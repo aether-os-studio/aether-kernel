@@ -15,7 +15,13 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             .task
             .address_space
             .munmap(address, len)
-            .map(|_| 0)
-            .map_err(SysErr::from)
+            .map_err(SysErr::from)?;
+        if len != 0 {
+            let end = address.saturating_add(
+                len.div_ceil(aether_frame::mm::PAGE_SIZE) * aether_frame::mm::PAGE_SIZE,
+            );
+            self.process.remove_mmap_region_range(address, end);
+        }
+        Ok(0)
     }
 }

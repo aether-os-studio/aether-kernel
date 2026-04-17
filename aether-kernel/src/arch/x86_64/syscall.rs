@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod nr {
     pub const READ: u64 = 0;
     pub const WRITE: u64 = 1;
@@ -26,6 +24,7 @@ pub mod nr {
     pub const PWRITE64: u64 = 18;
     pub const READV: u64 = 19;
     pub const WRITEV: u64 = 20;
+    pub const MREMAP: u64 = 25;
     pub const SENDFILE: u64 = 40;
     pub const SOCKET: u64 = 41;
     pub const CONNECT: u64 = 42;
@@ -52,6 +51,7 @@ pub mod nr {
     pub const WAIT4: u64 = 61;
     pub const KILL: u64 = 62;
     pub const UNAME: u64 = 63;
+    pub const FLOCK: u64 = 73;
     pub const FCNTL: u64 = 72;
     pub const GETCWD: u64 = 79;
     pub const CHDIR: u64 = 80;
@@ -59,6 +59,7 @@ pub mod nr {
     pub const RENAME: u64 = 82;
     pub const MKDIR: u64 = 83;
     pub const UNLINK: u64 = 87;
+    pub const LINK: u64 = 86;
     pub const SYMLINK: u64 = 88;
     pub const CREAT: u64 = 85;
     pub const CHMOD: u64 = 90;
@@ -92,6 +93,7 @@ pub mod nr {
     pub const UMOUNT2: u64 = 166;
     pub const GETTID: u64 = 186;
     pub const TKILL: u64 = 200;
+    pub const TIME: u64 = 201;
     pub const FUTEX: u64 = 202;
     pub const FADVISE64: u64 = 221;
     pub const EPOLL_CREATE: u64 = 213;
@@ -112,10 +114,12 @@ pub mod nr {
     pub const NEWFSTATAT: u64 = 262;
     pub const UNLINKAT: u64 = 263;
     pub const RENAMEAT: u64 = 264;
+    pub const LINKAT: u64 = 265;
     pub const READLINK: u64 = 89;
     pub const READLINKAT: u64 = 267;
     pub const FCHMODAT: u64 = 268;
     pub const FACCESSAT: u64 = 269;
+    pub const PPOLL: u64 = 271;
     pub const SET_ROBUST_LIST: u64 = 273;
     pub const DUP3: u64 = 292;
     pub const PIPE2: u64 = 293;
@@ -126,6 +130,7 @@ pub mod nr {
     pub const SIGNALFD: u64 = 282;
     pub const TIMERFD_CREATE: u64 = 283;
     pub const EVENTFD: u64 = 284;
+    pub const FALLOCATE: u64 = 285;
     pub const TIMERFD_SETTIME: u64 = 286;
     pub const TIMERFD_GETTIME: u64 = 287;
     pub const ACCEPT4: u64 = 288;
@@ -134,6 +139,7 @@ pub mod nr {
     pub const EPOLL_CREATE1: u64 = 291;
     pub const PRLIMIT64: u64 = 302;
     pub const GETRANDOM: u64 = 318;
+    pub const MEMFD_CREATE: u64 = 319;
     pub const EXECVEAT: u64 = 322;
     pub const STATX: u64 = 332;
     pub const FSOPEN: u64 = 430;

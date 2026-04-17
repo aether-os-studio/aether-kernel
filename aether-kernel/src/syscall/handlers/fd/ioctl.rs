@@ -4,9 +4,9 @@ use crate::process::{ProcessServices, ProcessSyscallContext};
 use crate::syscall::KernelSyscallContext;
 use crate::syscall::SyscallDisposition;
 use aether_drivers::drm::ioctl as drm_abi;
-use aether_drivers::{DrmFile, drm::DrmModeInfo};
+use aether_drivers::{DrmFile, EvdevFile, drm::DrmModeInfo};
 use aether_terminal::{ConsoleCore, LinuxTermios, LinuxTermios2, LinuxVtMode, LinuxWinSize};
-use aether_vfs::IoctlResponse;
+use aether_vfs::{FsError, IoctlResponse};
 
 const TCGETS: u64 = 0x5401;
 const TCSETS: u64 = 0x5402;
@@ -60,7 +60,20 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             drop(file);
             return self.syscall_drm_ioctl(drm, command, argument);
         }
-        let result = file.ioctl(command, argument).map_err(SysErr::from)?;
+        if let Some(evdev) = file
+            .node()
+            .file()
+            .and_then(|ops| ops.as_any().downcast_ref::<EvdevFile>())
+            && let Some(result) = self.syscall_evdev_ioctl(evdev, command, argument)?
+        {
+            drop(file);
+            return self.finish_ioctl_result(argument, result);
+        }
+        let result = match file.ioctl(command, argument) {
+            Ok(result) => result,
+            Err(FsError::Unsupported) => return Err(SysErr::NoTty),
+            Err(error) => return Err(SysErr::from(error)),
+        };
         drop(file);
         self.finish_ioctl_result(argument, result)
     }
@@ -71,6 +84,10 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             IoctlResponse::Data(bytes) => {
                 self.write_user_buffer(argument, &bytes)?;
                 Ok(0)
+            }
+            IoctlResponse::DataValue(bytes, value) => {
+                self.write_user_buffer(argument, &bytes)?;
+                Ok(value)
             }
         }
     }
@@ -150,6 +167,28 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 if argument != 0 {
                     console.set_active_vt(argument as u16);
                 }
+                Some(IoctlResponse::success())
+            }
+            _ => None,
+        };
+        Ok(result)
+    }
+
+    fn syscall_evdev_ioctl(
+        &mut self,
+        evdev: &EvdevFile,
+        command: u64,
+        argument: u64,
+    ) -> SysResult<Option<IoctlResponse>> {
+        const EVIOCSCLOCKID: u64 = 0x400445a0;
+
+        let result = match command {
+            EVIOCSCLOCKID => {
+                let bytes =
+                    self.syscall_read_user_exact_buffer(argument, core::mem::size_of::<i32>())?;
+                let clock_id =
+                    i32::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| SysErr::Fault)?);
+                evdev.set_clock_id(clock_id).map_err(SysErr::from)?;
                 Some(IoctlResponse::success())
             }
             _ => None,

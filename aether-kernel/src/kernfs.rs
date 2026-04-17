@@ -4,12 +4,14 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use aether_device::{DeviceClass, DeviceNamespace, DeviceNode, KernelDevice};
+use aether_device::{
+    DeviceClass, DeviceNamespace, DeviceNode, KernelDevice, SysfsEntry, SysfsEntryKind,
+};
 use aether_frame::bus::pci::PciDeviceInfo;
 use aether_frame::interrupt::timer;
 use aether_fs::pseudo::{BytesGenerator, generated_bytes_file, generated_text_file};
 use aether_tmpfs as tmpfs;
-use aether_vfs::{FsError, FsResult, NodeKind, NodeRef, Vfs};
+use aether_vfs::{FileNode, FileOperations, FsError, FsResult, NodeKind, NodeRef, Vfs};
 
 use crate::fs::LinuxUtsName;
 use crate::net::{
@@ -64,6 +66,18 @@ enum SysfsFileSource {
     Generated(BytesGenerator),
 }
 
+struct SysfsUeventFile {
+    content: Vec<u8>,
+    class: DeviceClass,
+    name: String,
+    devpath: String,
+    subsystem: String,
+    major: u16,
+    minor: u16,
+    nodes: Vec<DeviceNode>,
+    extra_fields: Vec<String>,
+}
+
 impl SysfsBus {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -115,6 +129,52 @@ impl SysfsBinAttribute {
     }
 }
 
+impl FileOperations for SysfsUeventFile {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn read(&self, offset: usize, buffer: &mut [u8]) -> FsResult<usize> {
+        if offset >= self.content.len() {
+            return Ok(0);
+        }
+        let len = buffer.len().min(self.content.len() - offset);
+        buffer[..len].copy_from_slice(&self.content[offset..offset + len]);
+        Ok(len)
+    }
+
+    fn write(&self, _offset: usize, buffer: &[u8]) -> FsResult<usize> {
+        let action = core::str::from_utf8(buffer)
+            .map_err(|_| FsError::InvalidInput)?
+            .trim_matches(char::from(0))
+            .trim();
+        if action.is_empty() {
+            return Ok(buffer.len());
+        }
+        let seqnum = reserve_kobject_uevent_seqnum();
+        publish_kobject_uevent(
+            render_uevent_message(
+                action,
+                self.class,
+                self.name.as_str(),
+                self.devpath.as_str(),
+                self.subsystem.as_str(),
+                self.major,
+                self.minor,
+                self.nodes.as_slice(),
+                seqnum,
+                self.extra_fields.as_slice(),
+            )
+            .as_slice(),
+        );
+        Ok(buffer.len())
+    }
+
+    fn size(&self) -> usize {
+        self.content.len()
+    }
+}
+
 impl KernelResourceRegistry {
     pub fn new(
         proc_root: NodeRef,
@@ -139,18 +199,29 @@ impl KernelResourceRegistry {
     ) -> FsResult<()> {
         let metadata = device.metadata();
         let nodes = device.nodes();
+        let uevent_fields = device.uevent_fields();
 
         for node in &nodes {
             dev_namespace.install(vfs, node.path.as_str(), node.node.clone())?;
         }
 
-        self.register_sysfs_resource(SysfsResource {
-            class: metadata.class,
-            name: &metadata.name,
-            major: metadata.major,
-            minor: metadata.minor,
-            nodes: &nodes,
-        })
+        self.register_sysfs_resource(
+            SysfsResource {
+                class: metadata.class,
+                name: &metadata.name,
+                major: metadata.major,
+                minor: metadata.minor,
+                nodes: &nodes,
+            },
+            device.sysfs_devpath_under_devices(),
+            uevent_fields.as_slice(),
+        )?;
+
+        for entry in device.sysfs_entries() {
+            self.install_sysfs_entry(&entry)?;
+        }
+
+        Ok(())
     }
 
     fn install_procfs(&self, command_line: Option<&str>, filesystems: &[&str]) -> FsResult<()> {
@@ -239,21 +310,23 @@ impl KernelResourceRegistry {
         Ok(())
     }
 
-    pub fn register_sysfs_resource(&self, resource: SysfsResource<'_>) -> FsResult<()> {
+    pub fn register_sysfs_resource(
+        &self,
+        resource: SysfsResource<'_>,
+        devpath_under_devices: Option<String>,
+        uevent_fields: &[String],
+    ) -> FsResult<()> {
         let class_name = class_name(resource.class);
         let class_dir = ensure_dir(
             &ensure_dir(&self.sys_root, "class", 0o040755)?,
             class_name,
             0o040755,
         )?;
-        let devices_dir = ensure_dir(
-            &ensure_dir(&self.sys_root, "devices", 0o040755)?,
-            "virtual",
-            0o040755,
-        )?;
-        let subsystem_dir = ensure_dir(&devices_dir, class_name, 0o040755)?;
-        let device_dir = ensure_dir(&subsystem_dir, resource.name, 0o040755)?;
-        let devpath = alloc::format!("/devices/virtual/{class_name}/{}", resource.name);
+        let device_path = devpath_under_devices
+            .unwrap_or_else(|| alloc::format!("virtual/{class_name}/{}", resource.name));
+        let devices_dir = ensure_dir(&self.sys_root, "devices", 0o040755)?;
+        let device_dir = ensure_dir_path(&devices_dir, device_path.as_str(), 0o040755)?;
+        let devpath = alloc::format!("/devices/{device_path}");
         let seqnum = reserve_kobject_uevent_seqnum();
 
         install_or_replace_child(
@@ -265,18 +338,29 @@ impl KernelResourceRegistry {
         )?;
         install_or_replace_child(
             &device_dir,
-            tmpfs::file(
+            FileNode::new(
                 "uevent",
-                render_uevent_file(
-                    resource.class,
-                    resource.name,
-                    devpath.as_str(),
-                    class_name,
-                    resource.major,
-                    resource.minor,
-                    resource.nodes,
-                )
-                .as_bytes(),
+                Arc::new(SysfsUeventFile {
+                    content: render_uevent_file(
+                        resource.class,
+                        resource.name,
+                        devpath.as_str(),
+                        class_name,
+                        resource.major,
+                        resource.minor,
+                        resource.nodes,
+                        uevent_fields,
+                    )
+                    .into_bytes(),
+                    class: resource.class,
+                    name: resource.name.to_string(),
+                    devpath: devpath.clone(),
+                    subsystem: class_name.to_string(),
+                    major: resource.major,
+                    minor: resource.minor,
+                    nodes: resource.nodes.to_vec(),
+                    extra_fields: uevent_fields.to_vec(),
+                }),
             ),
         )?;
         install_or_replace_child(
@@ -284,17 +368,14 @@ impl KernelResourceRegistry {
             tmpfs::symlink(
                 "subsystem",
                 relative_from_sys_devices(
-                    alloc::format!("virtual/{class_name}/{}", resource.name).as_str(),
+                    device_path.as_str(),
                     alloc::format!("class/{class_name}").as_str(),
                 ),
             ),
         )?;
         install_or_replace_child(
             &class_dir,
-            tmpfs::symlink(
-                resource.name,
-                alloc::format!("../../devices/virtual/{class_name}/{}", resource.name),
-            ),
+            tmpfs::symlink(resource.name, alloc::format!("../../devices/{device_path}")),
         )?;
 
         let dev_kind = match resource.class {
@@ -310,7 +391,7 @@ impl KernelResourceRegistry {
             &dev_map_dir,
             tmpfs::symlink(
                 alloc::format!("{}:{}", resource.major, resource.minor),
-                alloc::format!("../../devices/virtual/{class_name}/{}", resource.name),
+                alloc::format!("../../devices/{device_path}"),
             ),
         )?;
 
@@ -325,10 +406,48 @@ impl KernelResourceRegistry {
                 resource.minor,
                 resource.nodes,
                 seqnum,
+                uevent_fields,
             )
             .as_slice(),
         );
 
+        Ok(())
+    }
+
+    fn install_sysfs_entry(&self, entry: &SysfsEntry) -> FsResult<()> {
+        let trimmed = entry.path.trim_matches('/');
+        if trimmed.is_empty() {
+            return Err(FsError::InvalidInput);
+        }
+        let parent_path = trimmed
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        let name = trimmed
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .ok_or(FsError::InvalidInput)?;
+        let parent = if parent_path.is_empty() {
+            self.sys_root.clone()
+        } else {
+            ensure_dir_path(&self.sys_root, parent_path, 0o040755)?
+        };
+
+        match &entry.kind {
+            SysfsEntryKind::Directory { mode } => {
+                let _ = ensure_dir(&parent, name, *mode)?;
+            }
+            SysfsEntryKind::File { mode, bytes } => {
+                install_or_replace_child(
+                    &parent,
+                    tmpfs::file_with_mode(name, bytes.as_slice(), *mode),
+                )?;
+            }
+            SysfsEntryKind::Symlink { target } => {
+                install_or_replace_child(&parent, tmpfs::symlink(name, target.as_str()))?;
+            }
+        }
         Ok(())
     }
 
@@ -558,6 +677,7 @@ fn class_name(class: DeviceClass) -> &'static str {
         DeviceClass::Block => "block",
         DeviceClass::Display => "graphics",
         DeviceClass::Drm => "drm",
+        DeviceClass::Input => "input",
         DeviceClass::Console => "tty",
         DeviceClass::MessageBuffer => "misc",
         DeviceClass::Misc => "misc",
@@ -594,18 +714,25 @@ fn render_uevent_file(
     major: u16,
     minor: u16,
     nodes: &[DeviceNode],
+    extra_fields: &[String],
 ) -> String {
     let devname = nodes.first().map(|node| node.path.as_str()).unwrap_or(name);
     let devtype = match class {
         DeviceClass::Block => "disk",
         DeviceClass::Drm => "drm_minor",
+        DeviceClass::Input => "input",
         DeviceClass::Console => "tty",
         _ => "device",
     };
 
-    alloc::format!(
+    let mut content = alloc::format!(
         "DEVPATH={devpath}\nSUBSYSTEM={subsystem}\nMAJOR={major}\nMINOR={minor}\nDEVNAME={devname}\nDEVTYPE={devtype}\n"
-    )
+    );
+    for field in extra_fields {
+        content.push_str(field.as_str());
+        content.push('\n');
+    }
+    content
 }
 
 fn render_uevent_message(
@@ -618,11 +745,13 @@ fn render_uevent_message(
     minor: u16,
     nodes: &[DeviceNode],
     seqnum: u64,
+    extra_fields: &[String],
 ) -> Vec<u8> {
     let devname = nodes.first().map(|node| node.path.as_str()).unwrap_or(name);
     let devtype = match class {
         DeviceClass::Block => "disk",
         DeviceClass::Drm => "drm_minor",
+        DeviceClass::Input => "input",
         DeviceClass::Console => "tty",
         _ => "device",
     };
@@ -637,6 +766,9 @@ fn render_uevent_message(
     push_uevent_field(&mut bytes, alloc::format!("DEVNAME={devname}").as_str());
     push_uevent_field(&mut bytes, alloc::format!("DEVTYPE={devtype}").as_str());
     push_uevent_field(&mut bytes, alloc::format!("SEQNUM={seqnum}").as_str());
+    for field in extra_fields {
+        push_uevent_field(&mut bytes, field.as_str());
+    }
     bytes
 }
 

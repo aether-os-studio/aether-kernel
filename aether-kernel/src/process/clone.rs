@@ -30,7 +30,7 @@ pub(crate) const CLONE_INTO_CGROUP: u64 = 0x0002_0000_0000;
 const CSIGNAL_MASK: u64 = 0xff;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CloneParams {
+pub struct CloneParams {
     pub flags: u64,
     pub exit_signal: u64,
     pub child_stack_pointer: Option<u64>,

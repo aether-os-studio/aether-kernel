@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 aether-device = { path = "../aether-device" }
+aether-drivers = { path = "../aether-drivers" }
 aether-frame = { path = "../../../aether-frame" }
 aether-framebuffer = { path = "../aether-framebuffer" }
 aether-vfs = { path = "../aether-vfs" }

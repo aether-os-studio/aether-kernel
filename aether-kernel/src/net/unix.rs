@@ -725,10 +725,10 @@ impl KernelSocket for UnixSocket {
 
         let mut bound = BOUND_SOCKETS.lock_irqsave();
         let this = self.shared_self().ok_or(SysErr::AddrInUse)?;
-        if let Some(existing) = bound.get(&address).and_then(Weak::upgrade) {
-            if !Arc::ptr_eq(&existing, &this) {
-                return Err(SysErr::AddrInUse);
-            }
+        if let Some(existing) = bound.get(&address).and_then(Weak::upgrade)
+            && !Arc::ptr_eq(&existing, &this)
+        {
+            return Err(SysErr::AddrInUse);
         }
         // TODO: Pathname AF_UNIX sockets should also create a filesystem socket inode and
         // participate in VFS lifetime rules. The current implementation keeps a kernel-only

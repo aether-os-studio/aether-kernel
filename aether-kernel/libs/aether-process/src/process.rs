@@ -428,45 +428,45 @@ impl UserAddressSpace {
     }
 
     fn initialize_heap(&mut self) -> Result<(), BuildError> {
-        self.inner.lock_irqsave().initialize_heap()
+        self.inner.lock().initialize_heap()
     }
 
     pub fn stack_base(&self) -> u64 {
-        self.inner.lock_irqsave().stack_base
+        self.inner.lock().stack_base
     }
 
     pub fn layout(&self) -> UserAddressSpaceLayout {
-        self.inner.lock_irqsave().layout
+        self.inner.lock().layout
     }
 
     pub fn root(&self) -> PhysFrame {
-        self.inner.lock_irqsave().root
+        self.inner.lock().root
     }
 
     pub fn fork_cow(&self) -> Result<Self, BuildError> {
-        let copy = self.inner.lock_irqsave().fork_cow()?;
+        let copy = self.inner.lock().fork_cow()?;
         Ok(Self {
             inner: Arc::new(SpinLock::new(copy)),
         })
     }
 
     pub fn fork_copy(&self) -> Result<Self, BuildError> {
-        let copy = self.inner.lock_irqsave().fork_copy()?;
+        let copy = self.inner.lock().fork_copy()?;
         Ok(Self {
             inner: Arc::new(SpinLock::new(copy)),
         })
     }
 
     pub fn brk(&mut self, new_brk: u64) -> Result<u64, BuildError> {
-        self.inner.lock_irqsave().brk(new_brk)
+        self.inner.lock().brk(new_brk)
     }
 
     fn allocate_region(&mut self, len: u64) -> Result<u64, BuildError> {
-        self.inner.lock_irqsave().allocate_region(len)
+        self.inner.lock().allocate_region(len)
     }
 
     fn allocate_stack(&mut self, len: u64) -> Result<u64, BuildError> {
-        self.inner.lock_irqsave().allocate_stack(len)
+        self.inner.lock().allocate_stack(len)
     }
 
     pub fn mmap_anonymous(
@@ -477,7 +477,7 @@ impl UserAddressSpace {
         page_flags: MapFlags,
     ) -> Result<u64, BuildError> {
         self.inner
-            .lock_irqsave()
+            .lock()
             .mmap_anonymous(addr, len, flags, page_flags)
     }
 
@@ -490,7 +490,7 @@ impl UserAddressSpace {
         bytes: &[u8],
     ) -> Result<u64, BuildError> {
         self.inner
-            .lock_irqsave()
+            .lock()
             .mmap_bytes(addr, len, flags, page_flags, bytes)
     }
 
@@ -503,28 +503,45 @@ impl UserAddressSpace {
         physical_address: u64,
     ) -> Result<u64, BuildError> {
         self.inner
-            .lock_irqsave()
+            .lock()
             .mmap_physical(addr, len, flags, page_flags, physical_address)
     }
 
+    pub fn mmap_shared_physical(
+        &mut self,
+        addr: u64,
+        len: u64,
+        flags: u64,
+        page_flags: MapFlags,
+        physical_pages: &[u64],
+    ) -> Result<u64, BuildError> {
+        self.inner
+            .lock()
+            .mmap_shared_physical(addr, len, flags, page_flags, physical_pages)
+    }
+
     pub fn munmap(&mut self, addr: u64, len: u64) -> Result<(), BuildError> {
-        self.inner.lock_irqsave().munmap(addr, len)
+        self.inner.lock().munmap(addr, len)
     }
 
     pub fn mprotect(&mut self, addr: u64, len: u64, flags: MapFlags) -> Result<(), BuildError> {
-        self.inner.lock_irqsave().mprotect(addr, len, flags)
+        self.inner.lock().mprotect(addr, len, flags)
+    }
+
+    pub fn is_range_free(&self, addr: u64, len: u64) -> bool {
+        self.inner.lock().is_range_free(addr, len)
     }
 
     pub fn read(&self, address: u64, buffer: &mut [u8]) -> Result<usize, BuildError> {
-        self.inner.lock_irqsave().read(address, buffer)
+        self.inner.lock().read(address, buffer)
     }
 
     pub fn write(&self, address: u64, buffer: &[u8]) -> Result<usize, BuildError> {
-        self.inner.lock_irqsave().write(address, buffer)
+        self.inner.lock().write(address, buffer)
     }
 
     pub fn read_c_string(&self, address: u64, max_len: usize) -> Result<String, BuildError> {
-        self.inner.lock_irqsave().read_c_string(address, max_len)
+        self.inner.lock().read_c_string(address, max_len)
     }
 
     pub fn read_user_exact(&self, address: u64, len: usize) -> Result<Vec<u8>, BuildError> {
@@ -541,11 +558,11 @@ impl UserAddressSpace {
         base: u64,
         image: &S,
     ) -> Result<(), BuildError> {
-        self.inner.lock_irqsave().load_flat_image(base, image)
+        self.inner.lock().load_flat_image(base, image)
     }
 
     fn map_stack(&mut self, stack_base: u64, stack_pages: usize) -> Result<(), BuildError> {
-        self.inner.lock_irqsave().map_stack(stack_base, stack_pages)
+        self.inner.lock().map_stack(stack_base, stack_pages)
     }
 
     fn load_elf_image<S: ProgramImageSource + ?Sized>(
@@ -556,14 +573,12 @@ impl UserAddressSpace {
         kind: UserVmaKind,
     ) -> Result<(), BuildError> {
         self.inner
-            .lock_irqsave()
+            .lock()
             .load_elf_image(source, image, load_bias, kind)
     }
 
     pub fn handle_page_fault(&self, address: u64, error_code: u64) -> Result<bool, BuildError> {
-        self.inner
-            .lock_irqsave()
-            .handle_page_fault(address, error_code)
+        self.inner.lock().handle_page_fault(address, error_code)
     }
 }
 
@@ -619,7 +634,7 @@ impl UserAddressSpaceInner {
 
         let mut parent_mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
         let mut child_mapper = AddressSpace::<ArchitecturePageTable>::from_root(copy.root);
-        let mut allocator = frame_allocator().lock_irqsave();
+        let mut allocator = frame_allocator().lock();
 
         for index in 0..self.mappings.len() {
             let mapping_kind = self
@@ -642,11 +657,15 @@ impl UserAddressSpaceInner {
                     flags: mapping.flags,
                     cow: false,
                     owned: true,
+                    shared: false,
                 });
                 continue;
             }
 
             if !mapping.owned {
+                if mapping.shared {
+                    allocator.retain(mapping.frame)?;
+                }
                 child_mapper.map(
                     mapping.virt,
                     mapping.frame,
@@ -660,6 +679,7 @@ impl UserAddressSpaceInner {
                     flags: mapping.flags,
                     cow: false,
                     owned: false,
+                    shared: mapping.shared,
                 });
                 continue;
             }
@@ -692,6 +712,7 @@ impl UserAddressSpaceInner {
                 flags: child_flags,
                 cow: shared,
                 owned: true,
+                shared: false,
             });
         }
 
@@ -825,6 +846,39 @@ impl UserAddressSpaceInner {
         Ok(base + page_offset)
     }
 
+    fn mmap_shared_physical(
+        &mut self,
+        addr: u64,
+        len: u64,
+        flags: u64,
+        page_flags: MapFlags,
+        physical_pages: &[u64],
+    ) -> Result<u64, BuildError> {
+        if len == 0 {
+            return Err(BuildError::AddressOverflow);
+        }
+
+        let aligned_len = align_up(len, PAGE_SIZE);
+        let expected_pages = (aligned_len / PAGE_SIZE) as usize;
+        if physical_pages.len() < expected_pages {
+            return Err(BuildError::AddressOverflow);
+        }
+        let base = self.prepare_mapping_base(addr, aligned_len, flags)?;
+        for (index, physical_address) in physical_pages.iter().take(expected_pages).enumerate() {
+            let frame = PhysFrame::from_start_address(PhysAddr::new(*physical_address));
+            self.map_shared_page(base + index as u64 * PAGE_SIZE, frame, page_flags)?;
+        }
+
+        self.record_vma(
+            base,
+            base + aligned_len,
+            page_flags,
+            UserVmaKind::Shared,
+            false,
+        );
+        Ok(base)
+    }
+
     fn munmap(&mut self, addr: u64, len: u64) -> Result<(), BuildError> {
         if len == 0 || !VirtAddr::new(addr).is_aligned(PAGE_SIZE) {
             return Err(BuildError::AddressOverflow);
@@ -862,6 +916,19 @@ impl UserAddressSpaceInner {
         }
         self.update_vma_flags(addr, addr + aligned_len, flags);
         Ok(())
+    }
+
+    fn is_range_free(&self, addr: u64, len: u64) -> bool {
+        if len == 0 || !VirtAddr::new(addr).is_aligned(PAGE_SIZE) {
+            return false;
+        }
+        let Some(end) = addr.checked_add(align_up(len, PAGE_SIZE)) else {
+            return false;
+        };
+        !self
+            .vmas
+            .iter()
+            .any(|vma| vma.start < end && addr < vma.end)
     }
 
     fn read(&mut self, address: u64, buffer: &mut [u8]) -> Result<usize, BuildError> {
@@ -1076,7 +1143,7 @@ impl UserAddressSpaceInner {
         let writable_flags = self.mappings[index].flags | MapFlags::WRITE;
 
         let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
-        let mut allocator = frame_allocator().lock_irqsave();
+        let mut allocator = frame_allocator().lock();
         let ref_count = allocator.ref_count(old_frame).unwrap_or(1);
         if ref_count > 1 {
             let new_frame = allocator.alloc(1)?;
@@ -1101,7 +1168,7 @@ impl UserAddressSpaceInner {
 
     fn map_zeroed_page(&mut self, addr: u64, flags: MapFlags) -> Result<(), BuildError> {
         let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
-        let mut allocator = frame_allocator().lock_irqsave();
+        let mut allocator = frame_allocator().lock();
         let frame = allocator.alloc(1)?;
         zero_frame(frame);
         let virt = VirtAddr::new(addr);
@@ -1112,6 +1179,7 @@ impl UserAddressSpaceInner {
             flags,
             cow: false,
             owned: true,
+            shared: false,
         });
         Ok(())
     }
@@ -1155,7 +1223,7 @@ impl UserAddressSpaceInner {
         bytes: &[u8],
     ) -> Result<(), BuildError> {
         let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
-        let mut allocator = frame_allocator().lock_irqsave();
+        let mut allocator = frame_allocator().lock();
         let frame = allocator.alloc(1)?;
         zero_frame(frame);
         if !bytes.is_empty() {
@@ -1169,6 +1237,7 @@ impl UserAddressSpaceInner {
             flags,
             cow: false,
             owned: true,
+            shared: false,
         });
         Ok(())
     }
@@ -1180,7 +1249,7 @@ impl UserAddressSpaceInner {
         flags: MapFlags,
     ) -> Result<(), BuildError> {
         let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
-        let mut allocator = frame_allocator().lock_irqsave();
+        let mut allocator = frame_allocator().lock();
         let virt = VirtAddr::new(addr);
         mapper.map(virt, frame, MapSize::Size4KiB, flags, &mut *allocator)?;
         self.insert_mapping(UserMapping {
@@ -1189,12 +1258,58 @@ impl UserAddressSpaceInner {
             flags,
             cow: false,
             owned: false,
+            shared: false,
+        });
+        Ok(())
+    }
+
+    fn map_shared_page(
+        &mut self,
+        addr: u64,
+        frame: PhysFrame,
+        flags: MapFlags,
+    ) -> Result<(), BuildError> {
+        let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
+        let mut allocator = frame_allocator().lock();
+        allocator.retain(frame)?;
+        let virt = VirtAddr::new(addr);
+        mapper.map(virt, frame, MapSize::Size4KiB, flags, &mut *allocator)?;
+        self.insert_mapping(UserMapping {
+            virt,
+            frame,
+            flags,
+            cow: false,
+            owned: false,
+            shared: true,
         });
         Ok(())
     }
 
     fn copy_mapping(&mut self, mapping: &UserMapping) -> Result<(), BuildError> {
-        let mut allocator = frame_allocator().lock_irqsave();
+        if mapping.shared {
+            let virt = mapping.virt;
+            let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
+            let mut allocator = frame_allocator().lock();
+            allocator.retain(mapping.frame)?;
+            mapper.map(
+                virt,
+                mapping.frame,
+                MapSize::Size4KiB,
+                mapping.flags,
+                &mut *allocator,
+            )?;
+            self.insert_mapping(UserMapping {
+                virt,
+                frame: mapping.frame,
+                flags: mapping.flags,
+                cow: false,
+                owned: false,
+                shared: true,
+            });
+            return Ok(());
+        }
+
+        let mut allocator = frame_allocator().lock();
         let frame = allocator.alloc(1)?;
         copy_frame(mapping.frame, frame);
 
@@ -1222,6 +1337,7 @@ impl UserAddressSpaceInner {
             },
             cow: false,
             owned: true,
+            shared: false,
         });
         Ok(())
     }
@@ -1233,11 +1349,14 @@ impl UserAddressSpaceInner {
         let mapping = self.mappings.remove(index);
         let virt = mapping.virt;
         let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
-        let mut allocator = frame_allocator().lock_irqsave();
+        let mut allocator = frame_allocator().lock();
         if mapping.owned {
             let _ = mapper.unmap(virt, &mut *allocator)?;
         } else {
             let _ = mapper.unmap_preserve(virt, &mut *allocator)?;
+            if mapping.shared {
+                let _ = allocator.release(mapping.frame, 1);
+            }
         }
         Ok(())
     }
@@ -1317,6 +1436,27 @@ impl UserAddressSpaceInner {
         self.mappings.insert(index, mapping);
     }
 
+    fn coalesce_vmas(&mut self) {
+        if self.vmas.len() < 2 {
+            return;
+        }
+
+        let mut merged: Vec<UserVma> = Vec::with_capacity(self.vmas.len());
+        for vma in self.vmas.drain(..) {
+            if let Some(previous) = merged.last_mut()
+                && previous.end == vma.start
+                && previous.flags == vma.flags
+                && core::mem::discriminant(&previous.kind) == core::mem::discriminant(&vma.kind)
+                && previous.lazy == vma.lazy
+            {
+                previous.end = vma.end;
+                continue;
+            }
+            merged.push(vma);
+        }
+        self.vmas = merged;
+    }
+
     fn record_vma(&mut self, start: u64, end: u64, flags: MapFlags, kind: UserVmaKind, lazy: bool) {
         let vma = UserVma {
             start,
@@ -1330,6 +1470,7 @@ impl UserAddressSpaceInner {
             .binary_search_by_key(&start, |existing| existing.start)
             .unwrap_or_else(|index| index);
         self.vmas.insert(index, vma);
+        self.coalesce_vmas();
     }
 
     fn vma_for_address(&self, address: u64) -> Option<&UserVma> {
@@ -1349,12 +1490,38 @@ impl UserAddressSpaceInner {
     }
 
     fn update_vma_flags(&mut self, start: u64, end: u64, flags: MapFlags) {
-        for vma in &mut self.vmas {
+        let mut updated = Vec::with_capacity(self.vmas.len().saturating_add(2));
+        for vma in self.vmas.drain(..) {
             if vma.end <= start || vma.start >= end {
+                updated.push(vma);
                 continue;
             }
-            vma.flags = flags;
+
+            if start > vma.start {
+                updated.push(UserVma {
+                    start: vma.start,
+                    end: start,
+                    ..vma.clone()
+                });
+            }
+
+            updated.push(UserVma {
+                start: vma.start.max(start),
+                end: vma.end.min(end),
+                flags,
+                ..vma.clone()
+            });
+
+            if end < vma.end {
+                updated.push(UserVma {
+                    start: end,
+                    end: vma.end,
+                    ..vma
+                });
+            }
         }
+        self.vmas = updated;
+        self.coalesce_vmas();
     }
 
     fn remove_vma_range(&mut self, start: u64, end: u64) {
@@ -1380,6 +1547,7 @@ impl UserAddressSpaceInner {
             }
         }
         self.vmas = updated;
+        self.coalesce_vmas();
     }
 
     fn find_top_down_gap(&self, lower_bound: u64, upper_bound: u64, len: u64) -> Option<u64> {
@@ -1423,7 +1591,7 @@ impl UserAddressSpaceInner {
 impl Drop for UserAddressSpaceInner {
     fn drop(&mut self) {
         let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
-        let mut allocator = frame_allocator().lock_irqsave();
+        let mut allocator = frame_allocator().lock();
 
         for mapping in self.mappings.drain(..).rev() {
             let virt = mapping.virt;
@@ -1431,6 +1599,9 @@ impl Drop for UserAddressSpaceInner {
                 let _ = mapper.unmap(virt, &mut *allocator);
             } else {
                 let _ = mapper.unmap_preserve(virt, &mut *allocator);
+                if mapping.shared {
+                    let _ = allocator.release(mapping.frame, 1);
+                }
             }
         }
     }
@@ -1442,6 +1613,7 @@ struct UserMapping {
     flags: MapFlags,
     cow: bool,
     owned: bool,
+    shared: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1451,6 +1623,7 @@ enum UserVmaKind {
     Heap,
     Stack,
     Anonymous,
+    Shared,
     Device,
 }
 

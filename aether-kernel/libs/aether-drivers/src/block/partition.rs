@@ -114,6 +114,10 @@ impl PartitionDevice {
 }
 
 impl KernelDevice for PartitionDevice {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     fn metadata(&self) -> DeviceMetadata {
         self.metadata.clone()
     }

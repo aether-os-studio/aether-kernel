@@ -10,7 +10,7 @@ use aether_process::{BuildError, BuiltProcess};
 use aether_vfs::{OpenFileDescription, PollEvents, SharedWaitListener, WaitListener};
 
 use super::{
-    ChildEvent, ChildEventKind, CloneParams, DispatchWork, FileWaitRegistration, KernelProcess,
+    ChildEvent, ChildEventKind, DispatchWork, FileWaitRegistration, KernelProcess,
     PendingPollRegistration, Pid, ProcessBlock, ProcessBox, ProcessIdentity, ProcessManager,
     ProcessServices, ProcessState, ProcessStateSnapshot, RunningProcess, ScheduleEvent,
     ZombieProcess,
@@ -21,7 +21,6 @@ use crate::arch::{
     exception_signal,
 };
 use crate::credentials::Credentials;
-use crate::errno::SysErr;
 use crate::fs::{FdTable, FileDescriptor};
 use crate::rootfs::ProcessFsContext;
 use crate::signal::{SignalDelivery, SignalFdFile, SignalInfo, SignalState};
@@ -72,25 +71,26 @@ impl ProcessManager {
             .is_some_and(|deadline| deadline <= current_nanos)
     }
 
-    fn clone_fd_table_for_fork(parent: &FdTable, child_signals: &SignalState) -> FdTable {
+    pub(crate) fn clone_fd_table_for_fork(
+        parent: &FdTable,
+        child_signals: &SignalState,
+    ) -> FdTable {
         let mut table = FdTable::empty();
         for (fd, descriptor) in parent.entries() {
-            let cloned = if let Some(signalfd) = descriptor
-                .file
-                .lock()
-                .node()
-                .file()
-                .and_then(|file| file.as_any().downcast_ref::<SignalFdFile>())
-            {
-                let node = aether_vfs::FileNode::new(
-                    "signalfd",
-                    signalfd.with_signal_state(child_signals.clone()),
-                );
+            let (flags, child_signalfd) = {
+                let file = descriptor.file.lock();
+                let flags = file.flags();
+                let child_signalfd = file
+                    .node()
+                    .file()
+                    .and_then(|ops| ops.as_any().downcast_ref::<SignalFdFile>())
+                    .map(|signalfd| signalfd.with_signal_state(child_signals.clone()));
+                (flags, child_signalfd)
+            };
+            let cloned = if let Some(signalfd) = child_signalfd {
+                let node = aether_vfs::FileNode::new("signalfd", signalfd);
                 FileDescriptor {
-                    file: Arc::new(SpinLock::new(OpenFileDescription::new(
-                        node,
-                        descriptor.file.lock().flags(),
-                    ))),
+                    file: Arc::new(SpinLock::new(OpenFileDescription::new(node, flags))),
                     filesystem: descriptor.filesystem,
                     location: descriptor.location.clone(),
                     cloexec: descriptor.cloexec,
@@ -371,6 +371,7 @@ impl ProcessManager {
                 pending_syscall: None,
                 pending_syscall_name: "",
                 pending_poll: None,
+                mmap_regions: Vec::new(),
                 vfork_parent: None,
                 clear_child_tid: None,
                 files: self.initial_files.clone(),
@@ -383,6 +384,12 @@ impl ProcessManager {
         );
         self.run_queue.push_back(pid);
         Ok(pid)
+    }
+
+    pub(crate) fn allocate_pid(&mut self) -> Pid {
+        let pid = self.next_pid;
+        self.next_pid = self.next_pid.saturating_add(1);
+        pid
     }
 
     #[allow(dead_code)]
@@ -743,6 +750,7 @@ impl ProcessManager {
             return false;
         };
         process.task = new_task;
+        process.mmap_regions.clear();
         process.signals.prepare_for_exec();
         process.wake_result = None;
         true
@@ -827,113 +835,12 @@ impl ProcessManager {
             })
     }
 
-    pub(crate) fn clone_process(
-        &mut self,
-        parent: &mut KernelProcess,
-        params: CloneParams,
-    ) -> crate::errno::SysResult<Pid> {
-        params.validate()?;
-
-        let pid = self.next_pid;
-        self.next_pid = self.next_pid.saturating_add(1);
-
-        let mut child_task = if params.shares_vm() {
-            parent.task.fork_shared_vm().map_err(SysErr::from)?
-        } else {
-            parent.task.fork_cow().map_err(SysErr::from)?
-        };
-        child_task.process.context_mut().set_return_value(0);
-        if let Some(stack_pointer) = params.child_stack_pointer {
-            child_task
-                .process
-                .context_mut()
-                .set_stack_pointer(stack_pointer);
-        }
-        if params.set_tls()
-            && let Some(tls) = params.tls
-        {
-            child_task.process.context_mut().set_thread_pointer(tls);
-        }
-        if params.set_child_tid()
-            && let Some(child_tid) = params.child_tid
-        {
-            let raw = pid.to_ne_bytes();
-            let written = child_task
-                .address_space
-                .write(child_tid, &raw)
-                .map_err(SysErr::from)?;
-            if written != raw.len() {
-                return Err(SysErr::Fault);
-            }
-        }
-        if params.set_parent_tid()
-            && let Some(parent_tid) = params.parent_tid
-        {
-            let raw = pid.to_ne_bytes();
-            let written = parent
-                .task
-                .address_space
-                .write(parent_tid, &raw)
-                .map_err(SysErr::from)?;
-            if written != raw.len() {
-                return Err(SysErr::Fault);
-            }
-        }
-
-        let mut child_prctl = parent.prctl;
-        child_prctl.parent_death_signal = 0;
-        child_prctl.child_subreaper = false;
-
-        let vfork_parent = params.is_vfork().then_some(parent.identity.pid);
-        let child_signals = parent.signals.fork_copy();
-        let child_files = Self::clone_fd_table_for_fork(&parent.files, &child_signals);
-
-        self.processes.insert(
-            pid,
-            Box::new(KernelProcess {
-                identity: ProcessIdentity {
-                    pid,
-                    parent: if params.inherit_parent() {
-                        parent.identity.parent
-                    } else {
-                        Some(parent.identity.pid)
-                    },
-                    process_group: parent.identity.process_group,
-                    session: parent.identity.session,
-                },
-                task: child_task,
-                credentials: parent.credentials.clone(),
-                prctl: child_prctl,
-                assigned_cpu: parent.assigned_cpu,
-                kernel_context: None,
-                kernel_cpu: None,
-                pending_exec: None,
-                pending_syscall: None,
-                pending_syscall_name: "",
-                pending_poll: None,
-                vfork_parent,
-                clear_child_tid: params
-                    .clear_child_tid()
-                    .then_some(params.child_tid)
-                    .flatten(),
-                files: child_files,
-                fs: parent.fs.clone(),
-                umask: parent.umask,
-                signals: child_signals,
-                wake_result: None,
-                state: ProcessState::Runnable,
-            }),
-        );
-        self.track_child_link(
-            if params.inherit_parent() {
-                parent.identity.parent
-            } else {
-                Some(parent.identity.pid)
-            },
-            pid,
-        );
+    pub(crate) fn insert_cloned_process(&mut self, process: KernelProcess) -> Pid {
+        let pid = process.identity.pid;
+        self.track_child_link(process.identity.parent, pid);
+        self.processes.insert(pid, Box::new(process));
         self.run_queue.push_back(pid);
-        Ok(pid)
+        pid
     }
 
     fn finish_process_exit(&mut self, process: &mut KernelProcess) {
@@ -1157,6 +1064,24 @@ impl ProcessManager {
         } else {
             false
         }
+    }
+
+    pub(crate) fn send_signal_process_group(
+        &mut self,
+        process_group: Pid,
+        info: SignalInfo,
+    ) -> usize {
+        let targets = self
+            .processes
+            .iter()
+            .filter_map(|(&pid, process)| {
+                (process.identity.process_group == process_group).then_some(pid)
+            })
+            .collect::<Vec<_>>();
+        for pid in &targets {
+            self.notify_signal(*pid, info);
+        }
+        targets.len()
     }
 
     pub(crate) fn wake_futex(&mut self, uaddr: u64, bitset: u32, count: usize) -> usize {

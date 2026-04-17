@@ -10,20 +10,20 @@ use aether_macros::frame_entry;
 
 extern crate aether_frame;
 
-mod arch;
-mod credentials;
-mod devices;
-mod errno;
-mod fs;
-mod kernfs;
-mod log_sinks;
-mod net;
-mod process;
-mod procfs;
-mod rootfs;
-mod runtime;
-mod signal;
-mod syscall;
+pub mod arch;
+pub mod credentials;
+pub mod devices;
+pub mod errno;
+pub mod fs;
+pub mod kernfs;
+pub mod log_sinks;
+pub mod net;
+pub mod process;
+pub mod procfs;
+pub mod rootfs;
+pub mod runtime;
+pub mod signal;
+pub mod syscall;
 
 #[frame_entry]
 fn kernel_main() -> ! {

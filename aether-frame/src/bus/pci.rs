@@ -240,12 +240,12 @@ fn visit_bus(
 
             devices.push(info);
 
-            if is_bridge {
-                if let (Some(secondary), Some(subordinate)) = (secondary_bus, subordinate_bus) {
-                    if secondary != 0 && secondary <= subordinate {
-                        visit_bus(range, secondary, child_path.as_str(), visited, devices);
-                    }
-                }
+            if is_bridge
+                && let (Some(secondary), Some(subordinate)) = (secondary_bus, subordinate_bus)
+                && secondary != 0
+                && secondary <= subordinate
+            {
+                visit_bus(range, secondary, child_path.as_str(), visited, devices);
             }
         }
     }

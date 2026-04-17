@@ -7,10 +7,11 @@ use core::any::Any;
 
 use aether_frame::libs::spin::SpinLock;
 
+use crate::file::{FlockOperation, FlockState};
 use crate::{
     DirectoryEntry, FileAdvice, FileOperations, FsError, FsResult, IoctlResponse, MmapRequest,
     MmapResponse, NodeKind, NodeMetadata, PollEvents, SharedWaitListener, SuperBlock,
-    SuperBlockRef,
+    SuperBlockRef, WaitQueue,
 };
 
 pub type NodeRef = Arc<Inode>;
@@ -41,6 +42,10 @@ pub trait InodeOperations: Any + Send + Sync {
         _new_name: String,
         _replace: bool,
     ) -> FsResult<()> {
+        Err(FsError::NotDirectory)
+    }
+
+    fn link_child(&self, _name: String, _existing: &NodeRef) -> FsResult<()> {
         Err(FsError::NotDirectory)
     }
 
@@ -120,6 +125,8 @@ pub trait InodeOperations: Any + Send + Sync {
 
 pub struct Inode {
     superblock: SpinLock<Option<Weak<SuperBlock>>>,
+    flock: SpinLock<FlockState>,
+    flock_waiters: WaitQueue,
     operations: Arc<dyn InodeOperations>,
 }
 
@@ -127,6 +134,8 @@ impl Inode {
     pub fn new(operations: Arc<dyn InodeOperations>) -> NodeRef {
         Arc::new(Self {
             superblock: SpinLock::new(None),
+            flock: SpinLock::new(FlockState::default()),
+            flock_waiters: WaitQueue::new(),
             operations,
         })
     }
@@ -175,6 +184,10 @@ impl Inode {
     ) -> FsResult<()> {
         self.operations
             .rename_child(old_name, new_parent, new_name, replace)
+    }
+
+    pub fn link_child(&self, name: String, existing: &NodeRef) -> FsResult<()> {
+        self.operations.link_child(name, existing)
     }
 
     pub fn create_file(&self, name: String, mode: u32) -> FsResult<NodeRef> {
@@ -231,6 +244,67 @@ impl Inode {
     pub fn advise(&self, offset: u64, len: u64, advice: FileAdvice) -> FsResult<()> {
         let file = self.file().ok_or(FsError::NotFile)?;
         file.advise(offset, len, advice)
+    }
+
+    pub fn fallocate(&self, mode: u32, offset: u64, len: u64) -> FsResult<()> {
+        let file = self.file().ok_or(FsError::NotFile)?;
+        file.fallocate(mode, offset, len)
+    }
+
+    pub fn flock(&self, owner: u64, operation: FlockOperation) -> FsResult<()> {
+        let mut state = self.flock.lock_irqsave();
+        let changed = match operation {
+            FlockOperation::Unlock => {
+                let removed_shared = state.shared.remove(&owner);
+                let removed_exclusive = state.exclusive == Some(owner);
+                if removed_exclusive {
+                    state.exclusive = None;
+                }
+                removed_shared || removed_exclusive
+            }
+            FlockOperation::Shared => {
+                if let Some(holder) = state.exclusive
+                    && holder != owner
+                {
+                    return Err(FsError::WouldBlock);
+                }
+                let was_exclusive = state.exclusive == Some(owner);
+                if was_exclusive {
+                    state.exclusive = None;
+                }
+                let inserted = state.shared.insert(owner);
+                was_exclusive || inserted
+            }
+            FlockOperation::Exclusive => {
+                if state.exclusive == Some(owner) {
+                    false
+                } else {
+                    let shared_by_others = state
+                        .shared
+                        .iter()
+                        .any(|&shared_owner| shared_owner != owner);
+                    if state.exclusive.is_some() || shared_by_others {
+                        return Err(FsError::WouldBlock);
+                    }
+                    let removed_shared = state.shared.remove(&owner);
+                    state.exclusive = Some(owner);
+                    removed_shared || state.exclusive == Some(owner)
+                }
+            }
+        };
+        drop(state);
+        if changed {
+            self.flock_waiters.notify(PollEvents::LOCK);
+        }
+        Ok(())
+    }
+
+    pub fn register_flock_waiter(&self, listener: SharedWaitListener) -> u64 {
+        self.flock_waiters.register(PollEvents::LOCK, listener)
+    }
+
+    pub fn unregister_flock_waiter(&self, waiter_id: u64) -> bool {
+        self.flock_waiters.unregister(waiter_id)
     }
 
     pub fn wait_token(&self) -> u64 {

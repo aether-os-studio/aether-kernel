@@ -146,14 +146,15 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                     if completed {
                         SyscallDisposition::ok(0)
                     } else {
-                        if !is_absolute && rmtp != 0 {
-                            if let Err(error) = ctx.write_user_timespec(
+                        if !is_absolute
+                            && rmtp != 0
+                            && let Err(error) = ctx.write_user_timespec(
                                 rmtp,
                                 (remaining_nanos / 1_000_000_000) as i64,
                                 (remaining_nanos % 1_000_000_000) as i64,
-                            ) {
-                                return SyscallDisposition::err(error);
-                            }
+                            )
+                        {
+                            return SyscallDisposition::err(error);
                         }
                         SyscallDisposition::err(SysErr::Intr)
                     }

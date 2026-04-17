@@ -11,6 +11,8 @@ use crate::net::{
     SocketMessage, SocketReceive,
 };
 use crate::rootfs::{FsLocation, ProcessFsContext};
+use crate::signal::SigSet;
+use crate::syscall::abi::LinuxTimespec;
 
 const IOV_MAX: usize = 1024;
 const MAX_RW_COUNT: usize = 0x7fff_f000;
@@ -80,6 +82,14 @@ impl From<crate::process::PendingPollFd> for LinuxPollFd {
             revents: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PollWaitOptions {
+    deadline_nanos: Option<u64>,
+    timeout_nanos: Option<u64>,
+    timeout_address: Option<u64>,
+    restore_sigmask: Option<SigSet>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -188,49 +198,8 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         nfds: usize,
         timeout: i32,
     ) -> SyscallDisposition {
-        if let Some(result) = self.process.wake_result.take() {
-            let Some(pending) = self.process.pending_poll.clone() else {
-                return SyscallDisposition::err(SysErr::Intr);
-            };
-            let mut poll_fds = pending
-                .items
-                .iter()
-                .copied()
-                .map(LinuxPollFd::from)
-                .collect::<Vec<_>>();
-            let ready = match self.evaluate_poll_fds(&mut poll_fds) {
-                Ok(ready) => ready,
-                Err(error) => {
-                    self.clear_pending_poll_state();
-                    return SyscallDisposition::err(error);
-                }
-            };
-            if let Err(error) = self.write_poll_fds(pending.user_fds, &poll_fds) {
-                self.clear_pending_poll_state();
-                return SyscallDisposition::err(error);
-            }
-            return match result {
-                BlockResult::Poll { timed_out: true } => {
-                    self.clear_pending_poll_state();
-                    SyscallDisposition::ok(ready as u64)
-                }
-                BlockResult::Poll { timed_out: false } => {
-                    if ready != 0 {
-                        self.clear_pending_poll_state();
-                        SyscallDisposition::ok(ready as u64)
-                    } else {
-                        self.block_poll(pending.deadline_nanos)
-                    }
-                }
-                BlockResult::SignalInterrupted => {
-                    self.clear_pending_poll_state();
-                    SyscallDisposition::err(SysErr::Intr)
-                }
-                _ => {
-                    self.clear_pending_poll_state();
-                    SyscallDisposition::err(SysErr::Intr)
-                }
-            };
+        if self.process.wake_result.is_some() {
+            return self.resume_pending_poll_wait();
         }
 
         let mut poll_fds = match self.read_poll_fds(fds, nfds) {
@@ -252,19 +221,162 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             return SyscallDisposition::ok(0);
         }
 
-        let deadline_nanos = if timeout > 0 {
-            Some(
-                aether_frame::interrupt::timer::nanos_since_boot()
-                    .saturating_add(timeout as u64 * 1_000_000),
-            )
-        } else {
-            None
+        self.begin_poll_wait(
+            fds,
+            &poll_fds,
+            PollWaitOptions {
+                deadline_nanos: (timeout > 0).then(|| {
+                    aether_frame::interrupt::timer::nanos_since_boot()
+                        .saturating_add(timeout as u64 * 1_000_000)
+                }),
+                ..PollWaitOptions::default()
+            },
+        )
+    }
+
+    pub(super) fn syscall_ppoll(
+        &mut self,
+        fds: u64,
+        nfds: usize,
+        timeout: u64,
+        sigmask: u64,
+        sigsetsize: usize,
+    ) -> SysResult<u64> {
+        let mut options = self.parse_ppoll_timeout(timeout)?;
+        options.restore_sigmask = self.parse_ppoll_sigmask(sigmask, sigsetsize)?;
+
+        let result = (|| {
+            let mut poll_fds = self.read_poll_fds(fds, nfds)?;
+            let ready = self.evaluate_poll_fds(&mut poll_fds)?;
+            self.write_poll_fds(fds, &poll_fds)?;
+            if ready == 0 {
+                return Err(SysErr::Again);
+            }
+            Ok(ready as u64)
+        })();
+
+        self.restore_poll_wait_state(options.restore_sigmask, options.timeout_address, options);
+        result
+    }
+
+    pub(super) fn syscall_ppoll_blocking(
+        &mut self,
+        fds: u64,
+        nfds: usize,
+        timeout: u64,
+        sigmask: u64,
+        sigsetsize: usize,
+    ) -> SyscallDisposition {
+        if self.process.wake_result.is_some() {
+            return self.resume_pending_poll_wait();
+        }
+
+        let mut options = match self.parse_ppoll_timeout(timeout) {
+            Ok(options) => options,
+            Err(error) => return SyscallDisposition::err(error),
+        };
+        options.restore_sigmask = match self.parse_ppoll_sigmask(sigmask, sigsetsize) {
+            Ok(mask) => mask,
+            Err(error) => return SyscallDisposition::err(error),
         };
 
-        let registrations = self.collect_poll_registrations(&poll_fds);
+        let mut poll_fds = match self.read_poll_fds(fds, nfds) {
+            Ok(poll_fds) => poll_fds,
+            Err(error) => {
+                self.restore_poll_wait_state(
+                    options.restore_sigmask,
+                    options.timeout_address,
+                    options,
+                );
+                return SyscallDisposition::err(error);
+            }
+        };
+        let ready = match self.evaluate_poll_fds(&mut poll_fds) {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.restore_poll_wait_state(
+                    options.restore_sigmask,
+                    options.timeout_address,
+                    options,
+                );
+                return SyscallDisposition::err(error);
+            }
+        };
+        if let Err(error) = self.write_poll_fds(fds, &poll_fds) {
+            self.restore_poll_wait_state(options.restore_sigmask, options.timeout_address, options);
+            return SyscallDisposition::err(error);
+        }
+        if ready != 0 {
+            self.restore_poll_wait_state(options.restore_sigmask, options.timeout_address, options);
+            return SyscallDisposition::ok(ready as u64);
+        }
+        if options.timeout_nanos == Some(0) {
+            self.restore_poll_wait_state(options.restore_sigmask, options.timeout_address, options);
+            return SyscallDisposition::ok(0);
+        }
+
+        self.begin_poll_wait(fds, &poll_fds, options)
+    }
+
+    fn parse_ppoll_timeout(&self, timeout: u64) -> SysResult<PollWaitOptions> {
+        if timeout == 0 {
+            return Ok(PollWaitOptions::default());
+        }
+
+        let request = LinuxTimespec::read_from(self, timeout)?.validate()?;
+        let timeout_nanos = request.total_nanos()?;
+        Ok(PollWaitOptions {
+            deadline_nanos: Some(
+                aether_frame::interrupt::timer::nanos_since_boot().saturating_add(timeout_nanos),
+            ),
+            timeout_nanos: Some(timeout_nanos),
+            timeout_address: Some(timeout),
+            restore_sigmask: None,
+        })
+    }
+
+    fn parse_ppoll_sigmask(
+        &mut self,
+        sigmask: u64,
+        sigsetsize: usize,
+    ) -> SysResult<Option<SigSet>> {
+        if sigmask == 0 {
+            return Ok(None);
+        }
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(SysErr::Inval);
+        }
+
+        let previous = self.process.signals.blocked();
+        let raw = self.read_user_buffer(sigmask, sigsetsize)?;
+        self.process
+            .signals
+            .set_blocked_mask(crate::process::decode_sigset(&raw));
+        Ok(Some(previous))
+    }
+
+    fn begin_poll_wait(
+        &mut self,
+        user_fds: u64,
+        poll_fds: &[LinuxPollFd],
+        options: PollWaitOptions,
+    ) -> SyscallDisposition {
+        if self
+            .process
+            .signals
+            .has_deliverable(crate::arch::supports_user_handlers())
+        {
+            self.restore_poll_wait_state(options.restore_sigmask, options.timeout_address, options);
+            return SyscallDisposition::err(SysErr::Intr);
+        }
+
+        let registrations = self.collect_poll_registrations(poll_fds);
         self.process.pending_poll = Some(crate::process::PendingPollState {
-            user_fds: fds,
-            deadline_nanos,
+            user_fds,
+            deadline_nanos: options.deadline_nanos,
+            timeout_nanos: options.timeout_nanos,
+            timeout_address: options.timeout_address,
+            restore_sigmask: options.restore_sigmask,
             items: poll_fds
                 .iter()
                 .copied()
@@ -273,7 +385,56 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             registrations,
         });
 
-        self.block_poll(deadline_nanos)
+        self.block_poll(options.deadline_nanos)
+    }
+
+    fn resume_pending_poll_wait(&mut self) -> SyscallDisposition {
+        let Some(result) = self.process.wake_result.take() else {
+            return SyscallDisposition::err(SysErr::Intr);
+        };
+        let Some(pending) = self.process.pending_poll.clone() else {
+            return SyscallDisposition::err(SysErr::Intr);
+        };
+        let mut poll_fds = pending
+            .items
+            .iter()
+            .copied()
+            .map(LinuxPollFd::from)
+            .collect::<Vec<_>>();
+        let ready = match self.evaluate_poll_fds(&mut poll_fds) {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.finish_pending_poll_wait(&pending);
+                return SyscallDisposition::err(error);
+            }
+        };
+        if let Err(error) = self.write_poll_fds(pending.user_fds, &poll_fds) {
+            self.finish_pending_poll_wait(&pending);
+            return SyscallDisposition::err(error);
+        }
+
+        match result {
+            BlockResult::Poll { timed_out: true } => {
+                self.finish_pending_poll_wait(&pending);
+                SyscallDisposition::ok(ready as u64)
+            }
+            BlockResult::Poll { timed_out: false } => {
+                if ready != 0 {
+                    self.finish_pending_poll_wait(&pending);
+                    SyscallDisposition::ok(ready as u64)
+                } else {
+                    self.block_poll(pending.deadline_nanos)
+                }
+            }
+            BlockResult::SignalInterrupted => {
+                self.finish_pending_poll_wait(&pending);
+                SyscallDisposition::err(SysErr::Intr)
+            }
+            _ => {
+                self.finish_pending_poll_wait(&pending);
+                SyscallDisposition::err(SysErr::Intr)
+            }
+        }
     }
 
     pub(super) fn syscall_sendto(
@@ -659,6 +820,45 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         registrations
     }
 
+    fn finish_pending_poll_wait(&mut self, pending: &crate::process::PendingPollState) {
+        self.restore_poll_wait_state(
+            pending.restore_sigmask,
+            pending.timeout_address,
+            PollWaitOptions {
+                deadline_nanos: pending.deadline_nanos,
+                timeout_nanos: pending.timeout_nanos,
+                timeout_address: pending.timeout_address,
+                restore_sigmask: pending.restore_sigmask,
+            },
+        );
+        self.clear_pending_poll_state();
+    }
+
+    fn restore_poll_wait_state(
+        &mut self,
+        restore_sigmask: Option<SigSet>,
+        timeout_address: Option<u64>,
+        options: PollWaitOptions,
+    ) {
+        if let Some(previous_mask) = restore_sigmask {
+            self.process.signals.restore_mask(previous_mask);
+        }
+        if let Some(address) = timeout_address {
+            let remaining_nanos = options
+                .deadline_nanos
+                .map(|deadline| {
+                    deadline.saturating_sub(aether_frame::interrupt::timer::nanos_since_boot())
+                })
+                .or(options.timeout_nanos)
+                .unwrap_or(0);
+            let _ = self.write_user_timespec(
+                address,
+                (remaining_nanos / 1_000_000_000) as i64,
+                (remaining_nanos % 1_000_000_000) as i64,
+            );
+        }
+    }
+
     fn clear_pending_poll_state(&mut self) {
         self.process.pending_poll = None;
     }
@@ -775,12 +975,13 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         address_len: u64,
         received: &SocketReceive,
     ) -> SysResult<()> {
-        if let Some(name) = &received.address {
-            if address != 0 && address_len != 0 {
-                let count = core::cmp::min(address_len as usize, name.len());
-                if count != 0 {
-                    self.write_user_buffer(address, &name[..count])?;
-                }
+        if let Some(name) = &received.address
+            && address != 0
+            && address_len != 0
+        {
+            let count = core::cmp::min(address_len as usize, name.len());
+            if count != 0 {
+                self.write_user_buffer(address, &name[..count])?;
             }
         }
         Ok(())
@@ -918,7 +1119,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                     SCM_RIGHTS => {
                         if !rights.is_empty()
                             || payload.is_empty()
-                            || (payload.len() % core::mem::size_of::<i32>()) != 0
+                            || !payload.len().is_multiple_of(core::mem::size_of::<i32>())
                         {
                             return Err(SysErr::Inval);
                         }

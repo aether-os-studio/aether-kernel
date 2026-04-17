@@ -1,4 +1,4 @@
-use aether_frame::mm::MapFlags;
+use aether_frame::mm::PAGE_SIZE;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
@@ -13,22 +13,18 @@ crate::declare_syscall!(
 
 impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
     pub(crate) fn syscall_mprotect(&mut self, address: u64, len: u64, prot: u64) -> SysResult<u64> {
-        const PROT_WRITE: u64 = 0x2;
-        const PROT_EXEC: u64 = 0x4;
-
-        let mut page_flags = MapFlags::READ | MapFlags::USER;
-        if (prot & PROT_WRITE) != 0 {
-            page_flags = page_flags | MapFlags::WRITE;
-        }
-        if (prot & PROT_EXEC) != 0 {
-            page_flags = page_flags | MapFlags::EXECUTE;
-        }
+        let page_flags = crate::process::ProcessSyscallContext::<S>::mmap_page_flags(prot);
 
         self.process
             .task
             .address_space
             .mprotect(address, len, page_flags)
-            .map(|_| 0)
-            .map_err(SysErr::from)
+            .map_err(SysErr::from)?;
+        if len != 0 {
+            let end = address.saturating_add(len.div_ceil(PAGE_SIZE) * PAGE_SIZE);
+            self.process
+                .update_mmap_region_flags(address, end, page_flags);
+        }
+        Ok(0)
     }
 }

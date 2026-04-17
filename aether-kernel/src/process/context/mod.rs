@@ -47,7 +47,7 @@ impl<S> ProcessSyscallContext<'_, S> {
             return Err(SysErr::NotDir);
         }
 
-        if (flags & O_TRUNC) != 0 && node.kind() != NodeKind::Directory {
+        if (flags & O_TRUNC) != 0 && node.kind() == NodeKind::File {
             node.truncate(0).map_err(SysErr::from)?;
         }
 
@@ -245,11 +245,34 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     fn mprotect(&mut self, address: u64, len: u64, prot: u64) -> SysResult<u64> {
         Self::syscall_mprotect(self, address, len, prot)
     }
+    fn mremap(
+        &mut self,
+        old_address: u64,
+        old_size: u64,
+        new_size: u64,
+        flags: u64,
+        new_address: u64,
+    ) -> SysResult<u64> {
+        Self::syscall_mremap(self, old_address, old_size, new_size, flags, new_address)
+    }
     fn openat(&mut self, dirfd: i64, path: &str, flags: u64, mode: u64) -> SysResult<u64> {
         Self::syscall_openat(self, dirfd, path, flags, mode)
     }
     fn creat(&mut self, path: &str, mode: u64) -> SysResult<u64> {
         Self::syscall_creat(self, path, mode)
+    }
+    fn link(&mut self, old_path: &str, new_path: &str) -> SysResult<u64> {
+        Self::syscall_link(self, old_path, new_path)
+    }
+    fn linkat(
+        &mut self,
+        olddirfd: i64,
+        old_path: &str,
+        newdirfd: i64,
+        new_path: &str,
+        flags: u64,
+    ) -> SysResult<u64> {
+        Self::syscall_linkat(self, olddirfd, old_path, newdirfd, new_path, flags)
     }
     fn symlink(&mut self, target: &str, linkpath: &str) -> SysResult<u64> {
         Self::syscall_symlink(self, target, linkpath)
@@ -314,6 +337,26 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     ) -> crate::syscall::SyscallDisposition {
         Self::syscall_poll_blocking(self, fds, nfds, timeout)
     }
+    fn ppoll(
+        &mut self,
+        fds: u64,
+        nfds: usize,
+        timeout: u64,
+        sigmask: u64,
+        sigsetsize: usize,
+    ) -> SysResult<u64> {
+        Self::syscall_ppoll(self, fds, nfds, timeout, sigmask, sigsetsize)
+    }
+    fn ppoll_blocking(
+        &mut self,
+        fds: u64,
+        nfds: usize,
+        timeout: u64,
+        sigmask: u64,
+        sigsetsize: usize,
+    ) -> crate::syscall::SyscallDisposition {
+        Self::syscall_ppoll_blocking(self, fds, nfds, timeout, sigmask, sigsetsize)
+    }
     fn sendfile(&mut self, out_fd: u64, in_fd: u64, offset: u64, count: usize) -> SysResult<u64> {
         Self::syscall_sendfile(self, out_fd, in_fd, offset, count)
     }
@@ -363,8 +406,17 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     fn fadvise64(&mut self, fd: u64, offset: u64, len: u64, advice: u64) -> SysResult<u64> {
         Self::syscall_fadvise64(self, fd, offset, len, advice)
     }
+    fn fallocate(&mut self, fd: u64, mode: u64, offset: i64, len: i64) -> SysResult<u64> {
+        Self::syscall_fallocate(self, fd, mode, offset, len)
+    }
     fn ioctl_fd(&mut self, fd: u64, command: u64, argument: u64) -> SysResult<u64> {
         Self::syscall_ioctl_fd(self, fd, command, argument)
+    }
+    fn flock(&mut self, fd: u64, operation: u64) -> SysResult<u64> {
+        Self::syscall_flock(self, fd, operation)
+    }
+    fn flock_blocking(&mut self, fd: u64, operation: u64) -> SyscallDisposition {
+        Self::syscall_flock_blocking(self, fd, operation)
     }
     fn fcntl(&mut self, fd: u64, command: u64, arg: u64) -> SysResult<u64> {
         Self::syscall_fcntl(self, fd, command, arg)
@@ -542,6 +594,9 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     }
     fn pipe(&mut self, pipefd: u64, flags: u64) -> SysResult<u64> {
         Self::syscall_pipe(self, pipefd, flags)
+    }
+    fn memfd_create(&mut self, name: &str, flags: u64) -> SysResult<u64> {
+        Self::syscall_memfd_create(self, name, flags)
     }
     fn eventfd(&mut self, initval: u32) -> SysResult<u64> {
         Self::syscall_eventfd(self, initval)
@@ -856,6 +911,9 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     }
     fn gettimeofday(&mut self, tv: u64, tz: u64) -> SysResult<u64> {
         Self::syscall_gettimeofday(self, tv, tz)
+    }
+    fn time(&mut self, tloc: u64) -> SysResult<u64> {
+        Self::syscall_time(self, tloc)
     }
     fn clock_gettime(&mut self, clock_id: u64, tp: u64) -> SysResult<u64> {
         Self::syscall_clock_gettime(self, clock_id, tp)

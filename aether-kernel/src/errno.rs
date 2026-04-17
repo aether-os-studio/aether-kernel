@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use aether_drivers::DrmIoctlError;
 use aether_frame::mm::MappingError;
 use aether_process::BuildError;

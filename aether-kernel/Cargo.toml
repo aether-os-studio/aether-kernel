@@ -18,3 +18,9 @@ aether-terminal = { path = "libs/aether-terminal" }
 aether-tmpfs = { path = "libs/aether-tmpfs" }
 aether-vfs = { path = "libs/aether-vfs" }
 log = "0.4.29"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

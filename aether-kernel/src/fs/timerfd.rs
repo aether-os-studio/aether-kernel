@@ -298,10 +298,9 @@ impl TimerFdFile {
 
         let now_ns = self.clock.current_time_ns();
         let class = self.clock.deadline_class();
-        let (old_spec, became_readable) = {
+        let (old_spec, notify_readable) = {
             let mut registry = REGISTRY.lock_irqsave();
             let mut state = self.inner.lock_irqsave();
-            let was_readable = state.ticks != 0;
             let _ =
                 Self::refresh_due_locked(&mut registry, self.id, self.clock, &mut state, now_ns);
 
@@ -339,11 +338,11 @@ impl TimerFdFile {
                 }
             }
 
-            (old, !was_readable && state.ticks != 0)
+            (old, state.ticks != 0)
         };
 
         self.bump();
-        if became_readable {
+        if notify_readable {
             self.waiters.notify(PollEvents::READ);
         }
         Ok(old_spec)
@@ -472,10 +471,9 @@ fn wake_expired_class(class: DeadlineClass, now_ns: u64) {
         }
 
         for timerfd in ready {
-            let became_readable = {
+            let notify_readable = {
                 let mut registry = REGISTRY.lock_irqsave();
                 let mut state = timerfd.inner.lock_irqsave();
-                let was_readable = state.ticks != 0;
                 let changed = TimerFdFile::refresh_due_locked(
                     &mut registry,
                     timerfd.id,
@@ -483,9 +481,9 @@ fn wake_expired_class(class: DeadlineClass, now_ns: u64) {
                     &mut state,
                     now_ns,
                 );
-                changed && !was_readable && state.ticks != 0
+                changed && state.ticks != 0
             };
-            if became_readable {
+            if notify_readable {
                 timerfd.bump();
                 timerfd.waiters.notify(PollEvents::READ);
             }

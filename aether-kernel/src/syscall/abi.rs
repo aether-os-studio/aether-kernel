@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use alloc::string::String;
 
 use crate::errno::{SysErr, SysResult};

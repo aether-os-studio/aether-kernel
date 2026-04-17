@@ -4,7 +4,9 @@ extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
+use core::any::Any;
 
 use aether_vfs::{FsResult, NodeRef, Vfs};
 
@@ -18,6 +20,7 @@ pub enum DeviceClass {
     Block,
     Display,
     Drm,
+    Input,
     Console,
     MessageBuffer,
     Misc,
@@ -57,9 +60,63 @@ impl DeviceNode {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SysfsEntryKind {
+    Directory { mode: u32 },
+    File { mode: u32, bytes: Vec<u8> },
+    Symlink { target: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SysfsEntry {
+    pub path: String,
+    pub kind: SysfsEntryKind,
+}
+
+impl SysfsEntry {
+    pub fn directory(path: impl Into<String>, mode: u32) -> Self {
+        Self {
+            path: path.into(),
+            kind: SysfsEntryKind::Directory { mode },
+        }
+    }
+
+    pub fn file(path: impl Into<String>, mode: u32, bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            path: path.into(),
+            kind: SysfsEntryKind::File {
+                mode,
+                bytes: bytes.into(),
+            },
+        }
+    }
+
+    pub fn symlink(path: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            kind: SysfsEntryKind::Symlink {
+                target: target.into(),
+            },
+        }
+    }
+}
+
 pub trait KernelDevice: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
     fn metadata(&self) -> DeviceMetadata;
     fn nodes(&self) -> Vec<DeviceNode>;
+
+    fn sysfs_devpath_under_devices(&self) -> Option<String> {
+        None
+    }
+
+    fn sysfs_entries(&self) -> Vec<SysfsEntry> {
+        vec![]
+    }
+
+    fn uevent_fields(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 pub trait Driver: Send + Sync {

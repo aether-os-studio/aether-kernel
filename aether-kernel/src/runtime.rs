@@ -7,14 +7,14 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use aether_device::{DeviceRegistry, KernelDevice};
-use aether_drivers::DriverInventory;
+use aether_drivers::{DriverInventory, register_input_sink};
 use aether_frame::boot;
 use aether_frame::libs::spin::SpinLock;
 use aether_frame::logger::RegisterWriterError;
 use aether_framebuffer::{FramebufferDevice, FramebufferError, FramebufferSurface, RgbColor};
 use aether_kmsg::KmsgBuffer;
 use aether_process::{BuildError, ElfProgramBuilder, UserProgramBuilder, elf_interpreter_path};
-use aether_terminal::FramebufferConsole;
+use aether_terminal::{FramebufferConsole, register_process_group_signal_hook};
 use aether_vfs::{FileNode, FsError, NodeRef};
 
 use crate::arch::ArchContext;
@@ -186,6 +186,20 @@ fn process_kernel_syscall_entry(process: &mut KernelProcess) {
     );
 }
 
+fn runtime_send_process_group_signal(process_group: i32, signal: i32) {
+    let Some(runtime) = KernelRuntime::shared() else {
+        return;
+    };
+    if process_group <= 0 || signal <= 0 {
+        return;
+    }
+    let info = crate::signal::SignalInfo::kernel(signal as u8, 0);
+    let _ = runtime
+        .processes
+        .lock_irqsave()
+        .send_signal_process_group(process_group as u32, info);
+}
+
 impl KernelRuntime {
     pub fn current_pid() -> Option<Pid> {
         CURRENT_PIDS.lock_irqsave()[aether_frame::arch::cpu::current_cpu_index()]
@@ -231,10 +245,14 @@ impl KernelRuntime {
             log_sinks::install_terminal(terminal.clone());
             let tty: Arc<dyn KernelDevice> = terminal.clone();
             devices.register(tty);
+            let input_sink: Arc<dyn aether_drivers::InputEventSink> = terminal.clone();
+            register_input_sink(input_sink);
             console = Some(terminal);
         } else {
             log::warn!("bootloader did not provide a framebuffer");
         }
+
+        register_process_group_signal_hook(runtime_send_process_group_signal);
 
         let drivers = aether_drivers::probe_all(&mut devices);
 
@@ -523,6 +541,16 @@ impl ProcessServices for RuntimeServices<'_> {
         self.rootfs.unlink_in(fs, path, flags)
     }
 
+    fn link(
+        &mut self,
+        fs: &ProcessFsContext,
+        old_path: &str,
+        new_path: &str,
+        flags: u64,
+    ) -> SysResult<u64> {
+        self.rootfs.link_in(fs, old_path, new_path, flags)
+    }
+
     fn rename(&mut self, fs: &ProcessFsContext, old_path: &str, new_path: &str) -> SysResult<u64> {
         self.rootfs.rename_in(fs, old_path, new_path)
     }
@@ -632,7 +660,97 @@ impl ProcessServices for RuntimeServices<'_> {
     }
 
     fn clone_process(&mut self, parent: &mut KernelProcess, params: CloneParams) -> SysResult<Pid> {
-        self.processes.lock_irqsave().clone_process(parent, params)
+        params.validate()?;
+        let pid = self.processes.lock_irqsave().allocate_pid();
+        let child_parent = if params.inherit_parent() {
+            parent.identity.parent
+        } else {
+            Some(parent.identity.pid)
+        };
+
+        let mut child_task = if params.shares_vm() {
+            parent.task.fork_shared_vm().map_err(SysErr::from)?
+        } else {
+            parent.task.fork_cow().map_err(SysErr::from)?
+        };
+        child_task.process.context_mut().set_return_value(0);
+        if let Some(stack_pointer) = params.child_stack_pointer {
+            child_task
+                .process
+                .context_mut()
+                .set_stack_pointer(stack_pointer);
+        }
+        if params.set_tls()
+            && let Some(tls) = params.tls
+        {
+            child_task.process.context_mut().set_thread_pointer(tls);
+        }
+        if params.set_child_tid()
+            && let Some(child_tid) = params.child_tid
+        {
+            let raw = pid.to_ne_bytes();
+            let written = child_task
+                .address_space
+                .write(child_tid, &raw)
+                .map_err(SysErr::from)?;
+            if written != raw.len() {
+                return Err(SysErr::Fault);
+            }
+        }
+        if params.set_parent_tid()
+            && let Some(parent_tid) = params.parent_tid
+        {
+            let raw = pid.to_ne_bytes();
+            let written = parent
+                .task
+                .address_space
+                .write(parent_tid, &raw)
+                .map_err(SysErr::from)?;
+            if written != raw.len() {
+                return Err(SysErr::Fault);
+            }
+        }
+
+        let mut child_prctl = parent.prctl;
+        child_prctl.parent_death_signal = 0;
+        child_prctl.child_subreaper = false;
+
+        let vfork_parent = params.is_vfork().then_some(parent.identity.pid);
+        let child_signals = parent.signals.fork_copy();
+        let child_files = ProcessManager::clone_fd_table_for_fork(&parent.files, &child_signals);
+
+        let child = KernelProcess {
+            identity: crate::process::ProcessIdentity {
+                pid,
+                parent: child_parent,
+                process_group: parent.identity.process_group,
+                session: parent.identity.session,
+            },
+            task: child_task,
+            credentials: parent.credentials.clone(),
+            prctl: child_prctl,
+            assigned_cpu: parent.assigned_cpu,
+            kernel_context: None,
+            kernel_cpu: None,
+            pending_exec: None,
+            pending_syscall: None,
+            pending_syscall_name: "",
+            pending_poll: None,
+            mmap_regions: parent.mmap_regions.clone(),
+            vfork_parent,
+            clear_child_tid: params
+                .clear_child_tid()
+                .then_some(params.child_tid)
+                .flatten(),
+            files: child_files,
+            fs: parent.fs.clone(),
+            umask: parent.umask,
+            signals: child_signals,
+            wake_result: None,
+            state: ProcessState::Runnable,
+        };
+
+        Ok(self.processes.lock_irqsave().insert_cloned_process(child))
     }
 
     fn reap_child_event(

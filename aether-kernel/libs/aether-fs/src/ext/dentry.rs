@@ -282,6 +282,26 @@ impl InodeOperations for ExtInodeNode {
         Ok(())
     }
 
+    fn link_child(&self, name: String, existing: &NodeRef) -> FsResult<()> {
+        let target = existing
+            .operations()
+            .as_any()
+            .downcast_ref::<ExtInodeNode>()
+            .ok_or(FsError::Unsupported)?;
+        if target.kind == NodeKind::Directory {
+            return Err(FsError::Unsupported);
+        }
+
+        let (mut parent, entry_name) = self.parent_dir_and_name(name.as_str())?;
+        let _guard = lock_node_pair(self, target);
+        let mut inode = target.inode.lock_irqsave().clone();
+        block_on_future(parent.link(entry_name, &mut inode)).map_err(map_ext_error)?;
+        self.store_inode(parent.inode().clone());
+        target.store_inode(inode);
+        self.invalidate_child(name.as_str());
+        Ok(())
+    }
+
     fn symlink_target(&self) -> Option<&str> {
         self.symlink_target.as_deref()
     }

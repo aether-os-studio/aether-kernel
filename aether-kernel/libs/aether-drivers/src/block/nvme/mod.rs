@@ -157,6 +157,10 @@ impl NvmeController {
 }
 
 impl KernelDevice for NvmeController {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     fn metadata(&self) -> DeviceMetadata {
         self.metadata.clone()
     }
@@ -290,18 +294,17 @@ impl Future for NvmeReadFuture<'_> {
 
         loop {
             if let Some(in_flight) = self.in_flight.as_ref() {
-                let completion = {
+                let (completion, wake_list) = {
                     let mut state = self.transport.state.lock_irqsave();
+                    let _ = process_queue_completions_for_queue(
+                        &self.transport.registers,
+                        self.transport.capabilities,
+                        &mut state,
+                        QueueSelect::Io,
+                    );
                     let timed_out = aether_frame::interrupt::timer::nanos_since_boot()
                         >= in_flight.deadline_nanos;
-                    if timed_out {
-                        let _ = process_queue_completions_for_queue(
-                            &self.transport.registers,
-                            self.transport.capabilities,
-                            &mut state,
-                            QueueSelect::Io,
-                        );
-                    }
+                    let wake_list = wake_ready_waiters(&mut state);
 
                     let slot = match state.requests.get_mut(in_flight.cid as usize) {
                         Some(slot) => slot,
@@ -314,19 +317,23 @@ impl Future for NvmeReadFuture<'_> {
                         data.copy_from_slice(&slot.transfer.as_slice()[..bytes]);
                         let opcode = slot.opcode;
                         release_request(&mut state.requests, in_flight.cid);
-                        Some((completion, opcode, data))
+                        (Some((completion, opcode, data)), wake_list)
                     } else if timed_out {
                         release_request(&mut state.requests, in_flight.cid);
                         return Poll::Ready(Err(FsError::Unsupported));
                     } else {
                         slot.waker = Some(cx.waker().clone());
-                        None
+                        (None, wake_list)
                     }
                 };
+                for waker in wake_list {
+                    waker.wake();
+                }
 
                 let Some((completion, opcode, data)) = completion else {
                     return Poll::Pending;
                 };
+                fence(Ordering::Acquire);
                 if ensure_io_success(opcode, completion).is_err() {
                     return Poll::Ready(Err(FsError::Unsupported));
                 }
@@ -348,13 +355,27 @@ impl Future for NvmeReadFuture<'_> {
             let blocks = min(remaining_blocks, max_blocks_per_transfer);
             let bytes = blocks * block_size;
 
-            let cid = {
+            let cid = loop {
                 let mut state = self.transport.state.lock_irqsave();
                 let cid = match alloc_cid(&mut state) {
                     Ok(cid) => cid,
                     Err(NvmeProbeError::QueueFull { .. }) => {
-                        state.submit_waiters.push(cx.waker().clone());
-                        return Poll::Pending;
+                        let _ = process_queue_completions_for_queue(
+                            &self.transport.registers,
+                            self.transport.capabilities,
+                            &mut state,
+                            QueueSelect::Io,
+                        );
+                        let wake_list = wake_ready_waiters(&mut state);
+                        for waker in wake_list {
+                            waker.wake();
+                        }
+                        if let Ok(cid) = alloc_cid(&mut state) {
+                            cid
+                        } else {
+                            state.submit_waiters.push(cx.waker().clone());
+                            return Poll::Pending;
+                        }
                     }
                     Err(_) => return Poll::Ready(Err(FsError::Unsupported)),
                 };
@@ -366,6 +387,7 @@ impl Future for NvmeReadFuture<'_> {
                 slot.opcode = NVME_OPCODE_READ;
 
                 let mut command = NvmeCommand::new(NVME_OPCODE_READ, self.namespace.namespace_id);
+                command.cid = cid;
                 command.prp1 = slot.transfer.phys_addr();
                 command.cdw10 = self.current_lba as u32;
                 command.cdw11 = (self.current_lba >> 32) as u32;
@@ -381,7 +403,7 @@ impl Future for NvmeReadFuture<'_> {
                     state.io.sq_tail,
                     self.transport.capabilities,
                 );
-                cid
+                break cid;
             };
 
             self.in_flight = Some(InFlightRead {
@@ -440,18 +462,17 @@ impl Future for NvmeWriteFuture<'_> {
 
         loop {
             if let Some(in_flight) = self.in_flight.as_ref() {
-                let completion = {
+                let (completion, wake_list) = {
                     let mut state = self.transport.state.lock_irqsave();
+                    let _ = process_queue_completions_for_queue(
+                        &self.transport.registers,
+                        self.transport.capabilities,
+                        &mut state,
+                        QueueSelect::Io,
+                    );
                     let timed_out = aether_frame::interrupt::timer::nanos_since_boot()
                         >= in_flight.deadline_nanos;
-                    if timed_out {
-                        let _ = process_queue_completions_for_queue(
-                            &self.transport.registers,
-                            self.transport.capabilities,
-                            &mut state,
-                            QueueSelect::Io,
-                        );
-                    }
+                    let wake_list = wake_ready_waiters(&mut state);
 
                     let slot = match state.requests.get_mut(in_flight.cid as usize) {
                         Some(slot) => slot,
@@ -461,19 +482,23 @@ impl Future for NvmeWriteFuture<'_> {
                     if let Some(completion) = slot.completion.take() {
                         let opcode = slot.opcode;
                         release_request(&mut state.requests, in_flight.cid);
-                        Some((completion, opcode))
+                        (Some((completion, opcode)), wake_list)
                     } else if timed_out {
                         release_request(&mut state.requests, in_flight.cid);
                         return Poll::Ready(Err(FsError::Unsupported));
                     } else {
                         slot.waker = Some(cx.waker().clone());
-                        None
+                        (None, wake_list)
                     }
                 };
+                for waker in wake_list {
+                    waker.wake();
+                }
 
                 let Some((completion, opcode)) = completion else {
                     return Poll::Pending;
                 };
+                fence(Ordering::Acquire);
                 if ensure_io_success(opcode, completion).is_err() {
                     return Poll::Ready(Err(FsError::Unsupported));
                 }
@@ -493,13 +518,27 @@ impl Future for NvmeWriteFuture<'_> {
             let blocks = min(remaining_blocks, max_blocks_per_transfer);
             let bytes = blocks * block_size;
 
-            let cid = {
+            let cid = loop {
                 let mut state = self.transport.state.lock_irqsave();
                 let cid = match alloc_cid(&mut state) {
                     Ok(cid) => cid,
                     Err(NvmeProbeError::QueueFull { .. }) => {
-                        state.submit_waiters.push(cx.waker().clone());
-                        return Poll::Pending;
+                        let _ = process_queue_completions_for_queue(
+                            &self.transport.registers,
+                            self.transport.capabilities,
+                            &mut state,
+                            QueueSelect::Io,
+                        );
+                        let wake_list = wake_ready_waiters(&mut state);
+                        for waker in wake_list {
+                            waker.wake();
+                        }
+                        if let Ok(cid) = alloc_cid(&mut state) {
+                            cid
+                        } else {
+                            state.submit_waiters.push(cx.waker().clone());
+                            return Poll::Pending;
+                        }
                     }
                     Err(_) => return Poll::Ready(Err(FsError::Unsupported)),
                 };
@@ -513,6 +552,7 @@ impl Future for NvmeWriteFuture<'_> {
                 slot.opcode = NVME_OPCODE_WRITE;
 
                 let mut command = NvmeCommand::new(NVME_OPCODE_WRITE, self.namespace.namespace_id);
+                command.cid = cid;
                 command.prp1 = slot.transfer.phys_addr();
                 command.cdw10 = self.current_lba as u32;
                 command.cdw11 = (self.current_lba >> 32) as u32;
@@ -528,7 +568,7 @@ impl Future for NvmeWriteFuture<'_> {
                     state.io.sq_tail,
                     self.transport.capabilities,
                 );
-                cid
+                break cid;
             };
 
             self.in_flight = Some(InFlightWrite {
@@ -680,14 +720,7 @@ impl NvmeTransport {
             });
 
             if admin_processed != 0 || io_processed != 0 {
-                for request in &mut state.requests {
-                    if request.completion.is_some()
-                        && let Some(waker) = request.waker.take()
-                    {
-                        wake_list.push(waker);
-                    }
-                }
-                wake_list.extend(state.submit_waiters.drain(..));
+                wake_list = wake_ready_waiters(&mut state);
             }
         }
 
@@ -860,6 +893,7 @@ impl NvmeTransport {
             command.cdw11 = (current_lba >> 32) as u32;
             command.cdw12 = (blocks as u32).saturating_sub(1);
             let completion = self.submit(&mut state, QueueSelect::Io, command)?;
+            fence(Ordering::Acquire);
             ensure_io_success(command.opcode, completion)?;
 
             let bytes = blocks * block_size;
@@ -908,6 +942,7 @@ impl NvmeTransport {
             command.cdw11 = (current_lba >> 32) as u32;
             command.cdw12 = (blocks as u32).saturating_sub(1);
             let completion = self.submit(&mut state, QueueSelect::Io, command)?;
+            fence(Ordering::Acquire);
             ensure_io_success(command.opcode, completion)?;
 
             completed += bytes;
@@ -1158,12 +1193,11 @@ fn process_queue_completions(
 
         let cid_index = completion.cid as usize;
         if cid_index >= requests.len() || !requests[cid_index].active {
-            return Err(NvmeProbeError::QueueUnknownCid {
-                queue_id: queue.queue_id,
-                cid: completion.cid,
-                cq_head: queue.cq_head,
-                phase,
-            });
+            queue.sq_head = completion.sq_head % queue.depth;
+            queue.advance_completion();
+            registers.ring_completion_doorbell(queue.queue_id, queue.cq_head, capabilities);
+            processed += 1;
+            continue;
         }
 
         requests[cid_index].completion = Some(completion);
@@ -1172,6 +1206,19 @@ fn process_queue_completions(
         registers.ring_completion_doorbell(queue.queue_id, queue.cq_head, capabilities);
         processed += 1;
     }
+}
+
+fn wake_ready_waiters(state: &mut NvmeTransportState) -> Vec<Waker> {
+    let mut wake_list = Vec::new();
+    for request in &mut state.requests {
+        if request.completion.is_some()
+            && let Some(waker) = request.waker.take()
+        {
+            wake_list.push(waker);
+        }
+    }
+    wake_list.extend(state.submit_waiters.drain(..));
+    wake_list
 }
 
 fn process_queue_completions_for_queue(

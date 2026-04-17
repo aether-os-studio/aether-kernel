@@ -188,6 +188,10 @@ impl FramebufferDevice {
 }
 
 impl KernelDevice for FramebufferDevice {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     fn metadata(&self) -> DeviceMetadata {
         DeviceMetadata::new(
             alloc::format!("fb{}", self.index),

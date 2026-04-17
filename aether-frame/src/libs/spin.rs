@@ -21,6 +21,17 @@ impl<T> SpinLock<T> {
         }
     }
 
+    /// Returns a mutable reference to the protected value without taking the lock.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure there is no concurrent access to this lock and that
+    /// no `SpinLockGuard` or other reference derived from this lock is alive while
+    /// the returned reference is used.
+    pub unsafe fn get_mut(&self) -> &mut T {
+        unsafe { &mut *self.value.get() }
+    }
+
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         preempt::disable();
         self.acquire_lock();

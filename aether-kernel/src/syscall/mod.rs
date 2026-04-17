@@ -126,8 +126,25 @@ pub trait KernelSyscallContext {
     fn faccessat(&mut self, dirfd: i64, path: &str, mode: u64, flags: u64) -> SysResult<u64>;
     fn munmap(&mut self, address: u64, len: u64) -> SysResult<u64>;
     fn mprotect(&mut self, address: u64, len: u64, prot: u64) -> SysResult<u64>;
+    fn mremap(
+        &mut self,
+        old_address: u64,
+        old_size: u64,
+        new_size: u64,
+        flags: u64,
+        new_address: u64,
+    ) -> SysResult<u64>;
     fn openat(&mut self, dirfd: i64, path: &str, flags: u64, mode: u64) -> SysResult<u64>;
     fn creat(&mut self, path: &str, mode: u64) -> SysResult<u64>;
+    fn link(&mut self, old_path: &str, new_path: &str) -> SysResult<u64>;
+    fn linkat(
+        &mut self,
+        olddirfd: i64,
+        old_path: &str,
+        newdirfd: i64,
+        new_path: &str,
+        flags: u64,
+    ) -> SysResult<u64>;
     fn symlink(&mut self, target: &str, linkpath: &str) -> SysResult<u64>;
     fn unlinkat(&mut self, dirfd: i64, path: &str, flags: u64) -> SysResult<u64>;
     fn readlinkat(&mut self, dirfd: i64, path: &str, address: u64, len: usize) -> SysResult<u64>;
@@ -148,6 +165,22 @@ pub trait KernelSyscallContext {
     fn write_fd_blocking(&mut self, fd: u64, address: u64, len: usize) -> SyscallDisposition;
     fn poll(&mut self, fds: u64, nfds: usize, timeout: i32) -> SysResult<u64>;
     fn poll_blocking(&mut self, fds: u64, nfds: usize, timeout: i32) -> SyscallDisposition;
+    fn ppoll(
+        &mut self,
+        fds: u64,
+        nfds: usize,
+        timeout: u64,
+        sigmask: u64,
+        sigsetsize: usize,
+    ) -> SysResult<u64>;
+    fn ppoll_blocking(
+        &mut self,
+        fds: u64,
+        nfds: usize,
+        timeout: u64,
+        sigmask: u64,
+        sigsetsize: usize,
+    ) -> SyscallDisposition;
     fn sendfile(&mut self, out_fd: u64, in_fd: u64, offset: u64, count: usize) -> SysResult<u64>;
     fn sendfile_blocking(
         &mut self,
@@ -165,7 +198,10 @@ pub trait KernelSyscallContext {
     fn preadv64(&mut self, fd: u64, iov: u64, iovcnt: usize, offset: u64) -> SysResult<u64>;
     fn pwritev64(&mut self, fd: u64, iov: u64, iovcnt: usize, offset: u64) -> SysResult<u64>;
     fn fadvise64(&mut self, fd: u64, offset: u64, len: u64, advice: u64) -> SysResult<u64>;
+    fn fallocate(&mut self, fd: u64, mode: u64, offset: i64, len: i64) -> SysResult<u64>;
     fn ioctl_fd(&mut self, fd: u64, command: u64, argument: u64) -> SysResult<u64>;
+    fn flock(&mut self, fd: u64, operation: u64) -> SysResult<u64>;
+    fn flock_blocking(&mut self, fd: u64, operation: u64) -> SyscallDisposition;
     fn fcntl(&mut self, fd: u64, command: u64, arg: u64) -> SysResult<u64>;
     fn fstat(&mut self, fd: u64, address: u64) -> SysResult<u64>;
     fn fstatfs(&mut self, fd: u64, address: u64) -> SysResult<u64>;
@@ -258,6 +294,7 @@ pub trait KernelSyscallContext {
     ) -> SysResult<u64>;
     fn getdents64(&mut self, fd: u64, address: u64, len: usize) -> SysResult<u64>;
     fn pipe(&mut self, pipefd: u64, flags: u64) -> SysResult<u64>;
+    fn memfd_create(&mut self, name: &str, flags: u64) -> SysResult<u64>;
     fn eventfd(&mut self, initval: u32) -> SysResult<u64>;
     fn eventfd2(&mut self, initval: u32, flags: u64) -> SysResult<u64>;
     fn timerfd_create(&mut self, clockid: i32, flags: u64) -> SysResult<u64>;
@@ -409,6 +446,7 @@ pub trait KernelSyscallContext {
         sigmask: u64,
     ) -> SyscallDisposition;
     fn gettimeofday(&mut self, tv: u64, tz: u64) -> SysResult<u64>;
+    fn time(&mut self, tloc: u64) -> SysResult<u64>;
     fn clock_gettime(&mut self, clock_id: u64, tp: u64) -> SysResult<u64>;
     fn clock_getres(&mut self, clock_id: u64, tp: u64) -> SysResult<u64>;
     fn clock_nanosleep(

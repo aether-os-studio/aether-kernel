@@ -376,6 +376,84 @@ impl RootfsManager {
         Ok(0)
     }
 
+    pub fn link_in(
+        &self,
+        fs: &ProcessFsContext,
+        old_path: &str,
+        new_path: &str,
+        flags: u64,
+    ) -> SysResult<u64> {
+        const AT_SYMLINK_FOLLOW: u64 = 0x400;
+        const AT_EMPTY_PATH: u64 = 0x1000;
+
+        if (flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH)) != 0 {
+            return Err(SysErr::Inval);
+        }
+        if old_path.is_empty() || new_path.is_empty() {
+            return Err(SysErr::NoEnt);
+        }
+        if (flags & AT_EMPTY_PATH) != 0 {
+            // TODO: Linux linkat(AT_EMPTY_PATH) links an already-open file descriptor target.
+            // That needs fd-backed source resolution, so keep rejecting it explicitly for now.
+            return Err(SysErr::Inval);
+        }
+
+        let old_namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), old_path);
+        let new_namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), new_path);
+        let old_normalized = normalize_absolute_path(old_namespace_path.as_str());
+        let new_normalized = normalize_absolute_path(new_namespace_path.as_str());
+
+        if old_normalized == "/" || new_normalized == "/" {
+            return Err(SysErr::Perm);
+        }
+
+        let namespace = fs.namespace();
+        let namespace = namespace.lock();
+
+        let follow_source = (flags & AT_SYMLINK_FOLLOW) != 0;
+        let source_lookup =
+            self.lookup_namespace_entry(&namespace, old_normalized.as_str(), follow_source, 0)?;
+        let source = source_lookup.node;
+        if source.kind() == NodeKind::Directory {
+            return Err(SysErr::Perm);
+        }
+
+        let source_mount = namespace.covering_mount(source_lookup.path.as_str());
+        let target_mount = namespace.covering_mount(new_normalized.as_str());
+        if source_mount.device_id() != target_mount.device_id() {
+            return Err(SysErr::XDev);
+        }
+
+        if namespace.lookup_mount(new_normalized.as_str()).is_some() {
+            return Err(SysErr::Exists);
+        }
+
+        let parent =
+            self.lookup_namespace_path(&namespace, parent_path(new_normalized.as_str()), true, 0)?;
+        if parent.kind() != NodeKind::Directory {
+            return Err(SysErr::NotDir);
+        }
+
+        let name = leaf_name(new_normalized.as_str());
+        if name.is_empty() {
+            return Err(SysErr::NoEnt);
+        }
+        if parent.lookup(name).is_some() {
+            return Err(SysErr::Exists);
+        }
+
+        parent
+            .link_child(String::from(name), &source)
+            .map_err(|error| match error {
+                aether_vfs::FsError::Unsupported if source.kind() == NodeKind::Directory => {
+                    SysErr::Perm
+                }
+                other => SysErr::from(other),
+            })?;
+        crate::fs::notify_create(&parent, &source, name);
+        Ok(0)
+    }
+
     pub fn rename_in(
         &self,
         fs: &ProcessFsContext,
@@ -444,10 +522,8 @@ impl RootfsManager {
                 return Ok(0);
             }
             match (source.kind(), target.kind()) {
-                (NodeKind::Directory, NodeKind::Directory) => {
-                    if !target.entries().is_empty() {
-                        return Err(SysErr::NotEmpty);
-                    }
+                (NodeKind::Directory, NodeKind::Directory) if !target.entries().is_empty() => {
+                    return Err(SysErr::NotEmpty);
                 }
                 (NodeKind::Directory, _) => return Err(SysErr::NotDir),
                 (_, NodeKind::Directory) => return Err(SysErr::IsDir),

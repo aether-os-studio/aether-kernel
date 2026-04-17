@@ -13,6 +13,22 @@ pub trait FdSyscallContext {
     fn write_fd_blocking(&mut self, fd: u64, address: u64, len: usize) -> SyscallDisposition;
     fn poll(&mut self, fds: u64, nfds: usize, timeout: i32) -> SysResult<u64>;
     fn poll_blocking(&mut self, fds: u64, nfds: usize, timeout: i32) -> SyscallDisposition;
+    fn ppoll(
+        &mut self,
+        fds: u64,
+        nfds: usize,
+        timeout: u64,
+        sigmask: u64,
+        sigsetsize: usize,
+    ) -> SysResult<u64>;
+    fn ppoll_blocking(
+        &mut self,
+        fds: u64,
+        nfds: usize,
+        timeout: u64,
+        sigmask: u64,
+        sigsetsize: usize,
+    ) -> SyscallDisposition;
     fn sendfile(&mut self, out_fd: u64, in_fd: u64, offset: u64, count: usize) -> SysResult<u64>;
     fn sendfile_blocking(
         &mut self,

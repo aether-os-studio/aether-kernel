@@ -102,7 +102,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 if arg2 > CAP_LAST_CAP {
                     return Err(SysErr::Inval);
                 }
-                Ok(((self.process.prctl.capability_bounding_set >> arg2) & 1) as u64)
+                Ok((self.process.prctl.capability_bounding_set >> arg2) & 1)
             }
             PR_CAPBSET_DROP => {
                 if arg2 > CAP_LAST_CAP {

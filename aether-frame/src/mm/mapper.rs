@@ -8,7 +8,7 @@ use super::frame::{FrameAllocError, FrameAllocator, PhysFrame};
 
 const MAX_PAGE_TABLE_LEVELS: usize = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MapFlags(u64);
 
 impl MapFlags {

@@ -14,6 +14,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
 
 use aether_frame::libs::spin::SpinLock;
+use aether_frame::mm::MapFlags;
 use aether_frame::process::KernelContext;
 use aether_process::BuiltProcess;
 use aether_vfs::{NodeRef, PollEvents, SharedOpenFile};
@@ -22,7 +23,7 @@ use crate::credentials::Credentials;
 use crate::errno::SysResult;
 use crate::fs::{FdTable, FileSystemIdentity, LinuxStatFs};
 use crate::rootfs::ProcessFsContext;
-use crate::signal::SignalState;
+use crate::signal::{SigSet, SignalState};
 use crate::syscall::{BlockResult, SyscallArgs};
 
 pub type Pid = u32;
@@ -95,6 +96,7 @@ pub struct KernelProcess {
     pub pending_syscall: Option<PendingSyscall>,
     pub pending_syscall_name: &'static str,
     pub pending_poll: Option<PendingPollState>,
+    pub mmap_regions: Vec<MmapRegion>,
     pub vfork_parent: Option<Pid>,
     pub clear_child_tid: Option<u64>,
     pub files: FdTable,
@@ -121,8 +123,217 @@ pub struct PendingPollFd {
 pub struct PendingPollState {
     pub user_fds: u64,
     pub deadline_nanos: Option<u64>,
+    pub timeout_nanos: Option<u64>,
+    pub timeout_address: Option<u64>,
+    pub restore_sigmask: Option<SigSet>,
     pub items: Vec<PendingPollFd>,
     pub registrations: Vec<PendingPollRegistration>,
+}
+
+#[derive(Clone)]
+pub enum MmapRegionBacking {
+    Anonymous,
+    BufferedFile { file: SharedOpenFile, offset: u64 },
+    SharedFile { file: SharedOpenFile, offset: u64 },
+    DirectFile { file: SharedOpenFile, offset: u64 },
+}
+
+#[derive(Clone)]
+pub struct MmapRegion {
+    pub start: u64,
+    pub end: u64,
+    pub page_flags: MapFlags,
+    pub mmap_flags: u64,
+    pub backing: MmapRegionBacking,
+}
+
+impl KernelProcess {
+    fn mmap_backing_is_mergeable(lhs: &MmapRegion, rhs: &MmapRegion) -> bool {
+        if lhs.end != rhs.start
+            || lhs.page_flags != rhs.page_flags
+            || lhs.mmap_flags != rhs.mmap_flags
+        {
+            return false;
+        }
+
+        match (&lhs.backing, &rhs.backing) {
+            (MmapRegionBacking::Anonymous, MmapRegionBacking::Anonymous) => true,
+            (
+                MmapRegionBacking::BufferedFile {
+                    file: lhs_file,
+                    offset: lhs_offset,
+                },
+                MmapRegionBacking::BufferedFile {
+                    file: rhs_file,
+                    offset: rhs_offset,
+                },
+            )
+            | (
+                MmapRegionBacking::SharedFile {
+                    file: lhs_file,
+                    offset: lhs_offset,
+                },
+                MmapRegionBacking::SharedFile {
+                    file: rhs_file,
+                    offset: rhs_offset,
+                },
+            )
+            | (
+                MmapRegionBacking::DirectFile {
+                    file: lhs_file,
+                    offset: lhs_offset,
+                },
+                MmapRegionBacking::DirectFile {
+                    file: rhs_file,
+                    offset: rhs_offset,
+                },
+            ) => {
+                Arc::ptr_eq(lhs_file, rhs_file)
+                    && rhs_offset.saturating_sub(*lhs_offset) == lhs.end.saturating_sub(lhs.start)
+            }
+            _ => false,
+        }
+    }
+
+    fn coalesce_mmap_regions(&mut self) {
+        if self.mmap_regions.len() < 2 {
+            return;
+        }
+
+        let mut merged: Vec<MmapRegion> = Vec::with_capacity(self.mmap_regions.len());
+        for region in self.mmap_regions.drain(..) {
+            if let Some(previous) = merged.last_mut()
+                && Self::mmap_backing_is_mergeable(previous, &region)
+            {
+                previous.end = region.end;
+                continue;
+            }
+            merged.push(region);
+        }
+        self.mmap_regions = merged;
+    }
+
+    pub fn covering_mmap_region(&self, start: u64, end: u64) -> Option<&MmapRegion> {
+        self.mmap_regions
+            .iter()
+            .find(|region| start >= region.start && end <= region.end)
+    }
+
+    pub fn slice_mmap_region(&self, start: u64, end: u64) -> Option<MmapRegion> {
+        let region = self.covering_mmap_region(start, end)?.clone();
+        Some(MmapRegion {
+            start,
+            end,
+            page_flags: region.page_flags,
+            mmap_flags: region.mmap_flags,
+            backing: Self::adjusted_mmap_backing(
+                &region.backing,
+                start.saturating_sub(region.start),
+            ),
+        })
+    }
+
+    fn adjusted_mmap_backing(backing: &MmapRegionBacking, delta: u64) -> MmapRegionBacking {
+        match backing {
+            MmapRegionBacking::Anonymous => MmapRegionBacking::Anonymous,
+            MmapRegionBacking::BufferedFile { file, offset } => MmapRegionBacking::BufferedFile {
+                file: file.clone(),
+                offset: offset.saturating_add(delta),
+            },
+            MmapRegionBacking::SharedFile { file, offset } => MmapRegionBacking::SharedFile {
+                file: file.clone(),
+                offset: offset.saturating_add(delta),
+            },
+            MmapRegionBacking::DirectFile { file, offset } => MmapRegionBacking::DirectFile {
+                file: file.clone(),
+                offset: offset.saturating_add(delta),
+            },
+        }
+    }
+
+    pub fn insert_mmap_region(&mut self, region: MmapRegion) {
+        let index = self
+            .mmap_regions
+            .binary_search_by_key(&region.start, |existing| existing.start)
+            .unwrap_or_else(|index| index);
+        self.mmap_regions.insert(index, region);
+        self.coalesce_mmap_regions();
+    }
+
+    pub fn update_mmap_region_flags(&mut self, start: u64, end: u64, page_flags: MapFlags) {
+        let mut updated = Vec::with_capacity(self.mmap_regions.len().saturating_add(2));
+        for region in self.mmap_regions.drain(..) {
+            if region.end <= start || region.start >= end {
+                updated.push(region);
+                continue;
+            }
+
+            if start > region.start {
+                updated.push(MmapRegion {
+                    start: region.start,
+                    end: start,
+                    ..region.clone()
+                });
+            }
+
+            updated.push(MmapRegion {
+                start: region.start.max(start),
+                end: region.end.min(end),
+                page_flags,
+                mmap_flags: region.mmap_flags,
+                backing: Self::adjusted_mmap_backing(
+                    &region.backing,
+                    region.start.max(start).saturating_sub(region.start),
+                ),
+            });
+
+            if end < region.end {
+                updated.push(MmapRegion {
+                    start: end,
+                    end: region.end,
+                    page_flags: region.page_flags,
+                    mmap_flags: region.mmap_flags,
+                    backing: Self::adjusted_mmap_backing(
+                        &region.backing,
+                        end.saturating_sub(region.start),
+                    ),
+                });
+            }
+        }
+        self.mmap_regions = updated;
+        self.coalesce_mmap_regions();
+    }
+
+    pub fn remove_mmap_region_range(&mut self, start: u64, end: u64) {
+        let mut updated = Vec::with_capacity(self.mmap_regions.len());
+        for region in self.mmap_regions.drain(..) {
+            if end <= region.start || start >= region.end {
+                updated.push(region);
+                continue;
+            }
+            if start > region.start {
+                updated.push(MmapRegion {
+                    start: region.start,
+                    end: start,
+                    ..region.clone()
+                });
+            }
+            if end < region.end {
+                updated.push(MmapRegion {
+                    start: end,
+                    end: region.end,
+                    page_flags: region.page_flags,
+                    mmap_flags: region.mmap_flags,
+                    backing: Self::adjusted_mmap_backing(
+                        &region.backing,
+                        end.saturating_sub(region.start),
+                    ),
+                });
+            }
+        }
+        self.mmap_regions = updated;
+        self.coalesce_mmap_regions();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,14 +433,14 @@ pub struct PendingSyscall {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChildEventKind {
+pub enum ChildEventKind {
     Exited(i32),
     Stopped(u8),
     Continued,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ChildEvent {
+pub struct ChildEvent {
     pub pid: Pid,
     pub kind: ChildEventKind,
 }
@@ -276,6 +487,13 @@ pub trait ProcessServices {
     -> SysResult<u64>;
     fn bind_socket(&mut self, fs: &ProcessFsContext, path: &str, mode: u32) -> SysResult<u64>;
     fn unlink(&mut self, fs: &ProcessFsContext, path: &str, flags: u64) -> SysResult<u64>;
+    fn link(
+        &mut self,
+        fs: &ProcessFsContext,
+        old_path: &str,
+        new_path: &str,
+        flags: u64,
+    ) -> SysResult<u64>;
     fn rename(&mut self, fs: &ProcessFsContext, old_path: &str, new_path: &str) -> SysResult<u64>;
     fn getcwd(&mut self, fs: &ProcessFsContext) -> String;
     fn chdir(&mut self, fs: &mut ProcessFsContext, path: &str) -> SysResult<u64>;

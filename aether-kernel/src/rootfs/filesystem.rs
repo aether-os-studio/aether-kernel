@@ -89,6 +89,14 @@ impl MountedVfsNode {
             device_id: self.device_id,
         }))
     }
+
+    fn unwrap_peer(node: &NodeRef) -> NodeRef {
+        node.operations()
+            .as_any()
+            .downcast_ref::<Self>()
+            .map(|mounted| mounted.node.clone())
+            .unwrap_or_else(|| node.clone())
+    }
 }
 
 impl InodeOperations for MountedVfsNode {
@@ -124,7 +132,11 @@ impl InodeOperations for MountedVfsNode {
         replace: bool,
     ) -> FsResult<()> {
         self.node
-            .rename_child(old_name, new_parent, new_name, replace)
+            .rename_child(old_name, &Self::unwrap_peer(new_parent), new_name, replace)
+    }
+
+    fn link_child(&self, name: String, existing: &NodeRef) -> FsResult<()> {
+        self.node.link_child(name, &Self::unwrap_peer(existing))
     }
 
     fn create_file(&self, name: String, mode: u32) -> FsResult<NodeRef> {

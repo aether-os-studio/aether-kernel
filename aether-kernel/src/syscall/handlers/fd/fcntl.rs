@@ -1,3 +1,5 @@
+use aether_vfs::SharedMemoryFile;
+
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
 use crate::process::{ProcessServices, ProcessSyscallContext};
@@ -14,6 +16,8 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         const F_SETFD: u64 = 2;
         const F_GETFL: u64 = 3;
         const F_SETFL: u64 = 4;
+        const F_ADD_SEALS: u64 = 1033;
+        const F_GET_SEALS: u64 = 1034;
         const F_DUPFD_CLOEXEC: u64 = 1030;
         const FD_CLOEXEC: u64 = 1;
         const O_APPEND: u64 = 0o2000;
@@ -63,6 +67,31 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 }
                 file.set_flags(aether_vfs::OpenFlags::from_bits(next));
                 Ok(0)
+            }
+            F_ADD_SEALS => {
+                let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
+                let file = descriptor.file.lock();
+                let node = file.node();
+                let Some(shared) = node
+                    .file()
+                    .and_then(|ops| ops.as_any().downcast_ref::<SharedMemoryFile>())
+                else {
+                    return Err(SysErr::Inval);
+                };
+                shared.add_seals(arg as u32).map_err(SysErr::from)?;
+                Ok(0)
+            }
+            F_GET_SEALS => {
+                let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
+                let file = descriptor.file.lock();
+                let node = file.node();
+                let Some(shared) = node
+                    .file()
+                    .and_then(|ops| ops.as_any().downcast_ref::<SharedMemoryFile>())
+                else {
+                    return Err(SysErr::Inval);
+                };
+                Ok(shared.seals() as u64)
             }
             _ => Err(SysErr::Inval),
         }

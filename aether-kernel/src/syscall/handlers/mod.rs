@@ -9,6 +9,8 @@ mod brk;
 mod mmap;
 #[path = "memory/mprotect.rs"]
 mod mprotect;
+#[path = "memory/mremap.rs"]
+mod mremap;
 #[path = "memory/munmap.rs"]
 mod munmap;
 
@@ -20,6 +22,8 @@ mod clock_gettime;
 mod clock_nanosleep;
 #[path = "time/gettimeofday.rs"]
 mod gettimeofday;
+#[path = "time/time.rs"]
+mod time;
 #[path = "time/timerfd.rs"]
 mod timerfd;
 
@@ -96,6 +100,10 @@ mod inotify_init1;
 mod inotify_rm_watch;
 #[path = "fs/lchown.rs"]
 mod lchown;
+#[path = "fs/link.rs"]
+mod link;
+#[path = "fs/linkat.rs"]
+mod linkat;
 #[path = "fs/lstat.rs"]
 mod lstat;
 #[path = "fs/mkdir.rs"]
@@ -157,8 +165,12 @@ mod epoll_wait;
 mod eventfd;
 #[path = "fd/fadvise64.rs"]
 mod fadvise64;
+#[path = "fd/fallocate.rs"]
+mod fallocate;
 #[path = "fd/fcntl.rs"]
 mod fcntl;
+#[path = "fd/flock.rs"]
+mod flock;
 #[path = "fd/fstat.rs"]
 mod fstat;
 #[path = "fd/fstatfs.rs"]
@@ -169,12 +181,16 @@ mod getdents64;
 mod ioctl;
 #[path = "fd/lseek.rs"]
 mod lseek;
+#[path = "fd/memfd_create.rs"]
+mod memfd_create;
 #[path = "fd/pipe.rs"]
 mod pipe;
 #[path = "fd/pipe2.rs"]
 mod pipe2;
 #[path = "fd/poll.rs"]
 mod poll;
+#[path = "fd/ppoll.rs"]
+mod ppoll;
 #[path = "fd/pread64.rs"]
 mod pread64;
 #[path = "fd/preadv64.rs"]
@@ -343,6 +359,7 @@ pub fn init() {
             dup3::Dup3Syscall,
             ioctl::IoctlSyscall,
             fcntl::FcntlSyscall,
+            flock::FlockSyscall,
             fstat::FstatSyscall,
             fstatfs::FstatfsSyscall,
             futex::FutexSyscall,
@@ -359,6 +376,7 @@ pub fn init() {
             clock_getres::ClockGetresSyscall,
             clock_gettime::ClockGettimeSyscall,
             clock_nanosleep::ClockNanosleepSyscall,
+            time::TimeSyscall,
             timerfd::TimerfdCreateSyscall,
             timerfd::TimerfdSettimeSyscall,
             timerfd::TimerfdGettimeSyscall,
@@ -378,6 +396,7 @@ pub fn init() {
             mkdir::MkdirSyscall,
             mmap::MmapSyscall,
             mprotect::MprotectSyscall,
+            mremap::MremapSyscall,
             munmap::MunmapSyscall,
             open::OpenSyscall,
             openat::OpenAtSyscall,
@@ -392,14 +411,19 @@ pub fn init() {
             pipe::PipeSyscall,
             eventfd::EventfdSyscall,
             pipe2::Pipe2Syscall,
+            memfd_create::MemfdCreateSyscall,
             signalfd::SignalfdSyscall,
             signalfd4::Signalfd4Syscall,
             eventfd::Eventfd2Syscall,
+            fallocate::FallocateSyscall,
             inotify_init::InotifyInitSyscall,
             inotify_init1::InotifyInit1Syscall,
             inotify_add_watch::InotifyAddWatchSyscall,
             inotify_rm_watch::InotifyRmWatchSyscall,
+            link::LinkSyscall,
+            linkat::LinkAtSyscall,
             poll::PollSyscall,
+            ppoll::PpollSyscall,
             sendfile::SendfileSyscall,
             prctl::PrctlSyscall,
             epoll_create::EpollCreateSyscall,

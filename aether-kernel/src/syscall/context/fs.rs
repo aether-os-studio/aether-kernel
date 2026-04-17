@@ -5,6 +5,15 @@ pub trait FsSyscallContext {
     fn faccessat(&mut self, dirfd: i64, path: &str, mode: u64, flags: u64) -> SysResult<u64>;
     fn openat(&mut self, dirfd: i64, path: &str, flags: u64, mode: u64) -> SysResult<u64>;
     fn creat(&mut self, path: &str, mode: u64) -> SysResult<u64>;
+    fn link(&mut self, old_path: &str, new_path: &str) -> SysResult<u64>;
+    fn linkat(
+        &mut self,
+        olddirfd: i64,
+        old_path: &str,
+        newdirfd: i64,
+        new_path: &str,
+        flags: u64,
+    ) -> SysResult<u64>;
     fn symlink(&mut self, target: &str, linkpath: &str) -> SysResult<u64>;
     fn unlinkat(&mut self, dirfd: i64, path: &str, flags: u64) -> SysResult<u64>;
     fn readlinkat(&mut self, dirfd: i64, path: &str, address: u64, len: usize) -> SysResult<u64>;

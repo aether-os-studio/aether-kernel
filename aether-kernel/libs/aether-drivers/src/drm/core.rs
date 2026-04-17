@@ -1032,6 +1032,10 @@ struct DrmPrimaryDeviceNode {
 }
 
 impl KernelDevice for DrmPrimaryDeviceNode {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     fn metadata(&self) -> DeviceMetadata {
         DeviceMetadata::new(self.name.clone(), DeviceClass::Drm, DRM_MAJOR, self.minor)
     }

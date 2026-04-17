@@ -44,6 +44,10 @@ impl MiscCharDevice {
 }
 
 impl KernelDevice for MiscCharDevice {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     fn metadata(&self) -> DeviceMetadata {
         DeviceMetadata::new(self.name, DeviceClass::Misc, self.major, self.minor)
     }
@@ -120,6 +124,6 @@ impl FileOperations for MiscCharDeviceFile {
     }
 
     fn ioctl(&self, _command: u64, _argument: u64) -> FsResult<IoctlResponse> {
-        Ok(IoctlResponse::None(0))
+        Err(aether_vfs::FsError::Unsupported)
     }
 }

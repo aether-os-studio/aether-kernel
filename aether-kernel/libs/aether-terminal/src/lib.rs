@@ -2,17 +2,32 @@
 
 extern crate alloc;
 
+use aether_drivers::input::{
+    EV_KEY, InputDevice, InputEventSink, KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7,
+    KEY_8, KEY_9, KEY_A, KEY_APOSTROPHE, KEY_B, KEY_BACKSLASH, KEY_BACKSPACE, KEY_C, KEY_CAPSLOCK,
+    KEY_COMMA, KEY_D, KEY_DELETE, KEY_DOT, KEY_DOWN, KEY_E, KEY_END, KEY_ENTER, KEY_EQUAL, KEY_ESC,
+    KEY_F, KEY_G, KEY_GRAVE, KEY_H, KEY_HOME, KEY_I, KEY_INSERT, KEY_J, KEY_K, KEY_KP0, KEY_KP1,
+    KEY_KP2, KEY_KP3, KEY_KP4, KEY_KP5, KEY_KP6, KEY_KP7, KEY_KP8, KEY_KP9, KEY_KPASTERISK,
+    KEY_KPDOT, KEY_KPENTER, KEY_KPEQUAL, KEY_KPMINUS, KEY_KPPLUS, KEY_KPSLASH, KEY_L, KEY_LEFT,
+    KEY_LEFTALT, KEY_LEFTBRACE, KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_M, KEY_MINUS, KEY_N, KEY_O, KEY_P,
+    KEY_PAGEDOWN, KEY_PAGEUP, KEY_Q, KEY_R, KEY_RIGHT, KEY_RIGHTALT, KEY_RIGHTBRACE, KEY_RIGHTCTRL,
+    KEY_RIGHTSHIFT, KEY_S, KEY_SEMICOLON, KEY_SLASH, KEY_SPACE, KEY_T, KEY_TAB, KEY_U, KEY_UP,
+    KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z, LinuxInputEvent,
+};
 use aether_frame::serial_print;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::fmt;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use aether_device::{DeviceClass, DeviceMetadata, DeviceNode, KernelDevice, default_console_alias};
 use aether_frame::libs::spin::SpinLock;
 use aether_framebuffer::{FramebufferSurface, RgbColor};
-use aether_vfs::{FileNode, FileOperations, FsResult, IoctlResponse, PollEvents};
+use aether_vfs::{
+    FileNode, FileOperations, FsError, FsResult, IoctlResponse, PollEvents, SharedWaitListener,
+    WaitQueue,
+};
 use os_terminal::font::BitmapFont;
 use os_terminal::{DrawTarget, Rgb, Terminal};
 
@@ -37,8 +52,11 @@ const VMIN: usize = 6;
 const VSTART: usize = 8;
 const VSTOP: usize = 9;
 const VSUSP: usize = 10;
+const VEOL: usize = 11;
 
 const BRKINT: u32 = 0o000002;
+const IGNCR: u32 = 0o000200;
+const INLCR: u32 = 0o000100;
 const INPCK: u32 = 0o000020;
 const ISTRIP: u32 = 0o000040;
 const ICRNL: u32 = 0o000400;
@@ -54,6 +72,11 @@ const ICANON: u32 = 0o000002;
 const ECHO: u32 = 0o000010;
 const ECHOE: u32 = 0o000020;
 const ECHOK: u32 = 0o000040;
+
+const SIGINT: i32 = 2;
+const SIGQUIT: i32 = 3;
+const SIGTSTP: i32 = 20;
+const TTY_INPUT_BUF_SIZE: usize = 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,6 +298,21 @@ impl LinuxVtState {
     }
 }
 
+static mut PROCESS_GROUP_SIGNAL_HOOK: Option<fn(i32, i32)> = None;
+
+pub fn register_process_group_signal_hook(hook: fn(i32, i32)) {
+    unsafe {
+        PROCESS_GROUP_SIGNAL_HOOK = Some(hook);
+    }
+}
+
+fn send_process_group_signal(process_group: i32, signal: i32) {
+    let hook = unsafe { PROCESS_GROUP_SIGNAL_HOOK };
+    if let Some(hook) = hook {
+        hook(process_group, signal);
+    }
+}
+
 pub trait TtyBackend: Send + Sync {
     fn write_bytes(&self, bytes: &[u8]);
 
@@ -308,6 +346,10 @@ impl FramebufferConsole {
 }
 
 impl KernelDevice for FramebufferConsole {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     fn metadata(&self) -> DeviceMetadata {
         DeviceMetadata::new("tty0", DeviceClass::Console, 4, 0)
     }
@@ -347,6 +389,14 @@ impl fmt::Write for FramebufferConsole {
     }
 }
 
+impl InputEventSink for FramebufferConsole {
+    fn on_input_event(&self, device: &InputDevice, event: LinuxInputEvent) {
+        self.group
+            .active_console_file()
+            .receive_input_event(device, event);
+    }
+}
+
 pub struct TtyFile {
     attachment: TtyAttachment,
 }
@@ -373,11 +423,23 @@ struct ConsoleTtyState {
     tty_mode: i32,
     keyboard_mode: i32,
     vt_mode: LinuxVtMode,
+    input_buf: [u8; TTY_INPUT_BUF_SIZE],
+    input_head: u16,
+    input_tail: u16,
+    input_count: u16,
+    canon_buf: [u8; TTY_INPUT_BUF_SIZE],
+    canon_count: u16,
+    key_shift: bool,
+    key_ctrl: bool,
+    key_alt: bool,
+    key_capslock: bool,
 }
 
 struct TtyEndpoint {
     backend: Arc<dyn TtyBackend>,
     tty: SpinLock<ConsoleTtyState>,
+    version: AtomicU64,
+    waiters: WaitQueue,
 }
 
 impl TtyEndpoint {
@@ -391,7 +453,19 @@ impl TtyEndpoint {
                 tty_mode: 0,
                 keyboard_mode: 0,
                 vt_mode: LinuxVtMode::default(),
+                input_buf: [0; TTY_INPUT_BUF_SIZE],
+                input_head: 0,
+                input_tail: 0,
+                input_count: 0,
+                canon_buf: [0; TTY_INPUT_BUF_SIZE],
+                canon_count: 0,
+                key_shift: false,
+                key_ctrl: false,
+                key_alt: false,
+                key_capslock: false,
             }),
+            version: AtomicU64::new(1),
+            waiters: WaitQueue::new(),
         }
     }
 
@@ -402,6 +476,535 @@ impl TtyEndpoint {
     fn activate(&self) {
         self.backend.activate();
     }
+
+    fn bump_version(&self) {
+        let _ = self.version.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn tty_input_enqueue_byte(state: &mut ConsoleTtyState, byte: u8) -> bool {
+    if state.input_count as usize >= TTY_INPUT_BUF_SIZE {
+        state.input_head = (state.input_head + 1) % TTY_INPUT_BUF_SIZE as u16;
+        state.input_count -= 1;
+    }
+
+    state.input_buf[state.input_tail as usize] = byte;
+    state.input_tail = (state.input_tail + 1) % TTY_INPUT_BUF_SIZE as u16;
+    state.input_count += 1;
+    true
+}
+
+fn tty_input_dequeue_byte(state: &mut ConsoleTtyState) -> Option<u8> {
+    if state.input_count == 0 {
+        return None;
+    }
+    let byte = state.input_buf[state.input_head as usize];
+    state.input_head = (state.input_head + 1) % TTY_INPUT_BUF_SIZE as u16;
+    state.input_count -= 1;
+    Some(byte)
+}
+
+fn tty_echo_bytes(endpoint: &TtyEndpoint, state: &ConsoleTtyState, bytes: &[u8]) {
+    if bytes.is_empty() || (state.termios.c_lflag & ECHO) == 0 {
+        return;
+    }
+    endpoint.write_bytes(bytes);
+}
+
+fn tty_echo_erase(endpoint: &TtyEndpoint, state: &ConsoleTtyState) {
+    if (state.termios.c_lflag & ECHO) == 0 {
+        return;
+    }
+    if (state.termios.c_lflag & ECHOE) != 0 {
+        endpoint.write_bytes(b"\x08 \x08");
+    }
+}
+
+fn tty_input_commit_canon(state: &mut ConsoleTtyState) -> bool {
+    let mut committed = false;
+    for index in 0..state.canon_count as usize {
+        committed |= tty_input_enqueue_byte(state, state.canon_buf[index]);
+    }
+    state.canon_count = 0;
+    committed
+}
+
+fn tty_shifted_digit(code: u16) -> Option<u8> {
+    Some(match code {
+        KEY_1 => b'!',
+        KEY_2 => b'@',
+        KEY_3 => b'#',
+        KEY_4 => b'$',
+        KEY_5 => b'%',
+        KEY_6 => b'^',
+        KEY_7 => b'&',
+        KEY_8 => b'*',
+        KEY_9 => b'(',
+        KEY_0 => b')',
+        _ => return None,
+    })
+}
+
+fn tty_lookup_key_char(code: u16, shift: bool, caps: bool) -> Option<u8> {
+    let byte = match code {
+        KEY_A => {
+            if shift ^ caps {
+                b'A'
+            } else {
+                b'a'
+            }
+        }
+        KEY_B => {
+            if shift ^ caps {
+                b'B'
+            } else {
+                b'b'
+            }
+        }
+        KEY_C => {
+            if shift ^ caps {
+                b'C'
+            } else {
+                b'c'
+            }
+        }
+        KEY_D => {
+            if shift ^ caps {
+                b'D'
+            } else {
+                b'd'
+            }
+        }
+        KEY_E => {
+            if shift ^ caps {
+                b'E'
+            } else {
+                b'e'
+            }
+        }
+        KEY_F => {
+            if shift ^ caps {
+                b'F'
+            } else {
+                b'f'
+            }
+        }
+        KEY_G => {
+            if shift ^ caps {
+                b'G'
+            } else {
+                b'g'
+            }
+        }
+        KEY_H => {
+            if shift ^ caps {
+                b'H'
+            } else {
+                b'h'
+            }
+        }
+        KEY_I => {
+            if shift ^ caps {
+                b'I'
+            } else {
+                b'i'
+            }
+        }
+        KEY_J => {
+            if shift ^ caps {
+                b'J'
+            } else {
+                b'j'
+            }
+        }
+        KEY_K => {
+            if shift ^ caps {
+                b'K'
+            } else {
+                b'k'
+            }
+        }
+        KEY_L => {
+            if shift ^ caps {
+                b'L'
+            } else {
+                b'l'
+            }
+        }
+        KEY_M => {
+            if shift ^ caps {
+                b'M'
+            } else {
+                b'm'
+            }
+        }
+        KEY_N => {
+            if shift ^ caps {
+                b'N'
+            } else {
+                b'n'
+            }
+        }
+        KEY_O => {
+            if shift ^ caps {
+                b'O'
+            } else {
+                b'o'
+            }
+        }
+        KEY_P => {
+            if shift ^ caps {
+                b'P'
+            } else {
+                b'p'
+            }
+        }
+        KEY_Q => {
+            if shift ^ caps {
+                b'Q'
+            } else {
+                b'q'
+            }
+        }
+        KEY_R => {
+            if shift ^ caps {
+                b'R'
+            } else {
+                b'r'
+            }
+        }
+        KEY_S => {
+            if shift ^ caps {
+                b'S'
+            } else {
+                b's'
+            }
+        }
+        KEY_T => {
+            if shift ^ caps {
+                b'T'
+            } else {
+                b't'
+            }
+        }
+        KEY_U => {
+            if shift ^ caps {
+                b'U'
+            } else {
+                b'u'
+            }
+        }
+        KEY_V => {
+            if shift ^ caps {
+                b'V'
+            } else {
+                b'v'
+            }
+        }
+        KEY_W => {
+            if shift ^ caps {
+                b'W'
+            } else {
+                b'w'
+            }
+        }
+        KEY_X => {
+            if shift ^ caps {
+                b'X'
+            } else {
+                b'x'
+            }
+        }
+        KEY_Y => {
+            if shift ^ caps {
+                b'Y'
+            } else {
+                b'y'
+            }
+        }
+        KEY_Z => {
+            if shift ^ caps {
+                b'Z'
+            } else {
+                b'z'
+            }
+        }
+        KEY_1 => {
+            if shift {
+                tty_shifted_digit(code)?
+            } else {
+                b'1'
+            }
+        }
+        KEY_2 => {
+            if shift {
+                tty_shifted_digit(code)?
+            } else {
+                b'2'
+            }
+        }
+        KEY_3 => {
+            if shift {
+                tty_shifted_digit(code)?
+            } else {
+                b'3'
+            }
+        }
+        KEY_4 => {
+            if shift {
+                tty_shifted_digit(code)?
+            } else {
+                b'4'
+            }
+        }
+        KEY_5 => {
+            if shift {
+                tty_shifted_digit(code)?
+            } else {
+                b'5'
+            }
+        }
+        KEY_6 => {
+            if shift {
+                tty_shifted_digit(code)?
+            } else {
+                b'6'
+            }
+        }
+        KEY_7 => {
+            if shift {
+                tty_shifted_digit(code)?
+            } else {
+                b'7'
+            }
+        }
+        KEY_8 => {
+            if shift {
+                tty_shifted_digit(code)?
+            } else {
+                b'8'
+            }
+        }
+        KEY_9 => {
+            if shift {
+                tty_shifted_digit(code)?
+            } else {
+                b'9'
+            }
+        }
+        KEY_0 => {
+            if shift {
+                tty_shifted_digit(code)?
+            } else {
+                b'0'
+            }
+        }
+        KEY_KP0 => b'0',
+        KEY_KP1 => b'1',
+        KEY_KP2 => b'2',
+        KEY_KP3 => b'3',
+        KEY_KP4 => b'4',
+        KEY_KP5 => b'5',
+        KEY_KP6 => b'6',
+        KEY_KP7 => b'7',
+        KEY_KP8 => b'8',
+        KEY_KP9 => b'9',
+        _ => return None,
+    };
+    Some(byte)
+}
+
+fn tty_translate_key(state: &ConsoleTtyState, code: u16, out: &mut [u8; 8]) -> Option<usize> {
+    let shift = state.key_shift;
+    let ctrl = state.key_ctrl;
+    let caps = state.key_capslock;
+    let mut byte = match code {
+        KEY_ENTER | KEY_KPENTER => b'\n',
+        KEY_ESC => 27,
+        KEY_BACKSPACE => 127,
+        KEY_TAB => b'\t',
+        KEY_SPACE => b' ',
+        KEY_MINUS => {
+            if shift {
+                b'_'
+            } else {
+                b'-'
+            }
+        }
+        KEY_EQUAL | KEY_KPEQUAL => {
+            if shift {
+                b'+'
+            } else {
+                b'='
+            }
+        }
+        KEY_LEFTBRACE => {
+            if shift {
+                b'{'
+            } else {
+                b'['
+            }
+        }
+        KEY_RIGHTBRACE => {
+            if shift {
+                b'}'
+            } else {
+                b']'
+            }
+        }
+        KEY_BACKSLASH => {
+            if shift {
+                b'|'
+            } else {
+                b'\\'
+            }
+        }
+        KEY_SEMICOLON => {
+            if shift {
+                b':'
+            } else {
+                b';'
+            }
+        }
+        KEY_APOSTROPHE => {
+            if shift {
+                b'"'
+            } else {
+                b'\''
+            }
+        }
+        KEY_GRAVE => {
+            if shift {
+                b'~'
+            } else {
+                b'`'
+            }
+        }
+        KEY_COMMA => {
+            if shift {
+                b'<'
+            } else {
+                b','
+            }
+        }
+        KEY_DOT => {
+            if shift {
+                b'>'
+            } else {
+                b'.'
+            }
+        }
+        KEY_SLASH | KEY_KPSLASH => {
+            if shift {
+                b'?'
+            } else {
+                b'/'
+            }
+        }
+        KEY_KPASTERISK => b'*',
+        KEY_KPMINUS => b'-',
+        KEY_KPPLUS => b'+',
+        KEY_KPDOT => b'.',
+        KEY_UP => return write_escape(out, b"\x1b[A"),
+        KEY_DOWN => return write_escape(out, b"\x1b[B"),
+        KEY_RIGHT => return write_escape(out, b"\x1b[C"),
+        KEY_LEFT => return write_escape(out, b"\x1b[D"),
+        KEY_HOME => return write_escape(out, b"\x1b[H"),
+        KEY_END => return write_escape(out, b"\x1b[F"),
+        KEY_PAGEUP => return write_escape(out, b"\x1b[5~"),
+        KEY_PAGEDOWN => return write_escape(out, b"\x1b[6~"),
+        KEY_INSERT => return write_escape(out, b"\x1b[2~"),
+        KEY_DELETE => return write_escape(out, b"\x1b[3~"),
+        _ => tty_lookup_key_char(code, shift, caps)?,
+    };
+
+    if ctrl && byte.is_ascii_alphabetic() {
+        byte = (byte.to_ascii_lowercase() - b'a') + 1;
+    }
+    out[0] = byte;
+    Some(1)
+}
+
+fn write_escape(out: &mut [u8; 8], bytes: &[u8]) -> Option<usize> {
+    if bytes.len() > out.len() {
+        return None;
+    }
+    out[..bytes.len()].copy_from_slice(bytes);
+    Some(bytes.len())
+}
+
+fn tty_receive_bytes(endpoint: &TtyEndpoint, state: &mut ConsoleTtyState, bytes: &[u8]) -> bool {
+    let mut wake = false;
+    let canonical = (state.termios.c_lflag & ICANON) != 0;
+    let eofc = state.termios.c_cc[VEOF];
+
+    for mut byte in bytes.iter().copied() {
+        if (state.termios.c_iflag & IGNCR) != 0 && byte == b'\r' {
+            continue;
+        }
+        if (state.termios.c_iflag & ICRNL) != 0 && byte == b'\r' {
+            byte = b'\n';
+        } else if (state.termios.c_iflag & INLCR) != 0 && byte == b'\n' {
+            byte = b'\r';
+        }
+
+        if (state.termios.c_lflag & ISIG) != 0 && state.process_group != 0 {
+            if byte == state.termios.c_cc[VINTR] {
+                send_process_group_signal(state.process_group, SIGINT);
+                continue;
+            }
+            if byte == state.termios.c_cc[VQUIT] {
+                send_process_group_signal(state.process_group, SIGQUIT);
+                continue;
+            }
+            if byte == state.termios.c_cc[VSUSP] {
+                send_process_group_signal(state.process_group, SIGTSTP);
+                continue;
+            }
+        }
+
+        if !canonical {
+            wake |= tty_input_enqueue_byte(state, byte);
+            tty_echo_bytes(endpoint, state, &[byte]);
+            continue;
+        }
+
+        if byte == state.termios.c_cc[VERASE] || byte == 127 {
+            if state.canon_count > 0 {
+                state.canon_count -= 1;
+                tty_echo_erase(endpoint, state);
+            }
+            continue;
+        }
+
+        if byte == state.termios.c_cc[VKILL] {
+            while state.canon_count > 0 {
+                state.canon_count -= 1;
+                tty_echo_erase(endpoint, state);
+            }
+            if (state.termios.c_lflag & ECHOK) != 0 {
+                tty_echo_bytes(endpoint, state, b"\n");
+            }
+            continue;
+        }
+
+        if byte == eofc {
+            wake |= tty_input_commit_canon(state);
+            continue;
+        }
+
+        if (state.canon_count as usize) < TTY_INPUT_BUF_SIZE {
+            state.canon_buf[state.canon_count as usize] = byte;
+            state.canon_count += 1;
+        }
+        tty_echo_bytes(endpoint, state, &[byte]);
+
+        if byte == b'\n' || byte == state.termios.c_cc[VEOL] {
+            wake |= tty_input_commit_canon(state);
+        }
+    }
+
+    wake
 }
 
 pub struct VirtualTerminalGroup {
@@ -621,6 +1224,52 @@ impl TtyFile {
     pub fn open_query(&self) -> i32 {
         self.group().map_or(1, |group| group.open_query())
     }
+
+    fn receive_input_event(&self, device: &InputDevice, event: LinuxInputEvent) {
+        if !device.is_keyboard() || event.type_ != EV_KEY {
+            return;
+        }
+
+        let endpoint = self.endpoint();
+        let wake = {
+            let mut state = endpoint.tty.lock_irqsave();
+            match event.code {
+                KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
+                    state.key_shift = event.value != 0;
+                    false
+                }
+                KEY_LEFTCTRL | KEY_RIGHTCTRL => {
+                    state.key_ctrl = event.value != 0;
+                    false
+                }
+                KEY_LEFTALT | KEY_RIGHTALT => {
+                    state.key_alt = event.value != 0;
+                    false
+                }
+                KEY_CAPSLOCK => {
+                    if event.value == 1 {
+                        state.key_capslock = !state.key_capslock;
+                    }
+                    false
+                }
+                _ => {
+                    if event.value == 0 {
+                        return;
+                    }
+                    let mut bytes = [0u8; 8];
+                    let Some(len) = tty_translate_key(&state, event.code, &mut bytes) else {
+                        return;
+                    };
+                    tty_receive_bytes(&endpoint, &mut state, &bytes[..len])
+                }
+            }
+        };
+
+        if wake {
+            endpoint.bump_version();
+            endpoint.waiters.notify(PollEvents::READ);
+        }
+    }
 }
 
 impl FileOperations for TtyFile {
@@ -628,8 +1277,39 @@ impl FileOperations for TtyFile {
         self
     }
 
-    fn read(&self, _offset: usize, _buffer: &mut [u8]) -> FsResult<usize> {
-        Ok(0)
+    fn read(&self, _offset: usize, buffer: &mut [u8]) -> FsResult<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
+        let endpoint = self.endpoint();
+        let mut state = endpoint.tty.lock_irqsave();
+        let vmin = state.termios.c_cc[VMIN].max(1) as usize;
+        let canonical = (state.termios.c_lflag & ICANON) != 0;
+
+        if state.input_count == 0 {
+            return Err(FsError::WouldBlock);
+        }
+
+        let mut read = 0usize;
+        while read < buffer.len() {
+            let Some(byte) = tty_input_dequeue_byte(&mut state) else {
+                break;
+            };
+            buffer[read] = byte;
+            read += 1;
+            if canonical && byte == b'\n' {
+                break;
+            }
+            if !canonical && read >= vmin {
+                break;
+            }
+        }
+
+        if read != 0 {
+            endpoint.bump_version();
+        }
+        Ok(read)
     }
 
     fn write(&self, _offset: usize, buffer: &[u8]) -> FsResult<usize> {
@@ -662,7 +1342,30 @@ impl FileOperations for TtyFile {
     }
 
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
-        Ok(self.endpoint().backend.poll_ready(events))
+        let endpoint = self.endpoint();
+        let mut ready = endpoint.backend.poll_ready(events);
+        let state = endpoint.tty.lock_irqsave();
+        if events.contains(PollEvents::READ) && state.input_count != 0 {
+            ready = ready | PollEvents::READ;
+        }
+        Ok(ready)
+    }
+
+    fn wait_token(&self) -> u64 {
+        self.endpoint().version.load(Ordering::Acquire)
+    }
+
+    fn register_waiter(
+        &self,
+        events: PollEvents,
+        listener: SharedWaitListener,
+    ) -> FsResult<Option<u64>> {
+        Ok(Some(self.endpoint().waiters.register(events, listener)))
+    }
+
+    fn unregister_waiter(&self, waiter_id: u64) -> FsResult<()> {
+        let _ = self.endpoint().waiters.unregister(waiter_id);
+        Ok(())
     }
 }
 

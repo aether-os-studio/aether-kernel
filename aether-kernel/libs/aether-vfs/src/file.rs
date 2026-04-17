@@ -1,10 +1,12 @@
 extern crate alloc;
 
 use aether_frame::libs::spin::SpinLock;
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::BitOr;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Dentry, DentryRef, FsError, FsResult, NodeRef, SharedWaitListener};
 
@@ -71,6 +73,7 @@ impl OpenFlags {
 pub enum IoctlResponse {
     None(u64),
     Data(Vec<u8>),
+    DataValue(Vec<u8>, u64),
 }
 
 impl IoctlResponse {
@@ -92,6 +95,7 @@ impl PollEvents {
     pub const READ: Self = Self { bits: 1 << 0 };
     pub const WRITE: Self = Self { bits: 1 << 1 };
     pub const ERROR: Self = Self { bits: 1 << 2 };
+    pub const LOCK: Self = Self { bits: 1 << 3 };
 
     pub const fn empty() -> Self {
         Self { bits: 0 }
@@ -141,16 +145,20 @@ pub struct MmapRequest {
     pub flags: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MmapKind {
     Buffered,
     DirectPhysical {
         physical_address: u64,
         cache_policy: MmapCachePolicy,
     },
+    SharedPhysical {
+        physical_pages: Arc<[u64]>,
+        cache_policy: MmapCachePolicy,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmapResponse {
     pub kind: MmapKind,
 }
@@ -166,6 +174,18 @@ impl MmapResponse {
         Self {
             kind: MmapKind::DirectPhysical {
                 physical_address,
+                cache_policy,
+            },
+        }
+    }
+
+    pub fn shared_physical(
+        physical_pages: impl Into<Arc<[u64]>>,
+        cache_policy: MmapCachePolicy,
+    ) -> Self {
+        Self {
+            kind: MmapKind::SharedPhysical {
+                physical_pages: physical_pages.into(),
                 cache_policy,
             },
         }
@@ -257,6 +277,10 @@ impl VfsFile {
         self.inode().advise(offset, len, advice)
     }
 
+    pub fn fallocate(&self, mode: u32, offset: u64, len: u64) -> FsResult<()> {
+        self.inode().fallocate(mode, offset, len)
+    }
+
     pub fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
         self.inode().poll(events)
     }
@@ -289,20 +313,27 @@ impl Drop for VfsFile {
 }
 
 pub struct OpenFileDescription {
+    id: u64,
     file: VfsFile,
 }
 
 impl OpenFileDescription {
     pub fn new(node: NodeRef, flags: OpenFlags) -> Self {
         Self {
+            id: next_open_file_description_id(),
             file: VfsFile::from_inode(node, flags),
         }
     }
 
     pub fn from_dentry(dentry: DentryRef, flags: OpenFlags) -> Self {
         Self {
+            id: next_open_file_description_id(),
             file: VfsFile::new(dentry, flags),
         }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn node(&self) -> NodeRef {
@@ -345,6 +376,14 @@ impl OpenFileDescription {
         self.file.advise(offset, len, advice)
     }
 
+    pub fn fallocate(&self, mode: u32, offset: u64, len: u64) -> FsResult<()> {
+        self.file.fallocate(mode, offset, len)
+    }
+
+    pub fn flock(&self, operation: FlockOperation) -> FsResult<()> {
+        self.file.inode().flock(self.id, operation)
+    }
+
     pub fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
         self.file.poll(events)
     }
@@ -362,12 +401,49 @@ impl OpenFileDescription {
         events: PollEvents,
         listener: SharedWaitListener,
     ) -> FsResult<Option<u64>> {
+        if events.contains(PollEvents::LOCK) {
+            return Ok(Some(
+                FLOCK_WAITER_TAG | self.file.inode().register_flock_waiter(listener),
+            ));
+        }
         self.file.register_waiter(events, listener)
     }
 
     pub fn unregister_waiter(&self, waiter_id: u64) -> FsResult<()> {
+        if (waiter_id & FLOCK_WAITER_TAG) != 0 {
+            self.file
+                .inode()
+                .unregister_flock_waiter(waiter_id & !FLOCK_WAITER_TAG);
+            return Ok(());
+        }
         self.file.unregister_waiter(waiter_id)
     }
+}
+
+impl Drop for OpenFileDescription {
+    fn drop(&mut self) {
+        let _ = self.file.inode().flock(self.id, FlockOperation::Unlock);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlockOperation {
+    Shared,
+    Exclusive,
+    Unlock,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FlockState {
+    pub(crate) shared: BTreeSet<u64>,
+    pub(crate) exclusive: Option<u64>,
+}
+
+const FLOCK_WAITER_TAG: u64 = 1 << 63;
+static NEXT_OPEN_FILE_DESCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_open_file_description_id() -> u64 {
+    NEXT_OPEN_FILE_DESCRIPTION_ID.fetch_add(1, Ordering::AcqRel)
 }
 
 pub type SharedOpenFile = Arc<SpinLock<OpenFileDescription>>;
