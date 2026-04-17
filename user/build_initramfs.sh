@@ -1,0 +1,29 @@
+#!/bin/bash
+
+set -x # show cmds
+set -e # fail globally
+
+SCRIPT=$(realpath "$0")
+SCRIPTPATH=$(dirname "$SCRIPT")
+
+APK_PATH="$SCRIPTPATH/cache/$(uname -m)-apk-static"
+APK_URI="http://gitlab.alpinelinux.org/api/v4/projects/5/packages/generic/v2.14.10/$(uname -m)/apk.static"
+
+mkdir -p "$(dirname "$APK_PATH")"
+[ -f "$APK_PATH" ] || wget "$APK_URI" -O "$APK_PATH"
+chmod +x "$APK_PATH"
+
+ALPINE_VERSION=edge
+
+export APK_PATH ARCH SYSROOT ALPINE_VERSION SCRIPTPATH
+
+unshare -r -- /bin/bash -c '
+MIRROR_ROOT="http://mirrors.ustc.edu.cn/alpine"
+
+MIRROR="${MIRROR_ROOT}/${ALPINE_VERSION}"
+APK_CMD="$APK_PATH --arch $ARCH -U --allow-untrusted --root $SYSROOT/"
+
+$APK_CMD -X "$MIRROR/main" --initdb add busybox
+
+cp -r $SCRIPTPATH/init $SYSROOT
+'

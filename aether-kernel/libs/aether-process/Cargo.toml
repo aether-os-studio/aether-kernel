@@ -1,0 +1,8 @@
+[package]
+name = "aether-process"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aether-frame = { path = "../../../aether-frame" }
+xmas-elf = "=0.10.0"

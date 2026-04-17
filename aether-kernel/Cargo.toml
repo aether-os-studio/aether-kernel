@@ -1,0 +1,20 @@
+[package]
+name = "aether-kernel"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+aether-macros = { path = "../aether-frame/libs/aether-macros" }
+aether-device = { path = "libs/aether-device" }
+aether-drivers = { path = "libs/aether-drivers" }
+aether-fs = { path = "libs/aether-fs" }
+aether-framebuffer = { path = "libs/aether-framebuffer" }
+aether-frame = { path = "../aether-frame" }
+aether-initramfs = { path = "libs/aether-initramfs" }
+aether-kmsg = { path = "libs/aether-kmsg" }
+aether-process = { path = "libs/aether-process" }
+aether-terminal = { path = "libs/aether-terminal" }
+aether-tmpfs = { path = "libs/aether-tmpfs" }
+aether-vfs = { path = "libs/aether-vfs" }
+log = "0.4.29"

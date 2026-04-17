@@ -1,0 +1,13 @@
+[package]
+name = "aether-drivers"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+acpi = "6.1.1"
+aether-device = { path = "../aether-device" }
+aether-fs = { path = "../aether-fs" }
+aether-frame = { path = "../../../aether-frame" }
+aether-framebuffer = { path = "../aether-framebuffer" }
+aether-vfs = { path = "../aether-vfs" }
+log = "0.4.29"

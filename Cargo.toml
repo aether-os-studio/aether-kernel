@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "aether-frame",
+    "aether-frame/libs/aether-macros",
+    "aether-kernel/libs/aether-device",
+    "aether-kernel/libs/aether-drivers",
+    "aether-kernel/libs/aether-fs",
+    "aether-kernel",
+    "aether-kernel/libs/aether-framebuffer",
+    "aether-kernel/libs/aether-initramfs",
+    "aether-kernel/libs/aether-kmsg",
+    "aether-kernel/libs/aether-process",
+    "aether-kernel/libs/aether-terminal",
+    "aether-kernel/libs/aether-tmpfs",
+    "aether-kernel/libs/aether-vfs",
+    "xtask",
+]
+
+exclude = [
+    "target",
+    "docs",
+]
+
+default-members = ["xtask"]
+
+resolver = "2"

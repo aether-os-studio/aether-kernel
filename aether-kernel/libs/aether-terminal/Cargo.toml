@@ -1,0 +1,12 @@
+[package]
+name = "aether-terminal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aether-device = { path = "../aether-device" }
+aether-frame = { path = "../../../aether-frame" }
+aether-framebuffer = { path = "../aether-framebuffer" }
+aether-vfs = { path = "../aether-vfs" }
+log = "0.4.29"
+os-terminal = "=0.7.3"

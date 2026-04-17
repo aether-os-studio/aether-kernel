@@ -1,0 +1,9 @@
+[package]
+name = "aether-initramfs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpio_reader = "0.1"
+aether-tmpfs = { path = "../aether-tmpfs" }
+aether-vfs = { path = "../aether-vfs" }

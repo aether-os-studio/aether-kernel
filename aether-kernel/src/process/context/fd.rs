@@ -1,0 +1,1175 @@
+#![allow(dead_code)]
+
+use alloc::sync::Arc;
+
+use aether_vfs::FileAdvice;
+
+use super::*;
+use crate::fs::FileDescriptor;
+use crate::net::{
+    AcceptedSocket, KernelSocket, SCM_CREDENTIALS, SCM_RIGHTS, SocketCredentials, SocketFile,
+    SocketMessage, SocketReceive,
+};
+use crate::rootfs::{FsLocation, ProcessFsContext};
+
+const IOV_MAX: usize = 1024;
+const MAX_RW_COUNT: usize = 0x7fff_f000;
+const POLLFD_SIZE: usize = 8;
+
+const POLLIN: i16 = 0x001;
+const POLLPRI: i16 = 0x002;
+const POLLOUT: i16 = 0x004;
+const POLLERR: i16 = 0x008;
+const POLLHUP: i16 = 0x010;
+const POLLNVAL: i16 = 0x020;
+const POLLRDNORM: i16 = 0x040;
+const POLLRDBAND: i16 = 0x080;
+const POLLWRNORM: i16 = 0x100;
+const POLLWRBAND: i16 = 0x200;
+const MSG_PEEK: u64 = 0x0002;
+const MSG_CTRUNC: u32 = 0x0008;
+const MSG_TRUNC: u32 = 0x0020;
+const MSG_DONTWAIT: u64 = 0x0040;
+const MSG_CMSG_CLOEXEC: u64 = 0x40000000;
+const SOCK_NONBLOCK: u64 = 0o0004000;
+const SOCK_CLOEXEC: u64 = 0o2000000;
+const ACCEPT4_FLAGS_MASK: u64 = SOCK_NONBLOCK | SOCK_CLOEXEC;
+const SCM_MAX_FD: usize = 253;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LinuxPollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+impl LinuxPollFd {
+    fn read_from(
+        ctx: &ProcessSyscallContext<'_, impl ProcessServices>,
+        address: u64,
+    ) -> SysResult<Self> {
+        let bytes = ctx.syscall_read_user_exact_buffer(address, POLLFD_SIZE)?;
+        Ok(Self {
+            fd: i32::from_ne_bytes(bytes[0..4].try_into().map_err(|_| SysErr::Fault)?),
+            events: i16::from_ne_bytes(bytes[4..6].try_into().map_err(|_| SysErr::Fault)?),
+            revents: i16::from_ne_bytes(bytes[6..8].try_into().map_err(|_| SysErr::Fault)?),
+        })
+    }
+
+    fn to_bytes(self) -> [u8; POLLFD_SIZE] {
+        let mut bytes = [0u8; POLLFD_SIZE];
+        bytes[0..4].copy_from_slice(&self.fd.to_ne_bytes());
+        bytes[4..6].copy_from_slice(&self.events.to_ne_bytes());
+        bytes[6..8].copy_from_slice(&self.revents.to_ne_bytes());
+        bytes
+    }
+
+    const fn into_pending(self) -> crate::process::PendingPollFd {
+        crate::process::PendingPollFd {
+            fd: self.fd,
+            events: self.events,
+        }
+    }
+}
+
+impl From<crate::process::PendingPollFd> for LinuxPollFd {
+    fn from(value: crate::process::PendingPollFd) -> Self {
+        Self {
+            fd: value.fd,
+            events: value.events,
+            revents: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LinuxMsghdr {
+    name: u64,
+    name_len: u32,
+    iov: u64,
+    iov_len: usize,
+    control: u64,
+    control_len: usize,
+    flags: u32,
+}
+
+impl LinuxMsghdr {
+    const SIZE: usize = 56;
+
+    fn read_from(
+        ctx: &ProcessSyscallContext<'_, impl ProcessServices>,
+        address: u64,
+    ) -> SysResult<Self> {
+        let bytes = ctx.syscall_read_user_exact_buffer(address, Self::SIZE)?;
+        Ok(Self {
+            name: u64::from_ne_bytes(bytes[0..8].try_into().map_err(|_| SysErr::Fault)?),
+            name_len: u32::from_ne_bytes(bytes[8..12].try_into().map_err(|_| SysErr::Fault)?),
+            iov: u64::from_ne_bytes(bytes[16..24].try_into().map_err(|_| SysErr::Fault)?),
+            iov_len: u64::from_ne_bytes(bytes[24..32].try_into().map_err(|_| SysErr::Fault)?)
+                .min(usize::MAX as u64) as usize,
+            control: u64::from_ne_bytes(bytes[32..40].try_into().map_err(|_| SysErr::Fault)?),
+            control_len: u64::from_ne_bytes(bytes[40..48].try_into().map_err(|_| SysErr::Fault)?)
+                .min(usize::MAX as u64) as usize,
+            flags: u32::from_ne_bytes(bytes[48..52].try_into().map_err(|_| SysErr::Fault)?),
+        })
+    }
+
+    fn write_back(
+        self,
+        ctx: &mut ProcessSyscallContext<'_, impl ProcessServices>,
+        address: u64,
+    ) -> SysResult<()> {
+        let mut bytes = [0u8; Self::SIZE];
+        bytes[0..8].copy_from_slice(&self.name.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&self.name_len.to_ne_bytes());
+        bytes[16..24].copy_from_slice(&self.iov.to_ne_bytes());
+        bytes[24..32].copy_from_slice(&(self.iov_len as u64).to_ne_bytes());
+        bytes[32..40].copy_from_slice(&self.control.to_ne_bytes());
+        bytes[40..48].copy_from_slice(&(self.control_len as u64).to_ne_bytes());
+        bytes[48..52].copy_from_slice(&self.flags.to_ne_bytes());
+        ctx.write_user_buffer(address, &bytes)
+    }
+}
+
+const fn cmsg_header_len() -> usize {
+    core::mem::size_of::<usize>() + core::mem::size_of::<i32>() * 2
+}
+
+const fn cmsg_align(len: usize) -> usize {
+    let align = core::mem::size_of::<usize>();
+    (len + align - 1) & !(align - 1)
+}
+
+const fn cmsg_len(data_len: usize) -> usize {
+    cmsg_header_len() + data_len
+}
+
+const fn cmsg_space(data_len: usize) -> usize {
+    cmsg_align(cmsg_len(data_len))
+}
+
+fn serialize_cmsg(level: i32, kind: i32, payload: &[u8]) -> Vec<u8> {
+    let used = cmsg_len(payload.len());
+    let total = cmsg_space(payload.len());
+    let mut bytes = vec![0u8; total];
+    let len_bytes = used.to_ne_bytes();
+    bytes[..core::mem::size_of::<usize>()].copy_from_slice(&len_bytes);
+    let level_offset = core::mem::size_of::<usize>();
+    bytes[level_offset..level_offset + 4].copy_from_slice(&level.to_ne_bytes());
+    bytes[level_offset + 4..level_offset + 8].copy_from_slice(&kind.to_ne_bytes());
+    bytes[cmsg_header_len()..used].copy_from_slice(payload);
+    bytes
+}
+
+impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
+    pub(crate) fn should_not_block_socket_io(&self, fd: u32, flags: u64) -> bool {
+        (flags & MSG_DONTWAIT) != 0
+            || self
+                .process
+                .files
+                .get(fd)
+                .map(|descriptor| descriptor.file.lock().flags().nonblock())
+                .unwrap_or(false)
+    }
+
+    pub(super) fn syscall_poll(&mut self, fds: u64, nfds: usize, _timeout: i32) -> SysResult<u64> {
+        let mut poll_fds = self.read_poll_fds(fds, nfds)?;
+        let ready = self.evaluate_poll_fds(&mut poll_fds)?;
+        self.write_poll_fds(fds, &poll_fds)?;
+        if ready == 0 {
+            return Err(SysErr::Again);
+        }
+        Ok(ready as u64)
+    }
+
+    pub(super) fn syscall_poll_blocking(
+        &mut self,
+        fds: u64,
+        nfds: usize,
+        timeout: i32,
+    ) -> SyscallDisposition {
+        if let Some(result) = self.process.wake_result.take() {
+            let Some(pending) = self.process.pending_poll.clone() else {
+                return SyscallDisposition::err(SysErr::Intr);
+            };
+            let mut poll_fds = pending
+                .items
+                .iter()
+                .copied()
+                .map(LinuxPollFd::from)
+                .collect::<Vec<_>>();
+            let ready = match self.evaluate_poll_fds(&mut poll_fds) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    self.clear_pending_poll_state();
+                    return SyscallDisposition::err(error);
+                }
+            };
+            if let Err(error) = self.write_poll_fds(pending.user_fds, &poll_fds) {
+                self.clear_pending_poll_state();
+                return SyscallDisposition::err(error);
+            }
+            return match result {
+                BlockResult::Poll { timed_out: true } => {
+                    self.clear_pending_poll_state();
+                    SyscallDisposition::ok(ready as u64)
+                }
+                BlockResult::Poll { timed_out: false } => {
+                    if ready != 0 {
+                        self.clear_pending_poll_state();
+                        SyscallDisposition::ok(ready as u64)
+                    } else {
+                        self.block_poll(pending.deadline_nanos)
+                    }
+                }
+                BlockResult::SignalInterrupted => {
+                    self.clear_pending_poll_state();
+                    SyscallDisposition::err(SysErr::Intr)
+                }
+                _ => {
+                    self.clear_pending_poll_state();
+                    SyscallDisposition::err(SysErr::Intr)
+                }
+            };
+        }
+
+        let mut poll_fds = match self.read_poll_fds(fds, nfds) {
+            Ok(poll_fds) => poll_fds,
+            Err(error) => return SyscallDisposition::err(error),
+        };
+        let ready = match self.evaluate_poll_fds(&mut poll_fds) {
+            Ok(ready) => ready,
+            Err(error) => return SyscallDisposition::err(error),
+        };
+        if let Err(error) = self.write_poll_fds(fds, &poll_fds) {
+            return SyscallDisposition::err(error);
+        }
+        if ready != 0 {
+            return SyscallDisposition::ok(ready as u64);
+        }
+
+        if timeout == 0 {
+            return SyscallDisposition::ok(0);
+        }
+
+        let deadline_nanos = if timeout > 0 {
+            Some(
+                aether_frame::interrupt::timer::nanos_since_boot()
+                    .saturating_add(timeout as u64 * 1_000_000),
+            )
+        } else {
+            None
+        };
+
+        let registrations = self.collect_poll_registrations(&poll_fds);
+        self.process.pending_poll = Some(crate::process::PendingPollState {
+            user_fds: fds,
+            deadline_nanos,
+            items: poll_fds
+                .iter()
+                .copied()
+                .map(LinuxPollFd::into_pending)
+                .collect(),
+            registrations,
+        });
+
+        self.block_poll(deadline_nanos)
+    }
+
+    pub(super) fn syscall_sendto(
+        &mut self,
+        fd: u64,
+        buffer: u64,
+        len: usize,
+        flags: u64,
+        address: u64,
+        address_len: usize,
+    ) -> SysResult<u64> {
+        let (_file_ref, socket) = self.socket_from_fd(fd)?;
+        let bytes = self.read_user_buffer(buffer, len)?;
+        let address = self.read_optional_socket_address(address, address_len)?;
+        socket
+            .send_to(bytes.as_slice(), address.as_deref(), flags)
+            .map(|written| written as u64)
+    }
+
+    pub(super) fn syscall_sendto_blocking(
+        &mut self,
+        fd: u64,
+        buffer: u64,
+        len: usize,
+        flags: u64,
+        address: u64,
+        address_len: usize,
+    ) -> SyscallDisposition {
+        if self.should_not_block_socket_io(fd as u32, flags) {
+            return SyscallDisposition::Return(self.syscall_sendto(
+                fd,
+                buffer,
+                len,
+                flags,
+                address,
+                address_len,
+            ));
+        }
+        self.file_blocking_syscall(fd as u32, PollEvents::WRITE, |ctx| {
+            ctx.syscall_sendto(fd, buffer, len, flags, address, address_len)
+        })
+    }
+
+    pub(super) fn syscall_recvfrom(
+        &mut self,
+        fd: u64,
+        buffer: u64,
+        len: usize,
+        flags: u64,
+        address: u64,
+        address_len: u64,
+    ) -> SysResult<u64> {
+        let (_file_ref, socket) = self.socket_from_fd(fd)?;
+        if address != 0 && address_len == 0 {
+            return Err(SysErr::Fault);
+        }
+        let mut bytes = vec![0u8; len];
+        let received = socket.recv_from(bytes.as_mut_slice(), flags)?;
+        self.write_user_buffer(buffer, &bytes[..received.bytes_read])?;
+        self.write_socket_receive_address(address, address_len, &received)?;
+        Ok(received.bytes_read as u64)
+    }
+
+    pub(super) fn syscall_recvfrom_blocking(
+        &mut self,
+        fd: u64,
+        buffer: u64,
+        len: usize,
+        flags: u64,
+        address: u64,
+        address_len: u64,
+    ) -> SyscallDisposition {
+        if self.should_not_block_socket_io(fd as u32, flags) {
+            return SyscallDisposition::Return(self.syscall_recvfrom(
+                fd,
+                buffer,
+                len,
+                flags,
+                address,
+                address_len,
+            ));
+        }
+        self.file_blocking_syscall(fd as u32, PollEvents::READ, |ctx| {
+            ctx.syscall_recvfrom(fd, buffer, len, flags, address, address_len)
+        })
+    }
+
+    pub(super) fn syscall_sendmsg(&mut self, fd: u64, message: u64, flags: u64) -> SysResult<u64> {
+        let (_file_ref, socket) = self.socket_from_fd(fd)?;
+        let message = self.read_socket_message(message)?;
+        socket
+            .send_msg(&message, flags)
+            .map(|written| written as u64)
+    }
+
+    pub(super) fn syscall_recvmsg(&mut self, fd: u64, message: u64, flags: u64) -> SysResult<u64> {
+        let (_file_ref, socket) = self.socket_from_fd(fd)?;
+        let mut header = LinuxMsghdr::read_from(self, message)?;
+        if header.iov_len > IOV_MAX {
+            return Err(SysErr::Inval);
+        }
+
+        let segments = super::super::util::read_iovec_array(
+            &self.process.task.address_space,
+            header.iov,
+            header.iov_len,
+        )?;
+        let total_len = segments.iter().try_fold(0usize, |total, segment| {
+            total
+                .checked_add(segment.len)
+                .filter(|next| *next <= MAX_RW_COUNT)
+                .ok_or(SysErr::Inval)
+        })?;
+
+        let mut bytes = vec![0u8; total_len];
+        let received = socket.recv_msg(bytes.as_mut_slice(), flags)?;
+        self.write_iovec_bytes(&segments, &bytes[..received.bytes_read])?;
+        self.write_socket_receive_name(header.name, header.name_len as u64, &received)?;
+        let (control_len, control_flags) = self.write_socket_receive_control(
+            header.control,
+            header.control_len,
+            &received,
+            flags,
+        )?;
+
+        header.name_len = received
+            .address
+            .as_ref()
+            .filter(|_| header.name != 0)
+            .map(|name| name.len() as u32)
+            .unwrap_or(0);
+        header.control_len = control_len;
+        header.flags = received.msg_flags | control_flags;
+        header.write_back(self, message)?;
+        Ok(received.bytes_read as u64)
+    }
+
+    pub(super) fn syscall_sendmsg_blocking(
+        &mut self,
+        fd: u64,
+        message: u64,
+        flags: u64,
+    ) -> SyscallDisposition {
+        if self.should_not_block_socket_io(fd as u32, flags) {
+            return SyscallDisposition::Return(self.syscall_sendmsg(fd, message, flags));
+        }
+        self.file_blocking_syscall(fd as u32, PollEvents::WRITE, |ctx| {
+            ctx.syscall_sendmsg(fd, message, flags)
+        })
+    }
+
+    pub(super) fn syscall_recvmsg_blocking(
+        &mut self,
+        fd: u64,
+        message: u64,
+        flags: u64,
+    ) -> SyscallDisposition {
+        if self.should_not_block_socket_io(fd as u32, flags) {
+            return SyscallDisposition::Return(self.syscall_recvmsg(fd, message, flags));
+        }
+        self.file_blocking_syscall(fd as u32, PollEvents::READ, |ctx| {
+            ctx.syscall_recvmsg(fd, message, flags)
+        })
+    }
+
+    fn create_epoll_fd(&mut self, cloexec: bool) -> SysResult<u64> {
+        let epoll = aether_vfs::create_epoll_instance();
+        let node: aether_vfs::NodeRef = aether_vfs::FileNode::new("epoll", epoll);
+        let filesystem = super::super::util::anonymous_filesystem_identity();
+        Ok(self.process.files.insert_node(
+            node,
+            aether_vfs::OpenFlags::from_bits(aether_vfs::OpenFlags::READ),
+            filesystem,
+            None,
+            cloexec,
+        ) as u64)
+    }
+
+    pub(super) fn syscall_epoll_create(&mut self, size: u64) -> SysResult<u64> {
+        if size == 0 {
+            return Err(SysErr::Inval);
+        }
+        self.create_epoll_fd(false)
+    }
+
+    pub(super) fn syscall_epoll_create1(&mut self, flags: u64) -> SysResult<u64> {
+        const EPOLL_CLOEXEC: u64 = 0o2000000;
+
+        if (flags & !EPOLL_CLOEXEC) != 0 {
+            return Err(SysErr::Inval);
+        }
+        self.create_epoll_fd((flags & EPOLL_CLOEXEC) != 0)
+    }
+
+    pub(super) fn syscall_epoll_ctl(
+        &mut self,
+        epfd: u64,
+        op: i32,
+        fd: u64,
+        event: u64,
+    ) -> SysResult<u64> {
+        let epoll_op = aether_vfs::EpollCtlOp::from_raw(op).ok_or(SysErr::Inval)?;
+
+        let epoll_descriptor = self.process.files.get(epfd as u32).ok_or(SysErr::BadFd)?;
+        let epoll_node = epoll_descriptor.file.lock().node();
+        let epoll_file = epoll_node
+            .file()
+            .and_then(|f| f.as_any().downcast_ref::<aether_vfs::EpollInstance>())
+            .ok_or(SysErr::Inval)?;
+
+        let target_descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
+        let target_node = target_descriptor.file.lock().node();
+
+        let epoll_event = if event != 0 {
+            let event_bytes = self.syscall_read_user_exact_buffer(event, 12)?;
+            aether_vfs::EpollEvent::from_bytes(&event_bytes.try_into().unwrap_or([0; 12]))
+        } else {
+            aether_vfs::EpollEvent::default()
+        };
+
+        epoll_file.ctl(epoll_op, fd, target_node, epoll_event)?;
+        Ok(0)
+    }
+
+    pub(super) fn syscall_epoll_wait(
+        &mut self,
+        epfd: u64,
+        events: u64,
+        maxevents: usize,
+        timeout: i32,
+    ) -> SysResult<u64> {
+        self.syscall_epoll_pwait(epfd, events, maxevents, timeout, 0)
+    }
+
+    pub(super) fn syscall_epoll_wait_blocking(
+        &mut self,
+        epfd: u64,
+        events: u64,
+        maxevents: usize,
+        timeout: i32,
+    ) -> SyscallDisposition {
+        self.syscall_epoll_pwait_blocking(epfd, events, maxevents, timeout, 0)
+    }
+
+    pub(super) fn syscall_epoll_pwait(
+        &mut self,
+        epfd: u64,
+        events: u64,
+        maxevents: usize,
+        _timeout: i32,
+        sigmask: u64,
+    ) -> SysResult<u64> {
+        if maxevents == 0 {
+            return Err(SysErr::Inval);
+        }
+        if sigmask != 0 {
+            // epoll_pwait requires temporarily swapping the caller's signal mask around the wait.
+            // That mask choreography is not implemented yet.
+            return Err(SysErr::NoSys);
+        }
+
+        let epoll_descriptor = self.process.files.get(epfd as u32).ok_or(SysErr::BadFd)?;
+        let epoll_node = epoll_descriptor.file.lock().node();
+        let epoll_file = epoll_node
+            .file()
+            .and_then(|f| f.as_any().downcast_ref::<aether_vfs::EpollInstance>())
+            .ok_or(SysErr::Inval)?;
+
+        let ready_events = epoll_file.wait(maxevents)?;
+
+        if ready_events.is_empty() {
+            return Err(SysErr::Again);
+        }
+
+        for (i, ready_event) in ready_events.iter().enumerate() {
+            if i >= maxevents {
+                break;
+            }
+            let event_bytes = ready_event.to_bytes();
+            self.write_user_buffer(events + (i * 12) as u64, &event_bytes)?;
+        }
+
+        Ok(ready_events.len().min(maxevents) as u64)
+    }
+
+    pub(super) fn syscall_epoll_pwait_blocking(
+        &mut self,
+        epfd: u64,
+        events: u64,
+        maxevents: usize,
+        timeout: i32,
+        sigmask: u64,
+    ) -> SyscallDisposition {
+        if timeout == 0 {
+            return SyscallDisposition::Return(
+                self.syscall_epoll_pwait(epfd, events, maxevents, timeout, sigmask),
+            );
+        }
+        self.restartable_blocking_syscall(
+            |ctx| ctx.syscall_epoll_pwait(epfd, events, maxevents, timeout, sigmask),
+            |ctx| ctx.block_file(epfd as u32, PollEvents::READ),
+        )
+    }
+
+    fn read_poll_fds(&self, address: u64, nfds: usize) -> SysResult<Vec<LinuxPollFd>> {
+        const POLLFD_LIMIT: usize = 16 * 1024;
+
+        if nfds > POLLFD_LIMIT {
+            return Err(SysErr::Inval);
+        }
+
+        let mut poll_fds = Vec::with_capacity(nfds);
+        for index in 0..nfds {
+            let entry_address = address
+                .checked_add((index * POLLFD_SIZE) as u64)
+                .ok_or(SysErr::Fault)?;
+            poll_fds.push(LinuxPollFd::read_from(self, entry_address)?);
+        }
+        Ok(poll_fds)
+    }
+
+    fn write_poll_fds(&mut self, address: u64, poll_fds: &[LinuxPollFd]) -> SysResult<()> {
+        for (index, poll_fd) in poll_fds.iter().enumerate() {
+            let entry_address = address
+                .checked_add((index * POLLFD_SIZE) as u64)
+                .ok_or(SysErr::Fault)?;
+            self.write_user_buffer(entry_address, &poll_fd.to_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn evaluate_poll_fds(&self, poll_fds: &mut [LinuxPollFd]) -> SysResult<usize> {
+        let mut ready_count = 0usize;
+
+        for poll_fd in poll_fds {
+            poll_fd.revents = 0;
+            if poll_fd.fd < 0 {
+                continue;
+            }
+
+            let Some(descriptor) = self.process.files.get(poll_fd.fd as u32) else {
+                poll_fd.revents = POLLNVAL;
+                ready_count += 1;
+                continue;
+            };
+
+            let requested = linux_poll_to_events(poll_fd.events);
+            let ready = descriptor
+                .file
+                .lock()
+                .poll(requested | PollEvents::ERROR)
+                .map_err(SysErr::from)?;
+            poll_fd.revents = events_to_linux_poll(ready);
+            if poll_fd.revents != 0 {
+                ready_count += 1;
+            }
+        }
+
+        Ok(ready_count)
+    }
+
+    fn collect_poll_registrations(
+        &self,
+        poll_fds: &[LinuxPollFd],
+    ) -> Vec<crate::process::PendingPollRegistration> {
+        let mut registrations = Vec::new();
+
+        for poll_fd in poll_fds.iter().copied() {
+            if poll_fd.fd < 0 {
+                continue;
+            }
+            let events = linux_poll_to_events(poll_fd.events);
+            if events.bits() == 0 {
+                continue;
+            }
+            let fd = poll_fd.fd as u32;
+            let Some(_descriptor) = self.process.files.get(fd) else {
+                continue;
+            };
+            registrations.push(crate::process::PendingPollRegistration { fd, events });
+        }
+
+        registrations
+    }
+
+    fn clear_pending_poll_state(&mut self) {
+        self.process.pending_poll = None;
+    }
+
+    pub(crate) fn socket_from_fd(
+        &self,
+        fd: u64,
+    ) -> SysResult<(aether_vfs::SharedOpenFile, Arc<dyn KernelSocket>)> {
+        let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
+        let file_ref = descriptor.file.clone();
+        let node = file_ref.lock().node();
+        let socket = node
+            .file()
+            .and_then(|file| file.as_any().downcast_ref::<SocketFile>())
+            .map(SocketFile::socket)
+            .ok_or(SysErr::NotSock)?;
+        Ok((file_ref, socket))
+    }
+
+    pub(crate) fn read_socket_address(
+        &self,
+        address: u64,
+        address_len: usize,
+    ) -> SysResult<Vec<u8>> {
+        if address == 0 {
+            return Err(SysErr::Fault);
+        }
+        self.syscall_read_user_exact_buffer(address, address_len)
+    }
+
+    fn read_optional_socket_address(
+        &self,
+        address: u64,
+        address_len: usize,
+    ) -> SysResult<Option<Vec<u8>>> {
+        if address == 0 || address_len == 0 {
+            Ok(None)
+        } else {
+            self.read_socket_address(address, address_len).map(Some)
+        }
+    }
+
+    fn read_socket_message(&self, address: u64) -> SysResult<SocketMessage> {
+        let header = LinuxMsghdr::read_from(self, address)?;
+        if header.iov_len > IOV_MAX {
+            return Err(SysErr::Inval);
+        }
+
+        let name = self.read_optional_socket_address(header.name, header.name_len as usize)?;
+        let control = if header.control == 0 || header.control_len == 0 {
+            Vec::new()
+        } else {
+            self.syscall_read_user_exact_buffer(header.control, header.control_len)?
+        };
+        let (rights, explicit_credentials) = self.parse_socket_send_control(&control)?;
+
+        let segments = super::super::util::read_iovec_array(
+            &self.process.task.address_space,
+            header.iov,
+            header.iov_len,
+        )?;
+        let total_len = segments.iter().try_fold(0usize, |total, segment| {
+            total
+                .checked_add(segment.len)
+                .filter(|next| *next <= MAX_RW_COUNT)
+                .ok_or(SysErr::Inval)
+        })?;
+        let mut data = Vec::with_capacity(total_len);
+        for segment in segments {
+            if segment.len == 0 {
+                continue;
+            }
+            data.extend_from_slice(&self.read_user_buffer(segment.base, segment.len)?);
+        }
+
+        Ok(SocketMessage {
+            name,
+            data,
+            control,
+            rights,
+            sender: SocketCredentials::new(
+                self.process.identity.pid,
+                self.process.credentials.uid,
+                self.process.credentials.gid,
+            ),
+            explicit_credentials,
+            msg_flags: header.flags,
+        })
+    }
+
+    fn write_iovec_bytes(
+        &mut self,
+        segments: &[super::super::util::UserIoVec],
+        bytes: &[u8],
+    ) -> SysResult<()> {
+        let mut written = 0usize;
+        for segment in segments {
+            if written >= bytes.len() {
+                break;
+            }
+            let count = core::cmp::min(segment.len, bytes.len() - written);
+            if count == 0 {
+                continue;
+            }
+            self.write_user_buffer(segment.base, &bytes[written..written + count])?;
+            written += count;
+        }
+        Ok(())
+    }
+
+    fn write_socket_receive_name(
+        &mut self,
+        address: u64,
+        address_len: u64,
+        received: &SocketReceive,
+    ) -> SysResult<()> {
+        if let Some(name) = &received.address {
+            if address != 0 && address_len != 0 {
+                let count = core::cmp::min(address_len as usize, name.len());
+                if count != 0 {
+                    self.write_user_buffer(address, &name[..count])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_socket_receive_control(
+        &mut self,
+        address: u64,
+        address_len: usize,
+        received: &SocketReceive,
+        flags: u64,
+    ) -> SysResult<(usize, u32)> {
+        let mut msg_flags = 0u32;
+        let mut control = Vec::new();
+
+        if !received.control.is_empty() {
+            control.extend_from_slice(received.control.as_slice());
+        }
+
+        if !received.rights.is_empty() {
+            let base_len = control.len();
+            let available = address_len.saturating_sub(base_len);
+            let mut delivered = 0usize;
+            while delivered < received.rights.len() {
+                let remaining = received.rights.len() - delivered;
+                let mut fit = remaining;
+                while fit != 0 && cmsg_space(fit * core::mem::size_of::<i32>()) > available {
+                    fit -= 1;
+                }
+                if fit == 0 {
+                    msg_flags |= MSG_CTRUNC;
+                    break;
+                }
+
+                let cloexec = (flags & MSG_CMSG_CLOEXEC) != 0;
+                let mut payload = Vec::with_capacity(fit * core::mem::size_of::<i32>());
+                for descriptor in &received.rights[delivered..delivered + fit] {
+                    let mut installed = descriptor.clone();
+                    installed.cloexec = false;
+                    let fd = self.process.files.insert(installed, 0);
+                    payload.extend_from_slice(&(fd as i32).to_ne_bytes());
+                }
+                control.extend_from_slice(
+                    serialize_cmsg(crate::net::SOL_SOCKET, SCM_RIGHTS, payload.as_slice())
+                        .as_slice(),
+                );
+                if cloexec {
+                    for fd_bytes in payload.chunks_exact(core::mem::size_of::<i32>()) {
+                        let fd = i32::from_ne_bytes(fd_bytes.try_into().map_err(|_| SysErr::Fault)?)
+                            as u32;
+                        if let Some(descriptor) = self.process.files.get_mut(fd) {
+                            descriptor.cloexec = true;
+                        }
+                    }
+                }
+                delivered += fit;
+                if delivered < received.rights.len() {
+                    msg_flags |= MSG_CTRUNC;
+                    break;
+                }
+            }
+        }
+
+        if let Some(credentials) = received.credentials {
+            let available = address_len.saturating_sub(control.len());
+            let mut payload = Vec::with_capacity(12);
+            payload.extend_from_slice(&(credentials.pid as i32).to_ne_bytes());
+            payload.extend_from_slice(&credentials.uid.to_ne_bytes());
+            payload.extend_from_slice(&credentials.gid.to_ne_bytes());
+            if cmsg_space(payload.len()) <= available {
+                control.extend_from_slice(
+                    serialize_cmsg(crate::net::SOL_SOCKET, SCM_CREDENTIALS, payload.as_slice())
+                        .as_slice(),
+                );
+            } else {
+                msg_flags |= MSG_CTRUNC;
+            }
+        }
+
+        if address == 0 || address_len == 0 {
+            if !control.is_empty() {
+                msg_flags |= MSG_CTRUNC;
+            }
+            return Ok((0, msg_flags));
+        }
+
+        let count = core::cmp::min(address_len, control.len());
+        if count != 0 {
+            self.write_user_buffer(address, &control[..count])?;
+        }
+        if count < control.len() {
+            msg_flags |= MSG_CTRUNC;
+        }
+        Ok((count, msg_flags))
+    }
+
+    fn parse_socket_send_control(
+        &self,
+        control: &[u8],
+    ) -> SysResult<(Vec<FileDescriptor>, Option<SocketCredentials>)> {
+        let mut rights = Vec::new();
+        let mut credentials = None;
+        let mut offset = 0usize;
+        let current = SocketCredentials::new(
+            self.process.identity.pid,
+            self.process.credentials.uid,
+            self.process.credentials.gid,
+        );
+
+        while offset + cmsg_header_len() <= control.len() {
+            let len = usize::from_ne_bytes(
+                control[offset..offset + core::mem::size_of::<usize>()]
+                    .try_into()
+                    .map_err(|_| SysErr::Fault)?,
+            );
+            if len < cmsg_header_len() || offset + len > control.len() {
+                return Err(SysErr::Inval);
+            }
+
+            let level_offset = offset + core::mem::size_of::<usize>();
+            let level = i32::from_ne_bytes(
+                control[level_offset..level_offset + 4]
+                    .try_into()
+                    .map_err(|_| SysErr::Fault)?,
+            );
+            let kind = i32::from_ne_bytes(
+                control[level_offset + 4..level_offset + 8]
+                    .try_into()
+                    .map_err(|_| SysErr::Fault)?,
+            );
+            let payload = &control[offset + cmsg_header_len()..offset + len];
+
+            if level == crate::net::SOL_SOCKET {
+                match kind {
+                    SCM_RIGHTS => {
+                        if !rights.is_empty()
+                            || payload.is_empty()
+                            || (payload.len() % core::mem::size_of::<i32>()) != 0
+                        {
+                            return Err(SysErr::Inval);
+                        }
+                        let count = payload.len() / core::mem::size_of::<i32>();
+                        if count > SCM_MAX_FD {
+                            return Err(SysErr::TooManyRefs);
+                        }
+                        for fd_bytes in payload.chunks_exact(core::mem::size_of::<i32>()) {
+                            let fd =
+                                i32::from_ne_bytes(fd_bytes.try_into().map_err(|_| SysErr::Fault)?);
+                            if fd < 0 {
+                                return Err(SysErr::BadFd);
+                            }
+                            let descriptor = self
+                                .process
+                                .files
+                                .get(fd as u32)
+                                .cloned()
+                                .ok_or(SysErr::BadFd)?;
+                            rights.push(descriptor);
+                        }
+                    }
+                    SCM_CREDENTIALS => {
+                        if credentials.is_some() || payload.len() != 12 {
+                            return Err(SysErr::Inval);
+                        }
+                        let pid =
+                            i32::from_ne_bytes(payload[..4].try_into().map_err(|_| SysErr::Fault)?);
+                        if pid <= 0 {
+                            return Err(SysErr::Inval);
+                        }
+                        let explicit = SocketCredentials::new(
+                            pid as u32,
+                            u32::from_ne_bytes(
+                                payload[4..8].try_into().map_err(|_| SysErr::Fault)?,
+                            ),
+                            u32::from_ne_bytes(
+                                payload[8..12].try_into().map_err(|_| SysErr::Fault)?,
+                            ),
+                        );
+                        if !self.process.credentials.is_superuser() && explicit != current {
+                            return Err(SysErr::Perm);
+                        }
+                        credentials = Some(explicit);
+                    }
+                    _ => {}
+                }
+            }
+
+            let next = offset.saturating_add(cmsg_align(len));
+            if next <= offset || next > control.len() {
+                break;
+            }
+            offset = next;
+        }
+
+        Ok((rights, credentials))
+    }
+
+    fn write_socket_receive_address(
+        &mut self,
+        address: u64,
+        address_len: u64,
+        received: &SocketReceive,
+    ) -> SysResult<()> {
+        self.write_returned_socket_address(address, address_len, received.address.as_deref())
+    }
+
+    pub(crate) fn write_returned_socket_address(
+        &mut self,
+        address: u64,
+        address_len: u64,
+        returned: Option<&[u8]>,
+    ) -> SysResult<()> {
+        if address == 0 {
+            return Ok(());
+        }
+        if address_len == 0 {
+            return Err(SysErr::Fault);
+        }
+
+        let actual_len = returned.map(|name| name.len()).unwrap_or(0);
+        let requested = u32::from_ne_bytes(
+            self.syscall_read_user_exact_buffer(address_len, 4)?
+                .as_slice()
+                .try_into()
+                .map_err(|_| SysErr::Fault)?,
+        ) as usize;
+        if let Some(name) = returned {
+            let count = core::cmp::min(requested, name.len());
+            if count != 0 {
+                self.write_user_buffer(address, &name[..count])?;
+            }
+        }
+        self.write_user_buffer(address_len, &(actual_len as u32).to_ne_bytes())
+    }
+
+    pub(crate) fn install_accepted_socket(
+        &mut self,
+        accepted: AcceptedSocket,
+        address: u64,
+        address_len: u64,
+        flags: u64,
+    ) -> SysResult<u64> {
+        let (open_flags, cloexec) = parse_accept4_flags(flags)?;
+        let node: aether_vfs::NodeRef =
+            aether_vfs::FileNode::new("socket", Arc::new(SocketFile::new(accepted.socket)));
+        let filesystem = super::super::util::anonymous_filesystem_identity();
+        let fd = self
+            .process
+            .files
+            .insert_node(node, open_flags, filesystem, None, cloexec) as u64;
+
+        if address != 0 {
+            self.write_returned_socket_address(address, address_len, accepted.address.as_deref())?;
+        }
+
+        Ok(fd)
+    }
+
+    pub(super) fn syscall_fadvise64(
+        &mut self,
+        fd: u64,
+        offset: u64,
+        len: u64,
+        advice: u64,
+    ) -> SysResult<u64> {
+        let advice = match advice {
+            0 => FileAdvice::Normal,
+            1 => FileAdvice::Random,
+            2 => FileAdvice::Sequential,
+            3 => FileAdvice::WillNeed,
+            4 => FileAdvice::DontNeed,
+            5 => FileAdvice::NoReuse,
+            _ => return Err(SysErr::Inval),
+        };
+
+        let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
+        let file = descriptor.file.lock();
+        match file.node().kind() {
+            NodeKind::File | NodeKind::BlockDevice => {}
+            NodeKind::Fifo | NodeKind::Socket => return Err(SysErr::SPipe),
+            _ => return Err(SysErr::Inval),
+        }
+        file.advise(offset, len, advice).map_err(SysErr::from)?;
+        Ok(0)
+    }
+
+    pub(crate) fn fs_view_for_dirfd(&self, dirfd: i64, path: &str) -> SysResult<ProcessFsContext> {
+        const AT_FDCWD: i64 = -100;
+
+        if path.starts_with('/') || dirfd == AT_FDCWD {
+            return Ok(self.process.fs.clone());
+        }
+
+        let descriptor = self.process.files.get(dirfd as u32).ok_or(SysErr::BadFd)?;
+        let location = descriptor.location.clone().ok_or(SysErr::NotDir)?;
+        if location.node().kind() != NodeKind::Directory {
+            return Err(SysErr::NotDir);
+        }
+
+        let mut fs = self.process.fs.clone();
+        fs.set_cwd_location(location);
+        Ok(fs)
+    }
+
+    pub(crate) fn location_for_lookup(
+        &self,
+        fs: &ProcessFsContext,
+        path: &str,
+        node: &NodeRef,
+    ) -> Option<FsLocation> {
+        (node.kind() == NodeKind::Directory)
+            .then(|| FsLocation::new(resolve_at_path(fs, path), node.clone()))
+    }
+}
+
+fn parse_accept4_flags(flags: u64) -> SysResult<(aether_vfs::OpenFlags, bool)> {
+    if (flags & !ACCEPT4_FLAGS_MASK) != 0 {
+        return Err(SysErr::Inval);
+    }
+
+    let mut open_bits = aether_vfs::OpenFlags::READ | aether_vfs::OpenFlags::WRITE;
+    if (flags & SOCK_NONBLOCK) != 0 {
+        open_bits |= aether_vfs::OpenFlags::NONBLOCK;
+    }
+
+    Ok((
+        aether_vfs::OpenFlags::from_bits(open_bits),
+        (flags & SOCK_CLOEXEC) != 0,
+    ))
+}
+
+fn linux_poll_to_events(events: i16) -> PollEvents {
+    let mut poll_events = PollEvents::empty();
+    if (events & (POLLIN | POLLPRI | POLLRDNORM | POLLRDBAND)) != 0 {
+        poll_events = poll_events | PollEvents::READ;
+    }
+    if (events & (POLLOUT | POLLWRNORM | POLLWRBAND)) != 0 {
+        poll_events = poll_events | PollEvents::WRITE;
+    }
+    poll_events
+}
+
+fn events_to_linux_poll(events: PollEvents) -> i16 {
+    let mut result = 0i16;
+    if events.contains(PollEvents::READ) {
+        result |= POLLIN;
+    }
+    if events.contains(PollEvents::WRITE) {
+        result |= POLLOUT;
+    }
+    if events.contains(PollEvents::ERROR) {
+        result |= POLLERR | POLLHUP;
+    }
+    result
+}
+
+pub(crate) fn resolve_at_path(fs: &ProcessFsContext, path: &str) -> alloc::string::String {
+    let mut components = if path.starts_with('/') {
+        fs.root_path()
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .map(alloc::string::String::from)
+            .collect::<alloc::vec::Vec<_>>()
+    } else {
+        fs.cwd_path()
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .map(alloc::string::String::from)
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    let anchor = fs
+        .root_path()
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .count();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.len() > anchor {
+                    let _ = components.pop();
+                }
+            }
+            other => components.push(alloc::string::String::from(other)),
+        }
+    }
+    if components.is_empty() {
+        alloc::string::String::from("/")
+    } else {
+        alloc::format!("/{}", components.join("/"))
+    }
+}
