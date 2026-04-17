@@ -5,6 +5,7 @@ edition = "2024"
 build = "build.rs"
 
 [dependencies]
+aether-async = { path = "libs/aether-async" }
 aether-macros = { path = "../aether-frame/libs/aether-macros" }
 aether-device = { path = "libs/aether-device" }
 aether-drivers = { path = "libs/aether-drivers" }

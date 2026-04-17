@@ -141,14 +141,11 @@ impl Inode {
     }
 
     pub fn bind_superblock(&self, superblock: &SuperBlockRef) {
-        *self.superblock.lock_irqsave() = Some(Arc::downgrade(superblock));
+        *self.superblock.lock() = Some(Arc::downgrade(superblock));
     }
 
     pub fn superblock(&self) -> Option<SuperBlockRef> {
-        self.superblock
-            .lock_irqsave()
-            .as_ref()
-            .and_then(Weak::upgrade)
+        self.superblock.lock().as_ref().and_then(Weak::upgrade)
     }
 
     pub fn operations(&self) -> &dyn InodeOperations {
@@ -252,7 +249,7 @@ impl Inode {
     }
 
     pub fn flock(&self, owner: u64, operation: FlockOperation) -> FsResult<()> {
-        let mut state = self.flock.lock_irqsave();
+        let mut state = self.flock.lock();
         let changed = match operation {
             FlockOperation::Unlock => {
                 let removed_shared = state.shared.remove(&owner);

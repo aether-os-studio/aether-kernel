@@ -16,9 +16,11 @@ use aether_frame::process::{Process, ProcessBuilder};
 
 use crate::image::{ElfImage, ElfSegmentFlags, ElfSegmentType, ImageError, ProgramImageSource};
 use crate::layout::UserAddressSpaceLayout;
+
 const DEFAULT_EXECFN: &str = "<aether-process>";
 const ELF64_PHDR_SIZE: u64 = 56;
 const MAP_FIXED: u64 = 0x10;
+const MAP_FIXED_NOREPLACE: u64 = 0x100000;
 const MAP_ANONYMOUS: u64 = 0x20;
 
 const AT_NULL: u64 = 0;
@@ -1362,6 +1364,15 @@ impl UserAddressSpaceInner {
     }
 
     fn prepare_mapping_base(&mut self, addr: u64, len: u64, flags: u64) -> Result<u64, BuildError> {
+        if (flags & MAP_FIXED_NOREPLACE) != 0 {
+            if !VirtAddr::new(addr).is_aligned(PAGE_SIZE) {
+                return Err(BuildError::AddressOverflow);
+            }
+            if !self.is_range_free(addr, len) {
+                return Err(BuildError::Map(MappingError::AlreadyMapped));
+            }
+            return Ok(addr);
+        }
         if (flags & MAP_FIXED) != 0 {
             if !VirtAddr::new(addr).is_aligned(PAGE_SIZE) {
                 return Err(BuildError::AddressOverflow);

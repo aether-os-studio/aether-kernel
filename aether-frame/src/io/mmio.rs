@@ -114,14 +114,14 @@ pub fn remap_mmio(phys_base: u64, size: usize) -> Result<MmioRegion, RemapError>
         return Err(RemapError::InvalidSize);
     }
 
-    let _guard = MMIO_REMAP_LOCK.lock_irqsave();
+    let _guard = MMIO_REMAP_LOCK.lock();
     let page_base = phys_base & !(PAGE_SIZE - 1);
     let page_offset = (phys_base - page_base) as usize;
     let total_len = align_up(page_offset + size, PAGE_SIZE as usize);
     let virt_base = allocate_mmio_range(total_len as u64)?;
 
     let mut address_space = AddressSpace::<ArchitecturePageTable>::current();
-    let mut allocator = frame_allocator().lock_irqsave();
+    let mut allocator = frame_allocator().lock();
 
     for page_offset_bytes in (0..total_len).step_by(PAGE_SIZE as usize) {
         let phys =

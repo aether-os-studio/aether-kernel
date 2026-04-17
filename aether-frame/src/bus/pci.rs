@@ -143,7 +143,7 @@ struct PciBusRange {
 
 #[must_use]
 pub fn devices() -> Vec<PciDeviceInfo> {
-    let mut cache = PCI_DEVICE_CACHE.lock_irqsave();
+    let mut cache = PCI_DEVICE_CACHE.lock();
     if let Some(devices) = cache.as_ref() {
         return devices.clone();
     }

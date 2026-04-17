@@ -33,8 +33,8 @@ impl Vfs {
         root.bind_superblock(&superblock);
         let dentry = Dentry::new_root(root);
         superblock.set_root(dentry.clone());
-        *self.root_superblock.lock_irqsave() = Some(superblock);
-        *self.root.lock_irqsave() = Some(dentry);
+        *self.root_superblock.lock() = Some(superblock);
+        *self.root.lock() = Some(dentry);
     }
 
     pub fn replace_root(&self, root: NodeRef) -> Option<NodeRef> {
@@ -44,11 +44,11 @@ impl Vfs {
     }
 
     pub fn root_superblock(&self) -> Option<SuperBlockRef> {
-        self.root_superblock.lock_irqsave().clone()
+        self.root_superblock.lock().clone()
     }
 
     pub fn root_dentry(&self) -> Option<DentryRef> {
-        self.root.lock_irqsave().clone()
+        self.root.lock().clone()
     }
 
     pub fn root(&self) -> Option<NodeRef> {

@@ -8,7 +8,6 @@ pub mod acpi;
 pub mod arch;
 pub mod boot;
 pub mod bus;
-pub mod executor;
 pub mod interrupt;
 pub mod io;
 pub mod libs;
@@ -16,10 +15,7 @@ pub mod logger;
 pub mod mm;
 pub mod preempt;
 pub mod process;
+pub mod startup;
 
 #[inline(never)]
 pub const fn retain() {}
-
-unsafe extern "C" {
-    fn frame_entry() -> !;
-}

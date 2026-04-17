@@ -30,7 +30,7 @@ lazy_static! {
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    let _ = SERIAL1.lock_irqsave().write_fmt(args);
+    let _ = SERIAL1.lock().write_fmt(args);
 }
 
 #[macro_export]

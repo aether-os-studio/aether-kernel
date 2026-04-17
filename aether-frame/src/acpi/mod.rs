@@ -1,9 +1,10 @@
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::ptr::NonNull;
+use core::ptr::{NonNull, addr_of};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use acpi::platform::{AcpiPlatform, PciConfigRegions, ProcessorInfo};
+use acpi::sdt::fadt::Fadt;
 use acpi::{AcpiError, AcpiTables, Handle, HpetInfo, PciAddress, PhysicalMapping};
 
 pub use acpi::platform::InterruptModel;
@@ -28,6 +29,7 @@ pub struct AcpiState {
     platform: AcpiPlatform<AetherAcpiHandler>,
     pci_config_regions: Option<PciConfigRegions>,
     hpet_info: Option<HpetInfo>,
+    motherboard_implements_8042: bool,
 }
 
 impl AcpiState {
@@ -49,6 +51,11 @@ impl AcpiState {
     #[must_use]
     pub const fn hpet_info(&self) -> Option<&HpetInfo> {
         self.hpet_info.as_ref()
+    }
+
+    #[must_use]
+    pub const fn motherboard_implements_8042(&self) -> bool {
+        self.motherboard_implements_8042
     }
 
     #[must_use]
@@ -95,14 +102,20 @@ pub fn init() -> Result<(), AcpiInitError> {
     let handler = AetherAcpiHandler;
     let tables = unsafe { AcpiTables::from_rsdp(handler, rsdp_phys)? };
     log::info!("ACPI: basic table walk ready");
+    let motherboard_implements_8042 = tables.find_table::<Fadt>().is_some_and(|fadt| unsafe {
+        addr_of!(fadt.iapc_boot_arch)
+            .read_unaligned()
+            .motherboard_implements_8042()
+    });
     let pci_config_regions = PciConfigRegions::new(&tables).ok();
     let hpet_info = HpetInfo::new(&tables).ok();
     log::info!(
-        "ACPI: mcfg_regions={}, hpet={}",
+        "ACPI: mcfg_regions={}, hpet={}, i8042={}",
         pci_config_regions
             .as_ref()
             .map_or(0, |regions| regions.regions.len()),
-        hpet_info.is_some()
+        hpet_info.is_some(),
+        motherboard_implements_8042
     );
     if let Some(hpet_info) = hpet_info.as_ref() {
         crate::arch::timer::hpet::init(hpet_info.base_address as u64)
@@ -117,6 +130,7 @@ pub fn init() -> Result<(), AcpiInitError> {
             platform,
             pci_config_regions,
             hpet_info,
+            motherboard_implements_8042,
         });
     }
     ACPI_STATE.ready.store(true, Ordering::Release);

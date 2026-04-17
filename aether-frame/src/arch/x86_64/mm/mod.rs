@@ -6,7 +6,7 @@ use crate::mm::{AddressSpace, PageTableArch, PhysFrame, frame_allocator};
 pub use self::paging::{ArchitecturePageTable, PageTableEntry};
 
 pub fn new_user_root() -> Result<PhysFrame, crate::mm::MappingError> {
-    let mut allocator = frame_allocator().lock_irqsave();
+    let mut allocator = frame_allocator().lock();
     let root = AddressSpace::<ArchitecturePageTable>::new_root(&mut *allocator)?.root();
     copy_kernel_pml4_half(root);
     Ok(root)

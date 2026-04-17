@@ -4,7 +4,7 @@ use bit::BitIndex;
 
 mod builder;
 pub use builder::xapic_base;
-pub use builder::LocalApicBuilder;
+pub use builder::{LocalApicBuildMode, LocalApicBuilder};
 
 mod lapic_msr;
 use lapic_id::decode_lapic_id;

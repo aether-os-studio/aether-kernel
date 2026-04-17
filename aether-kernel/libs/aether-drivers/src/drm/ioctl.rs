@@ -58,10 +58,13 @@ pub const DRM_IOCTL_MODE_GETCRTC: u64 = iowr(DRM_IOCTL_BASE, 0xa1, DrmModeCrtc::
 pub const DRM_IOCTL_MODE_GETENCODER: u64 = iowr(DRM_IOCTL_BASE, 0xa6, DrmModeGetEncoder::SIZE);
 pub const DRM_IOCTL_MODE_GETCONNECTOR: u64 = iowr(DRM_IOCTL_BASE, 0xa7, DrmModeGetConnector::SIZE);
 pub const DRM_IOCTL_MODE_GETPROPERTY: u64 = iowr(DRM_IOCTL_BASE, 0xaa, DrmModeGetProperty::SIZE);
+pub const DRM_IOCTL_MODE_SETPROPERTY: u64 =
+    iowr(DRM_IOCTL_BASE, 0xab, DrmModeConnectorSetProperty::SIZE);
 pub const DRM_IOCTL_MODE_GETFB: u64 = iowr(DRM_IOCTL_BASE, 0xad, DrmModeFbCmd::SIZE);
 pub const DRM_IOCTL_MODE_RMFB: u64 = iowr(DRM_IOCTL_BASE, 0xaf, 4);
 pub const DRM_IOCTL_MODE_SETCRTC: u64 = iowr(DRM_IOCTL_BASE, 0xa2, DrmModeCrtc::SIZE);
 pub const DRM_IOCTL_MODE_PAGE_FLIP: u64 = iowr(DRM_IOCTL_BASE, 0xb0, DrmModeCrtcPageFlip::SIZE);
+pub const DRM_IOCTL_MODE_DIRTYFB: u64 = iowr(DRM_IOCTL_BASE, 0xb1, DrmModeFbDirtyCmd::SIZE);
 pub const DRM_IOCTL_MODE_CREATE_DUMB: u64 = iowr(DRM_IOCTL_BASE, 0xb2, DrmModeCreateDumb::SIZE);
 pub const DRM_IOCTL_MODE_MAP_DUMB: u64 = iowr(DRM_IOCTL_BASE, 0xb3, DrmModeMapDumb::SIZE);
 pub const DRM_IOCTL_MODE_DESTROY_DUMB: u64 = iowr(DRM_IOCTL_BASE, 0xb4, DrmModeDestroyDumb::SIZE);
@@ -71,6 +74,8 @@ pub const DRM_IOCTL_MODE_GETPLANE: u64 = iowr(DRM_IOCTL_BASE, 0xb6, DrmModeGetPl
 pub const DRM_IOCTL_MODE_ADDFB2: u64 = iowr(DRM_IOCTL_BASE, 0xb8, DrmModeFbCmd2::SIZE);
 pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u64 =
     iowr(DRM_IOCTL_BASE, 0xb9, DrmModeObjGetProperties::SIZE);
+pub const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u64 =
+    iowr(DRM_IOCTL_BASE, 0xba, DrmModeObjSetProperty::SIZE);
 pub const DRM_IOCTL_MODE_CLOSEFB: u64 = iowr(DRM_IOCTL_BASE, 0xd0, DrmModeCloseFb::SIZE);
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -461,6 +466,25 @@ impl DrmModeGetProperty {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmModeConnectorSetProperty {
+    pub value: u64,
+    pub prop_id: u32,
+    pub connector_id: u32,
+}
+
+impl DrmModeConnectorSetProperty {
+    pub const SIZE: usize = 16;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            value: read_u64(bytes, 0)?,
+            prop_id: read_u32(bytes, 8)?,
+            connector_id: read_u32(bytes, 12)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DrmModeObjGetProperties {
     pub props_ptr: u64,
     pub prop_values_ptr: u64,
@@ -488,6 +512,27 @@ impl DrmModeObjGetProperties {
             && write_u32(bytes, 16, self.count_props)
             && write_u32(bytes, 20, self.obj_id)
             && write_u32(bytes, 24, self.obj_type)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmModeObjSetProperty {
+    pub value: u64,
+    pub prop_id: u32,
+    pub obj_id: u32,
+    pub obj_type: u32,
+}
+
+impl DrmModeObjSetProperty {
+    pub const SIZE: usize = 24;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            value: read_u64(bytes, 0)?,
+            prop_id: read_u32(bytes, 8)?,
+            obj_id: read_u32(bytes, 12)?,
+            obj_type: read_u32(bytes, 16)?,
+        })
     }
 }
 
@@ -637,6 +682,29 @@ impl DrmModeFbCmd {
             && write_u32(bytes, 16, self.bpp)
             && write_u32(bytes, 20, self.depth)
             && write_u32(bytes, 24, self.handle)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmModeFbDirtyCmd {
+    pub fb_id: u32,
+    pub flags: u32,
+    pub color: u32,
+    pub num_clips: u32,
+    pub clips_ptr: u64,
+}
+
+impl DrmModeFbDirtyCmd {
+    pub const SIZE: usize = 24;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            fb_id: read_u32(bytes, 0)?,
+            flags: read_u32(bytes, 4)?,
+            color: read_u32(bytes, 8)?,
+            num_clips: read_u32(bytes, 12)?,
+            clips_ptr: read_u64(bytes, 16)?,
+        })
     }
 }
 

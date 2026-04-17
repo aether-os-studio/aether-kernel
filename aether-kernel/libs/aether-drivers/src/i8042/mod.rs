@@ -1,11 +1,12 @@
 extern crate alloc;
 
 use aether_device::{DeviceRegistry, KernelDevice};
+use aether_frame::acpi;
 use aether_frame::interrupt::{self, Trap, TrapFrame, device::allocate_vector};
 use aether_frame::io::Port;
 use aether_frame::libs::spin::SpinLock;
 use alloc::string::ToString;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 
 use crate::input::{
     BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BUS_I8042, EV_KEY, EV_REL, EV_REP, EV_SYN, InputDevice,
@@ -36,15 +37,21 @@ const PS2_DEV_SET_SAMPLE_RATE: u8 = 0xF3;
 
 const PS2_ACK: u8 = 0xFA;
 const PS2_RESEND: u8 = 0xFE;
+const PS2_IO_TIMEOUT_NS: u64 = 50_000_000;
+const PS2_RESET_TIMEOUT_NS: u64 = 500_000_000;
 
-static CONTROLLER: SpinLock<Option<Weak<I8042Controller>>> = SpinLock::new(None);
+static CONTROLLER: SpinLock<Option<Arc<I8042Controller>>> = SpinLock::new(None);
 
 pub fn probe(registry: &mut DeviceRegistry) {
     #[cfg(target_arch = "x86_64")]
     {
+        if !acpi::info().motherboard_implements_8042() {
+            log::info!("i8042: skipping probe because ACPI reports no 8042 controller");
+            return;
+        }
         match I8042Controller::probe(registry) {
             Ok(controller) => {
-                *CONTROLLER.lock_irqsave() = Some(Arc::downgrade(&controller));
+                *CONTROLLER.lock() = Some(controller);
             }
             Err(error) => {
                 log::warn!("i8042: probe failed: {error}");
@@ -104,7 +111,7 @@ impl I8042Controller {
             let mouse_device: Arc<dyn KernelDevice> = mouse;
             registry.register(mouse_device);
         } else {
-            controller.state.lock_irqsave().port2_available = false;
+            controller.state.lock().port2_available = false;
         }
 
         Ok(controller)
@@ -113,7 +120,7 @@ impl I8042Controller {
     fn init_controller(&self) -> Result<(), &'static str> {
         write_command(PS2_CMD_DISABLE_PORT1);
         write_command(PS2_CMD_DISABLE_PORT2);
-        let _ = read_data_nowait();
+        flush_output_buffer();
 
         write_command(PS2_CMD_READ_CONFIG);
         let mut config = read_data();
@@ -123,11 +130,11 @@ impl I8042Controller {
         write_data(config);
 
         write_command(PS2_CMD_TEST_CONTROLLER);
-        if read_data() != 0x55 {
+        if read_data_timeout(PS2_RESET_TIMEOUT_NS) != 0x55 {
             return Err("controller self-test failed");
         }
 
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         if is_dual_channel {
             write_command(PS2_CMD_ENABLE_PORT2);
             write_command(PS2_CMD_READ_CONFIG);
@@ -138,10 +145,10 @@ impl I8042Controller {
             }
         }
         write_command(PS2_CMD_TEST_PORT1);
-        state.port1_available = read_data() == 0x00;
+        state.port1_available = read_data_timeout(PS2_RESET_TIMEOUT_NS) == 0x00;
         if state.port2_available {
             write_command(PS2_CMD_TEST_PORT2);
-            state.port2_available = read_data() == 0x00;
+            state.port2_available = read_data_timeout(PS2_RESET_TIMEOUT_NS) == 0x00;
         }
         if !state.port1_available && !state.port2_available {
             return Err("no PS/2 ports available");
@@ -150,15 +157,18 @@ impl I8042Controller {
     }
 
     fn init_keyboard(&self) -> Result<(), &'static str> {
-        if !self.state.lock_irqsave().port1_available {
+        if !self.state.lock().port1_available {
             return Err("keyboard port unavailable");
         }
+
+        install_isa_irq(1)?;
+        flush_output_buffer();
 
         write_command(PS2_CMD_ENABLE_PORT1);
         if !send_to_port1(PS2_DEV_RESET) {
             return Err("keyboard reset failed");
         }
-        if read_data() != 0xAA {
+        if read_data_timeout(PS2_RESET_TIMEOUT_NS) != 0xAA {
             return Err("keyboard self-test failed");
         }
         if !send_to_port1(PS2_DEV_ENABLE) {
@@ -173,27 +183,28 @@ impl I8042Controller {
         config |= 0x01;
         write_command(PS2_CMD_WRITE_CONFIG);
         write_data(config);
-
-        install_isa_irq(1)?;
         Ok(())
     }
 
     fn init_mouse(&self) -> Result<(), &'static str> {
-        if !self.state.lock_irqsave().port2_available {
+        if !self.state.lock().port2_available {
             return Err("mouse port unavailable");
         }
+
+        install_isa_irq(12)?;
+        flush_output_buffer();
 
         write_command(PS2_CMD_ENABLE_PORT2);
         if !send_to_port2(PS2_DEV_RESET) {
             return Err("mouse reset failed");
         }
-        if read_data() != 0xAA {
+        if read_data_timeout(PS2_RESET_TIMEOUT_NS) != 0xAA {
             return Err("mouse self-test failed");
         }
         let _ = read_data();
 
         {
-            let mut state = self.state.lock_irqsave();
+            let mut state = self.state.lock();
             state.mouse_has_wheel = mouse_detect_wheel();
         }
 
@@ -206,27 +217,22 @@ impl I8042Controller {
         config |= 0x02;
         write_command(PS2_CMD_WRITE_CONFIG);
         write_data(config);
-
-        install_isa_irq(12)?;
         Ok(())
     }
 
     fn handle_interrupt(&self) {
-        let status = read_status();
-        if (status & 0x01) == 0 {
-            return;
-        }
-        let data = read_data_nowait();
-        if (status & 0x20) != 0 {
-            self.handle_mouse_data(data);
-        } else {
-            self.handle_keyboard_data(data);
+        while let Some((status, data)) = read_pending_data() {
+            if (status & 0x20) != 0 {
+                self.handle_mouse_data(data);
+            } else {
+                self.handle_keyboard_data(data);
+            }
         }
     }
 
     fn handle_keyboard_data(&self, data: u8) {
         let (scan_code, pressed, is_extended) = {
-            let mut state = self.state.lock_irqsave();
+            let mut state = self.state.lock();
             if data == 0xE0 {
                 state.keyboard_extended = true;
                 return;
@@ -247,7 +253,7 @@ impl I8042Controller {
 
     fn handle_mouse_data(&self, data: u8) {
         let packet = {
-            let mut state = self.state.lock_irqsave();
+            let mut state = self.state.lock();
             let packet_size = if state.mouse_has_wheel { 4 } else { 3 };
             let cycle = state.mouse_cycle;
             state.mouse_packet[cycle] = data;
@@ -278,7 +284,7 @@ impl I8042Controller {
             y |= !0xff;
         }
         y = -y;
-        let wheel = if self.state.lock_irqsave().mouse_has_wheel {
+        let wheel = if self.state.lock().mouse_has_wheel {
             let mut z = (packet[3] & 0x0f) as i8;
             if (z & 0x08) != 0 {
                 z |= !0x0f;
@@ -303,7 +309,7 @@ impl I8042Controller {
         }
 
         {
-            let mut state = self.state.lock_irqsave();
+            let mut state = self.state.lock();
             if state.mouse_left_pressed != left {
                 state.mouse_left_pressed = left;
                 mouse.emit(EV_KEY, BTN_LEFT, if left { 1 } else { 0 });
@@ -379,7 +385,7 @@ fn new_mouse_device() -> InputDevice {
 }
 
 fn ps2_interrupt_handler(_trap: Trap, _frame: &mut TrapFrame) {
-    let Some(controller) = CONTROLLER.lock_irqsave().as_ref().and_then(Weak::upgrade) else {
+    let Some(controller) = CONTROLLER.lock().as_ref().cloned() else {
         return;
     };
     controller.handle_interrupt();
@@ -404,7 +410,11 @@ fn mouse_set_sample_rate(rate: u8) -> bool {
 }
 
 fn wait_write() -> bool {
-    let deadline = aether_frame::interrupt::timer::nanos_since_boot() + 1_000_000_000;
+    wait_write_timeout(PS2_IO_TIMEOUT_NS)
+}
+
+fn wait_write_timeout(timeout_ns: u64) -> bool {
+    let deadline = aether_frame::interrupt::timer::nanos_since_boot().saturating_add(timeout_ns);
     while aether_frame::interrupt::timer::nanos_since_boot() < deadline {
         if (read_status() & 0x02) == 0 {
             return true;
@@ -415,7 +425,11 @@ fn wait_write() -> bool {
 }
 
 fn wait_read() -> bool {
-    let deadline = aether_frame::interrupt::timer::nanos_since_boot() + 1_000_000_000;
+    wait_read_timeout(PS2_IO_TIMEOUT_NS)
+}
+
+fn wait_read_timeout(timeout_ns: u64) -> bool {
+    let deadline = aether_frame::interrupt::timer::nanos_since_boot().saturating_add(timeout_ns);
     while aether_frame::interrupt::timer::nanos_since_boot() < deadline {
         if (read_status() & 0x01) != 0 {
             return true;
@@ -430,7 +444,11 @@ fn read_status() -> u8 {
 }
 
 fn read_data() -> u8 {
-    if !wait_read() {
+    read_data_timeout(PS2_IO_TIMEOUT_NS)
+}
+
+fn read_data_timeout(timeout_ns: u64) -> u8 {
+    if !wait_read_timeout(timeout_ns) {
         return 0xff;
     }
     read_data_nowait()
@@ -438,6 +456,22 @@ fn read_data() -> u8 {
 
 fn read_data_nowait() -> u8 {
     unsafe { Port::<u8>::new(PS2_DATA_PORT) }.read()
+}
+
+fn read_pending_data() -> Option<(u8, u8)> {
+    let status = read_status();
+    if (status & 0x01) == 0 {
+        return None;
+    }
+    Some((status, read_data_nowait()))
+}
+
+fn flush_output_buffer() {
+    loop {
+        if read_pending_data().is_none() {
+            break;
+        }
+    }
 }
 
 fn write_command(command: u8) {

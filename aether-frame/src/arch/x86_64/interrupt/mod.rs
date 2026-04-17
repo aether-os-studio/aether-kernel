@@ -4,6 +4,7 @@ pub mod gdt;
 mod idt;
 pub mod ioapic;
 pub mod msi;
+pub mod pic;
 mod trap;
 
 use crate::arch::fpu;

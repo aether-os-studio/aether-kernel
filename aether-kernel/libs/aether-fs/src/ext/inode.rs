@@ -1,6 +1,7 @@
 extern crate alloc;
 
-use aether_frame::libs::spin::{SpinLock, SpinLockGuard};
+use aether_frame::libs::mutex::{Mutex, MutexGuard};
+use aether_frame::libs::spin::SpinLock;
 use aether_vfs::{FsError, FsResult, Inode, NodeKind, NodeMetadata, NodeRef, NodeTimestamp};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -22,8 +23,8 @@ pub(crate) struct ExtInodeNode {
     pub(crate) inode: SpinLock<ExtInode>,
     pub(crate) metadata: SpinLock<NodeMetadata>,
     pub(crate) symlink_target: Option<String>,
-    pub(crate) io_lock: SpinLock<()>,
-    pub(crate) open_state: SpinLock<ExtOpenState>,
+    pub(crate) io_lock: Mutex<()>,
+    pub(crate) open_state: Mutex<ExtOpenState>,
     pub(crate) children: SpinLock<BTreeMap<String, NodeRef>>,
 }
 
@@ -51,13 +52,13 @@ impl ExtInodeNode {
             inode: SpinLock::new(inode),
             metadata: SpinLock::new(metadata),
             symlink_target,
-            io_lock: SpinLock::new(()),
-            open_state: SpinLock::new(ExtOpenState::default()),
+            io_lock: Mutex::new(()),
+            open_state: Mutex::new(ExtOpenState::default()),
             children: SpinLock::new(BTreeMap::new()),
         }))
     }
 
-    pub(crate) fn lock_io(&self) -> SpinLockGuard<'_, ()> {
+    pub(crate) fn lock_io(&self) -> MutexGuard<'_, ()> {
         self.io_lock.lock()
     }
 
@@ -76,7 +77,7 @@ impl ExtInodeNode {
         if self.kind != NodeKind::Directory {
             return Err(FsError::NotDirectory);
         }
-        let parent_inode = self.inode.lock_irqsave().clone();
+        let parent_inode = self.inode.lock().clone();
         let dir = Dir::open_inode(&self.filesystem, parent_inode).map_err(map_ext_error)?;
         let name = DirEntryName::try_from(child_name).map_err(|_| FsError::InvalidInput)?;
         Ok((dir, name))
@@ -100,7 +101,7 @@ impl ExtInodeNode {
     }
 
     pub(crate) fn open_file(&self) -> FsResult<ExtFile> {
-        let inode = self.inode.lock_irqsave().clone();
+        let inode = self.inode.lock().clone();
         ExtFile::open_inode(&self.filesystem, inode).map_err(map_ext_error)
     }
 
@@ -127,23 +128,22 @@ impl ExtInodeNode {
     }
 
     pub(crate) fn store_inode(&self, inode: ExtInode) {
-        *self.inode.lock_irqsave() = inode.clone();
-        *self.metadata.lock_irqsave() =
-            ext_node_metadata(inode.index.get() as u64, inode.metadata());
+        *self.inode.lock() = inode.clone();
+        *self.metadata.lock() = ext_node_metadata(inode.index.get() as u64, inode.metadata());
     }
 
     pub(crate) fn lookup_cached_child(&self, name: &str) -> Option<NodeRef> {
-        self.children.lock_irqsave().get(name).cloned()
+        self.children.lock().get(name).cloned()
     }
 
     pub(crate) fn cache_child(&self, name: &str, node: &NodeRef) {
         self.children
-            .lock_irqsave()
+            .lock()
             .insert(String::from(name), node.clone());
     }
 
     pub(crate) fn invalidate_child(&self, name: &str) {
-        let _ = self.children.lock_irqsave().remove(name);
+        let _ = self.children.lock().remove(name);
     }
 }
 

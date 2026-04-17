@@ -12,8 +12,8 @@ use super::inode::{ExtInodeNode, ext_mode, load_inode_node_from_ext_inode};
 use super::io::{block_on_future, map_ext_error};
 
 struct LockedNodePair<'a> {
-    _first: aether_frame::libs::spin::SpinLockGuard<'a, ()>,
-    _second: Option<aether_frame::libs::spin::SpinLockGuard<'a, ()>>,
+    _first: aether_frame::libs::mutex::MutexGuard<'a, ()>,
+    _second: Option<aether_frame::libs::mutex::MutexGuard<'a, ()>>,
 }
 
 fn lock_node_pair<'a>(left: &'a ExtInodeNode, right: &'a ExtInodeNode) -> LockedNodePair<'a> {
@@ -60,8 +60,7 @@ impl InodeOperations for ExtInodeNode {
 
         let inode = {
             let _guard = self.lock_io();
-            let parent =
-                Dir::open_inode(&self.filesystem, self.inode.lock_irqsave().clone()).ok()?;
+            let parent = Dir::open_inode(&self.filesystem, self.inode.lock().clone()).ok()?;
             block_on_future(parent.get_entry(ext4plus::prelude::DirEntryName::try_from(name).ok()?))
                 .ok()?
         };
@@ -83,8 +82,7 @@ impl InodeOperations for ExtInodeNode {
 
         let mut entries = Vec::new();
         let _guard = self.lock_io();
-        let Ok(directory) = Dir::open_inode(&self.filesystem, self.inode.lock_irqsave().clone())
-        else {
+        let Ok(directory) = Dir::open_inode(&self.filesystem, self.inode.lock().clone()) else {
             return entries;
         };
         let Ok(mut reader) = directory.read_dir() else {
@@ -240,11 +238,9 @@ impl InodeOperations for ExtInodeNode {
             .ok_or(FsError::Unsupported)?;
 
         let mut source_parent =
-            Dir::open_inode(&self.filesystem, self.inode.lock_irqsave().clone())
-                .map_err(map_ext_error)?;
-        let mut target_parent =
-            Dir::open_inode(&target.filesystem, target.inode.lock_irqsave().clone())
-                .map_err(map_ext_error)?;
+            Dir::open_inode(&self.filesystem, self.inode.lock().clone()).map_err(map_ext_error)?;
+        let mut target_parent = Dir::open_inode(&target.filesystem, target.inode.lock().clone())
+            .map_err(map_ext_error)?;
         let source_name = ext4plus::prelude::DirEntryName::try_from(old_name)
             .map_err(|_| FsError::InvalidInput)?;
         let _guard = lock_node_pair(self, target);
@@ -294,7 +290,7 @@ impl InodeOperations for ExtInodeNode {
 
         let (mut parent, entry_name) = self.parent_dir_and_name(name.as_str())?;
         let _guard = lock_node_pair(self, target);
-        let mut inode = target.inode.lock_irqsave().clone();
+        let mut inode = target.inode.lock().clone();
         block_on_future(parent.link(entry_name, &mut inode)).map_err(map_ext_error)?;
         self.store_inode(parent.inode().clone());
         target.store_inode(inode);
@@ -307,12 +303,12 @@ impl InodeOperations for ExtInodeNode {
     }
 
     fn mode(&self) -> Option<u32> {
-        Some(self.metadata.lock_irqsave().mode)
+        Some(self.metadata.lock().mode)
     }
 
     fn set_mode(&self, mode: u32) -> FsResult<()> {
         let _guard = self.lock_io();
-        let mut inode = self.inode.lock_irqsave().clone();
+        let mut inode = self.inode.lock().clone();
         let file_type = match self.kind {
             NodeKind::Directory => InodeMode::S_IFDIR,
             NodeKind::File => InodeMode::S_IFREG,
@@ -332,7 +328,7 @@ impl InodeOperations for ExtInodeNode {
 
     fn set_owner(&self, uid: u32, gid: u32) -> FsResult<()> {
         let _guard = self.lock_io();
-        let mut inode = self.inode.lock_irqsave().clone();
+        let mut inode = self.inode.lock().clone();
         inode.set_uid(uid);
         inode.set_gid(gid);
         block_on_future(inode.write(&self.filesystem)).map_err(map_ext_error)?;
@@ -341,6 +337,6 @@ impl InodeOperations for ExtInodeNode {
     }
 
     fn metadata(&self) -> NodeMetadata {
-        *self.metadata.lock_irqsave()
+        *self.metadata.lock()
     }
 }

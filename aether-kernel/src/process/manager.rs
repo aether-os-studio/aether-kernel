@@ -34,12 +34,57 @@ struct FileBlockListener {
 
 impl WaitListener for FileBlockListener {
     fn wake(&self, _events: PollEvents) {
-        self.queue.lock_irqsave().push_back(self.pid);
+        self.queue.lock().push_back(self.pid);
         self.pending.store(true, Ordering::Release);
     }
 }
 
 impl ProcessManager {
+    fn unregister_file_wait_registrations(&mut self, pid: Pid) {
+        let Some(registrations) = self.file_wait_registrations.remove(&pid) else {
+            return;
+        };
+        for registration in registrations {
+            let file = registration.file.lock();
+            let _ = file.unregister_waiter(registration.waiter_id);
+        }
+    }
+
+    fn blocked_file_ready_result(&self, process: &KernelProcess) -> Option<BlockResult> {
+        match process.state {
+            ProcessState::Blocked(ProcessBlock::File { fd, events }) => {
+                let descriptor = process.files.get(fd)?;
+                let ready = descriptor
+                    .file
+                    .lock()
+                    .poll(events | PollEvents::ERROR)
+                    .ok()?;
+                ready
+                    .intersects(events | PollEvents::ERROR)
+                    .then_some(BlockResult::File { ready: true })
+            }
+            ProcessState::Blocked(ProcessBlock::Poll { .. }) => {
+                let pending = process.pending_poll.as_ref()?;
+                if pending.registrations.iter().any(|registration| {
+                    let Some(descriptor) = process.files.get(registration.fd) else {
+                        return true;
+                    };
+                    descriptor
+                        .file
+                        .lock()
+                        .poll(registration.events | PollEvents::ERROR)
+                        .map(|ready| ready.intersects(registration.events | PollEvents::ERROR))
+                        .unwrap_or(false)
+                }) {
+                    Some(BlockResult::Poll { timed_out: false })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn publish_timer_deadline(&self) {
         crate::runtime::publish_next_timer_deadline(self.next_timer_deadline_nanos);
     }
@@ -69,6 +114,10 @@ impl ProcessManager {
     pub(crate) fn timer_deadline_due(&self, current_nanos: u64) -> bool {
         self.next_timer_deadline_nanos
             .is_some_and(|deadline| deadline <= current_nanos)
+    }
+
+    pub(crate) fn next_timer_deadline_nanos(&self) -> Option<u64> {
+        self.next_timer_deadline_nanos
     }
 
     pub(crate) fn clone_fd_table_for_fork(
@@ -198,8 +247,10 @@ impl ProcessManager {
                 options,
             },
         });
-        if let ProcessState::Blocked(ProcessBlock::File { fd, events }) = process.state {
-            let _ = (fd, events);
+        if matches!(
+            process.state,
+            ProcessState::Blocked(ProcessBlock::File { .. } | ProcessBlock::Poll { .. })
+        ) {
             self.ensure_file_wait_registration(pid, process);
         }
     }
@@ -264,21 +315,11 @@ impl ProcessManager {
         match block {
             ProcessBlock::File { .. } => {
                 self.blocked_files.remove(&pid);
-                if let Some(registrations) = self.file_wait_registrations.remove(&pid) {
-                    for registration in registrations {
-                        let file = registration.file.lock();
-                        let _ = file.unregister_waiter(registration.waiter_id);
-                    }
-                }
+                self.unregister_file_wait_registrations(pid);
             }
             ProcessBlock::Poll { deadline_nanos } => {
                 self.blocked_files.remove(&pid);
-                if let Some(registrations) = self.file_wait_registrations.remove(&pid) {
-                    for registration in registrations {
-                        let file = registration.file.lock();
-                        let _ = file.unregister_waiter(registration.waiter_id);
-                    }
-                }
+                self.unregister_file_wait_registrations(pid);
                 if let Some(deadline_nanos) = deadline_nanos
                     && let Some(waiters) = self.blocked_timers.get_mut(&deadline_nanos)
                 {
@@ -765,8 +806,16 @@ impl ProcessManager {
             }
             ProcessState::Stopped(_) | ProcessState::Blocked(_) => {
                 self.ensure_file_wait_registration(pid, &process);
-                self.track_blocked_process(pid, process.state);
-                self.processes.insert(pid, process);
+                if let Some(result) = self.blocked_file_ready_result(&process) {
+                    self.unregister_file_wait_registrations(pid);
+                    process.wake_result = Some(result);
+                    process.state = ProcessState::Runnable;
+                    self.run_queue.push_back(pid);
+                    self.processes.insert(pid, process);
+                } else {
+                    self.track_blocked_process(pid, process.state);
+                    self.processes.insert(pid, process);
+                }
             }
             ProcessState::Exited(_) => {
                 let status = match process.state {
@@ -897,7 +946,7 @@ impl ProcessManager {
         }
 
         let mut ready = alloc::collections::BTreeSet::new();
-        let mut queue = self.file_wait_queue.lock_irqsave();
+        let mut queue = self.file_wait_queue.lock();
         while let Some(pid) = queue.pop_front() {
             ready.insert(pid);
         }

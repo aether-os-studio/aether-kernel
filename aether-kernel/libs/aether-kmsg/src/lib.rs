@@ -48,7 +48,7 @@ impl KmsgBuffer {
         let mut text = String::new();
         let _ = text.write_fmt(args);
 
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         let record = KmsgRecord {
             sequence: state.next_sequence,
             level,
@@ -63,7 +63,7 @@ impl KmsgBuffer {
     }
 
     pub fn snapshot(&self) -> Vec<KmsgRecord> {
-        self.state.lock_irqsave().records.iter().cloned().collect()
+        self.state.lock().records.iter().cloned().collect()
     }
 
     pub fn file(self: &Arc<Self>) -> Arc<KmsgFile> {

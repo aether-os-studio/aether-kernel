@@ -2,6 +2,7 @@
 members = [
     "aether-frame",
     "aether-frame/libs/aether-macros",
+    "aether-kernel/libs/aether-async",
     "aether-kernel/libs/aether-device",
     "aether-kernel/libs/aether-drivers",
     "aether-kernel/libs/aether-fs",

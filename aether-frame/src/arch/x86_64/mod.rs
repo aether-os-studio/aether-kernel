@@ -23,9 +23,9 @@ pub extern "C" fn _start() -> ! {
             crate::serial_println!("limine boot information is incomplete");
             halt_forever();
         }
-
-        crate::frame_entry();
     }
+
+    crate::startup::boot_and_enter_kernel();
 }
 
 fn halt_forever() -> ! {

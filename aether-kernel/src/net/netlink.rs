@@ -168,12 +168,12 @@ impl NetlinkSocket {
             }),
             waiters: WaitQueue::new(),
         });
-        SOCKETS.lock_irqsave().push(Arc::downgrade(&socket));
+        SOCKETS.lock().push(Arc::downgrade(&socket));
         socket
     }
 
     fn ensure_portid(&self) -> u32 {
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         if state.portid == 0 {
             state.portid = allocate_portid(self.protocol, self.owner_pid, self);
         }
@@ -181,7 +181,7 @@ impl NetlinkSocket {
     }
 
     fn local_address(&self) -> SockAddrNetlink {
-        let state = self.state.lock_irqsave();
+        let state = self.state.lock();
         SockAddrNetlink {
             portid: state.portid,
             groups: state.groups,
@@ -189,11 +189,11 @@ impl NetlinkSocket {
     }
 
     fn peer_address(&self) -> SysResult<SockAddrNetlink> {
-        self.state.lock_irqsave().connected.ok_or(SysErr::NotConn)
+        self.state.lock().connected.ok_or(SysErr::NotConn)
     }
 
     fn enqueue(&self, message: NetlinkMessage) -> SysResult<()> {
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         let next = state.recv_bytes.saturating_add(message.data.len());
         if next > state.rcvbuf {
             return Err(SysErr::NoBufs);
@@ -215,7 +215,7 @@ impl NetlinkSocket {
 
     fn set_sol_socket(&self, optname: i32, value: &[u8]) -> SysResult<()> {
         let parsed = read_sockopt_i32(value)?;
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         match optname {
             SO_PASSCRED => {
                 state.passcred = parsed != 0;
@@ -240,7 +240,7 @@ impl NetlinkSocket {
         }
 
         let bit = 1u32 << (group - 1);
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         match optname {
             NETLINK_ADD_MEMBERSHIP => {
                 state.groups |= bit;
@@ -291,7 +291,7 @@ impl KernelSocket for NetlinkSocket {
 
     fn recv_from(&self, buffer: &mut [u8], flags: u64) -> SysResult<super::SocketReceive> {
         let peek = (flags & MSG_PEEK) != 0;
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         let message = if peek {
             state.recv_queue.front().cloned()
         } else {
@@ -341,7 +341,7 @@ impl KernelSocket for NetlinkSocket {
         if address.groups != 0 {
             return Err(SysErr::Inval);
         }
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         state.connected = Some(address);
         if state.portid == 0 {
             state.portid = allocate_portid(self.protocol, self.owner_pid, self);
@@ -360,7 +360,7 @@ impl KernelSocket for NetlinkSocket {
             address.portid
         };
 
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         state.portid = portid;
         state.groups = address.groups;
         Ok(())
@@ -369,11 +369,7 @@ impl KernelSocket for NetlinkSocket {
     fn send_to(&self, buffer: &[u8], address: Option<&[u8]>, _flags: u64) -> SysResult<usize> {
         let destination = match address {
             Some(address) => SockAddrNetlink::parse(address)?,
-            None => self
-                .state
-                .lock_irqsave()
-                .connected
-                .ok_or(SysErr::DestAddrReq)?,
+            None => self.state.lock().connected.ok_or(SysErr::DestAddrReq)?,
         };
 
         let sender_portid = self.ensure_portid();
@@ -397,7 +393,7 @@ impl KernelSocket for NetlinkSocket {
     }
 
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
-        let state = self.state.lock_irqsave();
+        let state = self.state.lock();
         let mut ready = PollEvents::empty();
         if events.contains(PollEvents::READ) && !state.recv_queue.is_empty() {
             ready = ready | PollEvents::READ;
@@ -428,7 +424,7 @@ impl KernelSocket for NetlinkSocket {
     fn getsockopt(&self, level: i32, optname: i32) -> SysResult<Vec<u8>> {
         match level {
             super::SOL_SOCKET => {
-                let state = self.state.lock_irqsave();
+                let state = self.state.lock();
                 match optname {
                     SO_PASSCRED => Ok(encode_sockopt_i32(state.passcred as i32)),
                     SO_SNDBUF | SO_SNDBUFFORCE => {
@@ -449,7 +445,7 @@ impl KernelSocket for NetlinkSocket {
 }
 
 fn live_sockets() -> Vec<Arc<NetlinkSocket>> {
-    let mut sockets = SOCKETS.lock_irqsave();
+    let mut sockets = SOCKETS.lock();
     let mut live = Vec::with_capacity(sockets.len());
     sockets.retain(|entry| match entry.upgrade() {
         Some(socket) => {
@@ -468,7 +464,7 @@ fn portid_in_use(protocol: i32, portid: u32, skip: &NetlinkSocket) -> bool {
     live_sockets().into_iter().any(|socket| {
         socket.protocol == protocol
             && !core::ptr::addr_eq(Arc::as_ptr(&socket), skip as *const NetlinkSocket)
-            && socket.state.lock_irqsave().portid == portid
+            && socket.state.lock().portid == portid
     })
 }
 
@@ -487,7 +483,7 @@ fn allocate_portid(protocol: i32, preferred: u32, skip: &NetlinkSocket) -> u32 {
 fn lookup_portid(protocol: i32, portid: u32, skip: &NetlinkSocket) -> Option<Arc<NetlinkSocket>> {
     live_sockets().into_iter().find(|socket| {
         socket.protocol == protocol
-            && socket.state.lock_irqsave().portid == portid
+            && socket.state.lock().portid == portid
             && !core::ptr::addr_eq(Arc::as_ptr(socket), skip as *const NetlinkSocket)
     })
 }
@@ -501,7 +497,7 @@ fn broadcast_message(protocol: i32, sender_portid: u32, group_mask: u32, payload
         if socket.protocol != protocol {
             continue;
         }
-        let groups = socket.state.lock_irqsave().groups;
+        let groups = socket.state.lock().groups;
         if (groups & group_mask) == 0 {
             continue;
         }

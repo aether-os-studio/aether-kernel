@@ -25,6 +25,7 @@ const IA32_GS_BASE: u32 = 0xc000_0101;
 pub struct CurrentRun {
     pub kernel_rsp: u64,
     pub kernel_cr3: u64,
+    pub kernel_interrupts_enabled: u64,
     pub process: usize,
     pub saved_rbx: u64,
     pub saved_rbp: u64,
@@ -37,6 +38,7 @@ pub struct CurrentRun {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KernelContext {
+    pub rip: u64,
     pub rsp: u64,
     pub saved_rbx: u64,
     pub saved_rbp: u64,
@@ -44,6 +46,15 @@ pub struct KernelContext {
     pub saved_r13: u64,
     pub saved_r14: u64,
     pub saved_r15: u64,
+}
+
+pub type KernelContextEntry = unsafe extern "C" fn(*mut ()) -> !;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct KernelContextStartFrame {
+    arg: *mut (),
+    entry: KernelContextEntry,
 }
 
 static CURRENT_RUNS: PerCpuPtr<CurrentRun, MAX_CPUS> = PerCpuPtr::new();
@@ -167,6 +178,7 @@ impl Process {
             kernel_cr3: <crate::arch::mm::ArchitecturePageTable as PageTableArch>::root_frame()
                 .start_address()
                 .as_u64(),
+            kernel_interrupts_enabled: 1,
             process: core::ptr::from_mut(self) as usize,
             saved_rbx: 0,
             saved_rbp: 0,
@@ -293,18 +305,20 @@ where
     }
 }
 
-pub fn initialize_kernel_context(stack_top: u64, entry: usize, arg: usize) -> KernelContext {
+pub fn initialize_kernel_context(
+    stack_top: u64,
+    entry: KernelContextEntry,
+    arg: *mut (),
+) -> KernelContext {
     let mut rsp = align_down(stack_top, 16);
-    rsp -= 8;
-    unsafe { (rsp as *mut u64).write(entry as u64) };
-    rsp -= 8;
-    unsafe { (rsp as *mut u64).write(arg as u64) };
-    rsp -= 8;
+    rsp -= core::mem::size_of::<KernelContextStartFrame>() as u64;
+    let frame = rsp as *mut KernelContextStartFrame;
     unsafe {
-        (rsp as *mut u64).write(aether_x86_kernel_context_start as *const () as usize as u64)
-    };
+        frame.write(KernelContextStartFrame { arg, entry });
+    }
 
     KernelContext {
+        rip: aether_x86_kernel_context_start as *const () as usize as u64,
         rsp,
         ..KernelContext::default()
     }
@@ -313,19 +327,18 @@ pub fn initialize_kernel_context(stack_top: u64, entry: usize, arg: usize) -> Ke
 #[repr(C)]
 struct TypedKernelContextEntry<T> {
     state: *mut T,
-    entry: fn(&mut T),
+    entry: fn(&mut T) -> !,
 }
 
-unsafe extern "C" fn typed_kernel_context_entry<T>(arg: usize) {
-    let typed = unsafe { &*(arg as *const TypedKernelContextEntry<T>) };
+unsafe extern "C" fn typed_kernel_context_entry<T>(arg: *mut ()) -> ! {
+    let typed = unsafe { &*(arg.cast::<TypedKernelContextEntry<T>>()) };
     (typed.entry)(unsafe { &mut *typed.state });
-    unreachable!("typed kernel context entry returned unexpectedly");
 }
 
 pub fn initialize_typed_kernel_context<T>(
     stack_top: u64,
     state: &mut T,
-    entry: fn(&mut T),
+    entry: fn(&mut T) -> !,
 ) -> KernelContext {
     let mut typed_entry_top = align_down(stack_top, 16);
     typed_entry_top -= core::mem::size_of::<TypedKernelContextEntry<T>>() as u64;
@@ -335,8 +348,8 @@ pub fn initialize_typed_kernel_context<T>(
     }
     initialize_kernel_context(
         typed_entry_top,
-        typed_kernel_context_entry::<T> as *const () as usize,
-        typed_entry_top as usize,
+        typed_kernel_context_entry::<T>,
+        typed_entry_top as *mut (),
     )
 }
 
@@ -431,6 +444,11 @@ global_asm!(
         mov [rdx + {run_saved_r14_off}], r14
         mov [rdx + {run_saved_r15_off}], r15
         mov [rdx + {run_kernel_rsp_off}], rsp
+        pushfq
+        pop rax
+        shr rax, 9
+        and eax, 1
+        mov [rdx + {run_kernel_if_off}], rax
         mov cr3, rsi
         mov rsi, rdi
 
@@ -462,6 +480,11 @@ global_asm!(
         mov [rdx + {run_saved_r14_off}], r14
         mov [rdx + {run_saved_r15_off}], r15
         mov [rdx + {run_kernel_rsp_off}], rsp
+        pushfq
+        pop rax
+        shr rax, 9
+        and eax, 1
+        mov [rdx + {run_kernel_if_off}], rax
         mov cr3, rsi
         mov rsi, rdi
 
@@ -498,6 +521,8 @@ global_asm!(
 
     .global aether_x86_switch_kernel_context
     aether_x86_switch_kernel_context:
+        lea rax, [rip + 1f]
+        mov [rdi + {ctx_rip_off}], rax
         mov [rdi + {ctx_rsp_off}], rsp
         mov [rdi + {ctx_saved_rbx_off}], rbx
         mov [rdi + {ctx_saved_rbp_off}], rbp
@@ -505,6 +530,7 @@ global_asm!(
         mov [rdi + {ctx_saved_r13_off}], r13
         mov [rdi + {ctx_saved_r14_off}], r14
         mov [rdi + {ctx_saved_r15_off}], r15
+        mov rax, [rsi + {ctx_rip_off}]
         mov rsp, [rsi + {ctx_rsp_off}]
         mov rbx, [rsi + {ctx_saved_rbx_off}]
         mov rbp, [rsi + {ctx_saved_rbp_off}]
@@ -512,13 +538,15 @@ global_asm!(
         mov r13, [rsi + {ctx_saved_r13_off}]
         mov r14, [rsi + {ctx_saved_r14_off}]
         mov r15, [rsi + {ctx_saved_r15_off}]
+        jmp rax
+    1:
         ret
 
     .global aether_x86_kernel_context_start
     aether_x86_kernel_context_start:
         pop rdi
         pop rax
-        call rax
+        jmp rax
         ud2
     "#,
     run_kernel_rsp_off = const offset_of!(CurrentRun, kernel_rsp),
@@ -528,6 +556,8 @@ global_asm!(
     run_saved_r13_off = const offset_of!(CurrentRun, saved_r13),
     run_saved_r14_off = const offset_of!(CurrentRun, saved_r14),
     run_saved_r15_off = const offset_of!(CurrentRun, saved_r15),
+    run_kernel_if_off = const offset_of!(CurrentRun, kernel_interrupts_enabled),
+    ctx_rip_off = const offset_of!(KernelContext, rip),
     ctx_rsp_off = const offset_of!(KernelContext, rsp),
     ctx_saved_rbx_off = const offset_of!(KernelContext, saved_rbx),
     ctx_saved_rbp_off = const offset_of!(KernelContext, saved_rbp),

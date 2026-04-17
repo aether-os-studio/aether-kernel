@@ -55,19 +55,19 @@ impl SignalState {
     }
 
     pub fn blocked(&self) -> SigSet {
-        self.inner.lock_irqsave().blocked
+        self.inner.lock().blocked
     }
 
     pub fn set_blocked_mask(&mut self, mask: SigSet) {
-        self.inner.lock_irqsave().blocked = sanitize_mask(mask);
+        self.inner.lock().blocked = sanitize_mask(mask);
     }
 
     pub fn restore_mask(&mut self, mask: SigSet) {
-        self.inner.lock_irqsave().blocked = sanitize_mask(mask);
+        self.inner.lock().blocked = sanitize_mask(mask);
     }
 
     pub fn fork_copy(&self) -> Self {
-        let inner = self.inner.lock_irqsave();
+        let inner = self.inner.lock();
         Self::from_inner(SignalStateInner {
             blocked: inner.blocked,
             pending: [None; SIGNAL_MAX + 1],
@@ -77,7 +77,7 @@ impl SignalState {
     }
 
     pub fn prepare_for_exec(&mut self) {
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         let mut signal = 1usize;
         while signal <= SIGNAL_MAX {
             let action = inner.actions[signal];
@@ -90,7 +90,7 @@ impl SignalState {
     }
 
     pub fn set_mask(&mut self, how: u64, set: SigSet) {
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         match how {
             SIG_BLOCK => inner.blocked |= sanitize_mask(set),
             SIG_UNBLOCK => inner.blocked &= !sanitize_mask(set),
@@ -100,11 +100,7 @@ impl SignalState {
     }
 
     pub fn action(&self, signal: u8) -> Option<SignalAction> {
-        self.inner
-            .lock_irqsave()
-            .actions
-            .get(signal as usize)
-            .copied()
+        self.inner.lock().actions.get(signal as usize).copied()
     }
 
     pub fn set_action(&mut self, signal: u8, action: SignalAction) -> bool {
@@ -112,7 +108,7 @@ impl SignalState {
         if index == 0 || index > SIGNAL_MAX || signal == SIGKILL || signal == SIGSTOP {
             return false;
         }
-        self.inner.lock_irqsave().actions[index] = action;
+        self.inner.lock().actions[index] = action;
         true
     }
 
@@ -122,7 +118,7 @@ impl SignalState {
             return;
         }
 
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         if info.signal == SIGCONT {
             inner.pending[SIGSTOP as usize] = None;
             inner.pending[SIGTSTP as usize] = None;
@@ -139,7 +135,7 @@ impl SignalState {
 
     #[allow(dead_code)]
     pub fn has_unblocked_pending(&self) -> bool {
-        let inner = self.inner.lock_irqsave();
+        let inner = self.inner.lock();
         inner
             .pending
             .iter()
@@ -148,7 +144,7 @@ impl SignalState {
     }
 
     pub fn has_deliverable(&self, handlers_supported: bool) -> bool {
-        let inner = self.inner.lock_irqsave();
+        let inner = self.inner.lock();
         let mut signal = 1usize;
         while signal <= SIGNAL_MAX {
             if let Some(info) = inner.pending[signal] {
@@ -166,7 +162,7 @@ impl SignalState {
     }
 
     pub fn take_next_delivery(&mut self, handlers_supported: bool) -> SignalDelivery {
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         let mut signal = 1usize;
         while signal <= SIGNAL_MAX {
             if let Some(info) = inner.pending[signal] {
@@ -185,20 +181,20 @@ impl SignalState {
     }
 
     pub fn enter_sigsuspend(&mut self, mask: SigSet) {
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         inner.suspend_mask = Some(inner.blocked);
         inner.blocked = sanitize_mask(mask);
     }
 
     pub fn leave_sigsuspend(&mut self) {
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         if let Some(previous) = inner.suspend_mask.take() {
             inner.blocked = previous;
         }
     }
 
     pub fn has_pending_in_mask(&self, mask: SigSet) -> bool {
-        let inner = self.inner.lock_irqsave();
+        let inner = self.inner.lock();
         let masked = sanitize_mask(mask);
         inner.pending.iter().flatten().any(|info| {
             let bit = sigbit(info.signal);
@@ -208,7 +204,7 @@ impl SignalState {
 
     pub fn take_pending_in_mask(&self, mask: SigSet) -> Option<SignalInfo> {
         let masked = sanitize_mask(mask);
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         let mut signal = 1usize;
         while signal <= SIGNAL_MAX {
             if let Some(info) = inner.pending[signal] {
@@ -237,7 +233,7 @@ impl SignalState {
 
     #[allow(dead_code)]
     pub fn has_waitable_child_signal(&self) -> bool {
-        let inner = self.inner.lock_irqsave();
+        let inner = self.inner.lock();
         matches!(
             inner.pending[super::abi::SIGCHLD as usize],
             Some(SignalInfo {

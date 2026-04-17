@@ -24,11 +24,11 @@ pub struct SignalFdFile {
 
 impl SignalFdFile {
     pub fn mask(&self) -> SigSet {
-        *self.mask.lock_irqsave()
+        *self.mask.lock()
     }
 
     pub fn set_mask(&self, mask: SigSet) {
-        *self.mask.lock_irqsave() = mask;
+        *self.mask.lock() = mask;
         if self.state.has_pending_in_mask(mask) {
             self.state.notify_waiters();
         }

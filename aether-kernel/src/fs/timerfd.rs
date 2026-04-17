@@ -208,7 +208,7 @@ pub struct TimerFdFile {
 
 impl TimerFdFile {
     pub fn create(clock: TimerFdClock) -> Arc<Self> {
-        let mut registry = REGISTRY.lock_irqsave();
+        let mut registry = REGISTRY.lock();
         let file = Arc::new(Self {
             id: registry.allocate_id(),
             clock,
@@ -263,15 +263,15 @@ impl TimerFdFile {
 
     fn refresh_due(&self) -> bool {
         let now_ns = self.clock.current_time_ns();
-        let mut registry = REGISTRY.lock_irqsave();
-        let mut state = self.inner.lock_irqsave();
+        let mut registry = REGISTRY.lock();
+        let mut state = self.inner.lock();
         Self::refresh_due_locked(&mut registry, self.id, self.clock, &mut state, now_ns)
     }
 
     pub fn get_time(&self) -> LinuxItimerSpec {
         let now_ns = self.clock.current_time_ns();
-        let mut registry = REGISTRY.lock_irqsave();
-        let mut state = self.inner.lock_irqsave();
+        let mut registry = REGISTRY.lock();
+        let mut state = self.inner.lock();
         let _ = Self::refresh_due_locked(&mut registry, self.id, self.clock, &mut state, now_ns);
         let remaining_ns = state.expires_ns.saturating_sub(now_ns);
         LinuxItimerSpec {
@@ -299,8 +299,8 @@ impl TimerFdFile {
         let now_ns = self.clock.current_time_ns();
         let class = self.clock.deadline_class();
         let (old_spec, notify_readable) = {
-            let mut registry = REGISTRY.lock_irqsave();
-            let mut state = self.inner.lock_irqsave();
+            let mut registry = REGISTRY.lock();
+            let mut state = self.inner.lock();
             let _ =
                 Self::refresh_due_locked(&mut registry, self.id, self.clock, &mut state, now_ns);
 
@@ -315,7 +315,6 @@ impl TimerFdFile {
 
             state.interval_ns = interval_ns;
             state.cancel_on_set = cancel_on_set;
-            state.ticks = 0;
             state.expires_ns = if value_ns == 0 {
                 0
             } else if absolute {
@@ -351,8 +350,8 @@ impl TimerFdFile {
 
 impl Drop for TimerFdFile {
     fn drop(&mut self) {
-        let mut registry = REGISTRY.lock_irqsave();
-        let state = self.inner.lock_irqsave();
+        let mut registry = REGISTRY.lock();
+        let state = self.inner.lock();
         if state.expires_ns != 0 {
             registry.remove_deadline(self.clock.deadline_class(), state.expires_ns, self.id);
         }
@@ -374,7 +373,7 @@ impl FileOperations for TimerFdFile {
 
         let _ = self.refresh_due();
         let ticks = {
-            let mut state = self.inner.lock_irqsave();
+            let mut state = self.inner.lock();
             if state.ticks == 0 {
                 return Err(FsError::WouldBlock);
             }
@@ -390,7 +389,7 @@ impl FileOperations for TimerFdFile {
 
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
         let _ = self.refresh_due();
-        let readable = self.inner.lock_irqsave().ticks != 0;
+        let readable = self.inner.lock().ticks != 0;
         let mut ready = PollEvents::empty();
         if readable && events.contains(PollEvents::READ) {
             ready = ready | PollEvents::READ;
@@ -430,6 +429,33 @@ pub fn deadline_due() -> bool {
     NEXT_REALTIME_DEADLINE_NS.load(Ordering::Acquire) <= now_realtime
 }
 
+pub fn next_wakeup_deadline() -> Option<u64> {
+    let monotonic = NEXT_MONOTONIC_DEADLINE_NS.load(Ordering::Acquire);
+    let realtime = NEXT_REALTIME_DEADLINE_NS.load(Ordering::Acquire);
+
+    let monotonic_deadline = (monotonic != u64::MAX).then_some(monotonic);
+    let realtime_deadline = if realtime == u64::MAX {
+        None
+    } else {
+        let now_monotonic = timer::nanos_since_boot();
+        let (secs, nanos) = timer::unix_time_nanos();
+        let now_realtime = (secs as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nanos);
+        Some(if realtime <= now_realtime {
+            now_monotonic
+        } else {
+            now_monotonic.saturating_add(realtime.saturating_sub(now_realtime))
+        })
+    };
+
+    match (monotonic_deadline, realtime_deadline) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
 pub fn wake_expired_timers() {
     wake_expired_class(DeadlineClass::Monotonic, timer::nanos_since_boot());
     let (secs, nanos) = timer::unix_time_nanos();
@@ -444,7 +470,7 @@ pub fn wake_expired_timers() {
 fn wake_expired_class(class: DeadlineClass, now_ns: u64) {
     loop {
         let ready = {
-            let mut registry = REGISTRY.lock_irqsave();
+            let mut registry = REGISTRY.lock();
             let Some((&deadline, _)) = registry.deadlines_mut(class).first_key_value() else {
                 registry.refresh_next_deadlines();
                 return;
@@ -472,8 +498,8 @@ fn wake_expired_class(class: DeadlineClass, now_ns: u64) {
 
         for timerfd in ready {
             let notify_readable = {
-                let mut registry = REGISTRY.lock_irqsave();
-                let mut state = timerfd.inner.lock_irqsave();
+                let mut registry = REGISTRY.lock();
+                let mut state = timerfd.inner.lock();
                 let changed = TimerFdFile::refresh_due_locked(
                     &mut registry,
                     timerfd.id,

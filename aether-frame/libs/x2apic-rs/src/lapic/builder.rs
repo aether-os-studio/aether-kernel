@@ -2,6 +2,17 @@ use crate::lapic::lapic_msr::*;
 use crate::lapic::{LocalApic, LocalApicMode};
 use raw_cpuid::CpuId;
 
+/// Selects how the local APIC operating mode should be chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalApicBuildMode {
+    /// Prefer x2APIC when the CPU supports it, otherwise fall back to xAPIC.
+    Auto,
+    /// Force legacy MMIO xAPIC mode.
+    XApic,
+    /// Force x2APIC mode and fail if the CPU does not support it.
+    X2Apic,
+}
+
 /// The builder pattern for configuring the local APIC.
 #[derive(Debug, Default)]
 pub struct LocalApicBuilder {
@@ -16,6 +27,7 @@ pub struct LocalApicBuilder {
     ipi_destination_mode: Option<IpiDestMode>,
 
     xapic_base: Option<u64>,
+    mode: Option<LocalApicBuildMode>,
 }
 
 impl LocalApicBuilder {
@@ -88,6 +100,16 @@ impl LocalApicBuilder {
         self
     }
 
+    /// Selects the local APIC operating mode explicitly.
+    ///
+    /// `Auto` preserves the previous behavior of preferring x2APIC when the CPU
+    /// supports it. `XApic` forces MMIO xAPIC mode, and `X2Apic` requires CPU
+    /// support for x2APIC.
+    pub fn mode(&mut self, mode: LocalApicBuildMode) -> &mut Self {
+        self.mode = Some(mode);
+        self
+    }
+
     /// Builds a new `LocalApic`.
     ///
     /// # Errors
@@ -96,15 +118,39 @@ impl LocalApicBuilder {
     /// 1. the CPU does not support the x2apic interrupt architecture, or
     /// 2. any of the required fields are empty.
     pub fn build(&mut self) -> Result<LocalApic, &'static str> {
-        let mode = if cpu_has_x2apic() {
-            LocalApicMode::X2Apic
-        } else {
-            if self.xapic_base.is_none() {
-                return Err("LocalApicBuilder: XApic base is required.");
-            }
+        let requested_mode = self.mode.unwrap_or(LocalApicBuildMode::Auto);
+        let mode = match requested_mode {
+            LocalApicBuildMode::Auto => {
+                if cpu_has_x2apic() {
+                    LocalApicMode::X2Apic
+                } else {
+                    if self.xapic_base.is_none() {
+                        return Err(
+                            "LocalApicBuilder: XApic base is required.",
+                        );
+                    }
 
-            LocalApicMode::XApic {
-                xapic_base: self.xapic_base.unwrap(),
+                    LocalApicMode::XApic {
+                        xapic_base: self.xapic_base.unwrap(),
+                    }
+                }
+            }
+            LocalApicBuildMode::XApic => {
+                if self.xapic_base.is_none() {
+                    return Err("LocalApicBuilder: XApic base is required.");
+                }
+
+                LocalApicMode::XApic {
+                    xapic_base: self.xapic_base.unwrap(),
+                }
+            }
+            LocalApicBuildMode::X2Apic => {
+                if !cpu_has_x2apic() {
+                    return Err(
+                        "LocalApicBuilder: CPU does not support x2APIC.",
+                    );
+                }
+                LocalApicMode::X2Apic
             }
         };
 

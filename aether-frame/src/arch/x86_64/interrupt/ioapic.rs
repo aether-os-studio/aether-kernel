@@ -40,7 +40,7 @@ pub fn init_from_acpi(vector_base: u8) -> Result<usize, &'static str> {
     }
 
     let count = controllers.len();
-    *CONTROLLERS.lock_irqsave() = Some(controllers);
+    *CONTROLLERS.lock() = Some(controllers);
     Ok(count)
 }
 
@@ -50,7 +50,7 @@ pub fn configure_isa_irq(
     destination_lapic_id: u8,
 ) -> Result<(), &'static str> {
     let (gsi, flags) = isa_irq_route(irq)?;
-    let controllers = CONTROLLERS.lock_irqsave();
+    let controllers = CONTROLLERS.lock();
     let controllers = controllers.as_ref().ok_or("IOAPICs are not initialized")?;
     let controller = controllers
         .iter()
@@ -66,7 +66,7 @@ pub fn configure_isa_irq(
     entry.set_dest(destination_lapic_id);
     entry.set_flags(flags);
 
-    let mut ioapic = controller.ioapic.lock_irqsave();
+    let mut ioapic = controller.ioapic.lock();
     unsafe {
         ioapic.set_table_entry(pin, entry);
         ioapic.enable_irq(pin);

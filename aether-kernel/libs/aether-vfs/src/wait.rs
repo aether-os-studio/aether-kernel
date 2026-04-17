@@ -35,19 +35,19 @@ impl WaitQueue {
     pub fn register(&self, events: PollEvents, listener: SharedWaitListener) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::AcqRel);
         self.registrations
-            .lock_irqsave()
+            .lock()
             .insert(id, WaitRegistration { events, listener });
         id
     }
 
     pub fn unregister(&self, id: u64) -> bool {
-        self.registrations.lock_irqsave().remove(&id).is_some()
+        self.registrations.lock().remove(&id).is_some()
     }
 
     pub fn notify(&self, events: PollEvents) {
         let listeners = self
             .registrations
-            .lock_irqsave()
+            .lock()
             .values()
             .filter_map(|registration| {
                 let matched = events.intersection(registration.events);

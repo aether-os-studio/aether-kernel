@@ -1135,13 +1135,13 @@ impl TtyFile {
 
     fn with_state<R>(&self, f: impl FnOnce(&ConsoleTtyState) -> R) -> R {
         let endpoint = self.endpoint();
-        let guard = endpoint.tty.lock_irqsave();
+        let guard = endpoint.tty.lock();
         f(&guard)
     }
 
     fn with_state_mut<R>(&self, f: impl FnOnce(&mut ConsoleTtyState) -> R) -> R {
         let endpoint = self.endpoint();
-        let mut guard = endpoint.tty.lock_irqsave();
+        let mut guard = endpoint.tty.lock();
         f(&mut guard)
     }
 
@@ -1232,7 +1232,7 @@ impl TtyFile {
 
         let endpoint = self.endpoint();
         let wake = {
-            let mut state = endpoint.tty.lock_irqsave();
+            let mut state = endpoint.tty.lock();
             match event.code {
                 KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
                     state.key_shift = event.value != 0;
@@ -1283,7 +1283,7 @@ impl FileOperations for TtyFile {
         }
 
         let endpoint = self.endpoint();
-        let mut state = endpoint.tty.lock_irqsave();
+        let mut state = endpoint.tty.lock();
         let vmin = state.termios.c_cc[VMIN].max(1) as usize;
         let canonical = (state.termios.c_lflag & ICANON) != 0;
 
@@ -1344,7 +1344,7 @@ impl FileOperations for TtyFile {
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
         let endpoint = self.endpoint();
         let mut ready = endpoint.backend.poll_ready(events);
-        let state = endpoint.tty.lock_irqsave();
+        let state = endpoint.tty.lock();
         if events.contains(PollEvents::READ) && state.input_count != 0 {
             ready = ready | PollEvents::READ;
         }
@@ -1430,7 +1430,7 @@ struct FramebufferTtyBackend {
 
 impl TtyBackend for FramebufferTtyBackend {
     fn write_bytes(&self, bytes: &[u8]) {
-        let mut terminal = self.terminal.lock_irqsave();
+        let mut terminal = self.terminal.lock();
         terminal.process(bytes);
     }
 

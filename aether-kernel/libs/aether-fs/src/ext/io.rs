@@ -250,5 +250,5 @@ pub(crate) fn block_on_future<F>(future: F) -> F::Output
 where
     F: Future,
 {
-    aether_frame::executor::block_on(future)
+    crate::block_on_future(future)
 }

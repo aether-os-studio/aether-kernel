@@ -75,7 +75,7 @@ pub fn init() {
 }
 
 pub fn register_writer(writer: LogWriter) -> Result<(), RegisterWriterError> {
-    let mut writers = LOG_WRITERS.lock_irqsave();
+    let mut writers = LOG_WRITERS.lock();
 
     if writers
         .iter()
@@ -94,5 +94,5 @@ pub fn register_writer(writer: LogWriter) -> Result<(), RegisterWriterError> {
 }
 
 fn snapshot_writers() -> [Option<LogWriter>; MAX_LOG_WRITERS] {
-    *LOG_WRITERS.lock_irqsave()
+    *LOG_WRITERS.lock()
 }

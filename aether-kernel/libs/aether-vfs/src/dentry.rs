@@ -41,7 +41,7 @@ impl Dentry {
     }
 
     pub fn parent(&self) -> Option<DentryRef> {
-        self.parent.lock_irqsave().as_ref().and_then(Weak::upgrade)
+        self.parent.lock().as_ref().and_then(Weak::upgrade)
     }
 
     pub fn absolute_path(&self) -> String {

@@ -74,6 +74,10 @@ pub const DRM_CLIENT_CAP_ASPECT_RATIO: u64 = 4;
 pub const DRM_CLIENT_CAP_WRITEBACK_CONNECTORS: u64 = 5;
 
 pub const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
+pub const DRM_MODE_FB_DIRTY_ANNOTATE_COPY: u32 = 0x01;
+pub const DRM_MODE_FB_DIRTY_ANNOTATE_FILL: u32 = 0x02;
+pub const DRM_MODE_FB_DIRTY_FLAGS: u32 =
+    DRM_MODE_FB_DIRTY_ANNOTATE_COPY | DRM_MODE_FB_DIRTY_ANNOTATE_FILL;
 
 pub const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
 pub const DRM_MODE_PAGE_FLIP_FLAGS: u32 = DRM_MODE_PAGE_FLIP_EVENT | 0x02 | 0x0c;
@@ -310,7 +314,7 @@ struct DrmState {
     current_fb_id: u32,
     master_pid: Option<u32>,
     universal_planes: bool,
-    dumb_buffers: BTreeMap<u32, DumbBuffer>,
+    dumb_buffers: BTreeMap<u32, Arc<DumbBuffer>>,
     framebuffers: BTreeMap<u32, DrmFramebufferState>,
     event_queue: VecDeque<u8>,
 }
@@ -397,7 +401,7 @@ impl DrmDevice {
                 if value > 1 {
                     return Err(DrmIoctlError::Invalid);
                 }
-                self.state.lock_irqsave().universal_planes = value != 0;
+                self.state.lock().universal_planes = value != 0;
                 Ok(())
             }
             DRM_CLIENT_CAP_ATOMIC => {
@@ -412,7 +416,7 @@ impl DrmDevice {
     }
 
     pub fn set_master(&self, pid: u32) -> Result<(), DrmIoctlError> {
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         match state.master_pid {
             Some(owner) if owner != pid => Err(DrmIoctlError::Busy),
             _ => {
@@ -423,7 +427,7 @@ impl DrmDevice {
     }
 
     pub fn drop_master(&self, pid: u32) -> Result<(), DrmIoctlError> {
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         match state.master_pid {
             Some(owner) if owner == pid => {
                 state.master_pid = None;
@@ -435,7 +439,7 @@ impl DrmDevice {
     }
 
     pub fn resources(&self) -> DrmResourcesSnapshot {
-        let state = self.state.lock_irqsave();
+        let state = self.state.lock();
         let mode = self.backend.mode();
         DrmResourcesSnapshot {
             framebuffer_ids: state.framebuffers.keys().copied().collect(),
@@ -451,7 +455,7 @@ impl DrmDevice {
 
     pub fn get_crtc(&self, crtc_id: u32) -> Option<DrmCrtcSnapshot> {
         (crtc_id == self.crtc_id).then(|| {
-            let state = self.state.lock_irqsave();
+            let state = self.state.lock();
             DrmCrtcSnapshot {
                 crtc_id: self.crtc_id,
                 framebuffer_id: state.current_fb_id,
@@ -494,13 +498,13 @@ impl DrmDevice {
     }
 
     pub fn plane_ids(&self) -> Vec<u32> {
-        let _ = self.state.lock_irqsave().universal_planes;
+        let _ = self.state.lock().universal_planes;
         alloc::vec![self.plane_id]
     }
 
     pub fn get_plane(&self, plane_id: u32) -> Option<DrmPlaneSnapshot> {
         (plane_id == self.plane_id).then(|| {
-            let state = self.state.lock_irqsave();
+            let state = self.state.lock();
             DrmPlaneSnapshot {
                 plane_id: self.plane_id,
                 crtc_id: self.crtc_id,
@@ -513,7 +517,7 @@ impl DrmDevice {
     }
 
     pub fn get_framebuffer(&self, framebuffer_id: u32) -> Option<DrmFramebufferSnapshot> {
-        let state = self.state.lock_irqsave();
+        let state = self.state.lock();
         state
             .framebuffers
             .get(&framebuffer_id)
@@ -743,12 +747,12 @@ impl DrmDevice {
         let pitch = (width.saturating_mul(bytes_per_pixel).saturating_add(63)) & !63;
         let size = height.saturating_mul(pitch) as usize;
         let dma = DmaRegion::new(size).map_err(|_| DrmIoctlError::NoMemory)?;
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         let handle = state.next_handle;
         state.next_handle = state.next_handle.saturating_add(1);
         state.dumb_buffers.insert(
             handle,
-            DumbBuffer {
+            Arc::new(DumbBuffer {
                 handle,
                 width,
                 height,
@@ -756,23 +760,23 @@ impl DrmDevice {
                 pitch,
                 size,
                 dma,
-            },
+            }),
         );
         self.bump();
         Ok((handle, pitch, size as u64))
     }
 
     pub fn map_dumb(&self, handle: u32) -> Result<u64, DrmIoctlError> {
-        let state = self.state.lock_irqsave();
+        let state = self.state.lock();
         state
             .dumb_buffers
             .get(&handle)
-            .map(DumbBuffer::phys_addr)
+            .map(|dumb| dumb.phys_addr())
             .ok_or(DrmIoctlError::NotFound)
     }
 
     pub fn destroy_dumb(&self, handle: u32) -> Result<(), DrmIoctlError> {
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         if state.current_fb_id != 0
             && state
                 .framebuffers
@@ -799,7 +803,7 @@ impl DrmDevice {
             return Err(DrmIoctlError::Invalid);
         }
 
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         let dumb = state
             .dumb_buffers
             .get(&create.handle)
@@ -836,7 +840,7 @@ impl DrmDevice {
     }
 
     pub fn remove_framebuffer(&self, framebuffer_id: u32) -> Result<(), DrmIoctlError> {
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         if framebuffer_id == state.current_fb_id {
             return Err(DrmIoctlError::Busy);
         }
@@ -848,8 +852,24 @@ impl DrmDevice {
     }
 
     pub fn set_crtc(&self, framebuffer_id: u32) -> Result<(), DrmIoctlError> {
-        let (bytes, width, height, pitch, format) = {
-            let state = self.state.lock_irqsave();
+        self.present_framebuffer(framebuffer_id)?;
+        self.state.lock().current_fb_id = framebuffer_id;
+        self.bump();
+        Ok(())
+    }
+
+    pub fn dirty_framebuffer(&self, framebuffer_id: u32, flags: u32) -> Result<(), DrmIoctlError> {
+        if (flags & !DRM_MODE_FB_DIRTY_FLAGS) != 0 {
+            return Err(DrmIoctlError::Invalid);
+        }
+        self.present_framebuffer(framebuffer_id)?;
+        self.bump();
+        Ok(())
+    }
+
+    fn present_framebuffer(&self, framebuffer_id: u32) -> Result<(), DrmIoctlError> {
+        let (dumb, width, height, pitch, format) = {
+            let state = self.state.lock();
             let framebuffer = state
                 .framebuffers
                 .get(&framebuffer_id)
@@ -859,7 +879,7 @@ impl DrmDevice {
                 .get(&framebuffer.handle)
                 .ok_or(DrmIoctlError::NotFound)?;
             (
-                dumb.bytes().to_vec(),
+                dumb.clone(),
                 framebuffer.width,
                 framebuffer.height,
                 framebuffer.pitch,
@@ -868,9 +888,7 @@ impl DrmDevice {
         };
 
         self.backend
-            .present(bytes.as_slice(), width, height, pitch, format)?;
-        self.state.lock_irqsave().current_fb_id = framebuffer_id;
-        self.bump();
+            .present(dumb.bytes(), width, height, pitch, format)?;
         Ok(())
     }
 
@@ -904,7 +922,7 @@ impl DrmDevice {
         event[24..28].copy_from_slice(&0u32.to_ne_bytes());
         event[28..32].copy_from_slice(&self.crtc_id.to_ne_bytes());
 
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         state.event_queue.extend(event);
         drop(state);
         self.bump();
@@ -912,7 +930,7 @@ impl DrmDevice {
     }
 
     fn drain_events(&self, buffer: &mut [u8]) -> FsResult<usize> {
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         if state.event_queue.is_empty() {
             return Err(FsError::WouldBlock);
         }
@@ -952,11 +970,11 @@ impl DrmDevice {
     }
 
     fn has_events(&self) -> bool {
-        !self.state.lock_irqsave().event_queue.is_empty()
+        !self.state.lock().event_queue.is_empty()
     }
 
     fn mmap_dumb(&self, offset: u64, length: u64) -> FsResult<MmapResponse> {
-        let state = self.state.lock_irqsave();
+        let state = self.state.lock();
         let dumb = state
             .dumb_buffers
             .values()

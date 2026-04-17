@@ -3,6 +3,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
+use core::future::Future;
 use core::pin::Pin;
 
 use aether_vfs::{FileOperations, FsError, FsResult};
@@ -246,5 +247,5 @@ fn validate_geometry(geometry: BlockGeometry) -> FsResult<BlockGeometry> {
 }
 
 pub(crate) fn block_on<T>(mut future: BlockFuture<'_, T>) -> FsResult<T> {
-    aether_frame::executor::block_on(async move { future.as_mut().await })
+    crate::block_on_future(async move { future.as_mut().await })
 }

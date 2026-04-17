@@ -17,10 +17,7 @@ unsafe impl Sync for DmaRegion {}
 impl DmaRegion {
     pub fn new(len: usize) -> Result<Self, ()> {
         let pages = len.div_ceil(PAGE_SIZE as usize).max(1);
-        let frame = frame_allocator()
-            .lock_irqsave()
-            .alloc(pages)
-            .map_err(|_| ())?;
+        let frame = frame_allocator().lock().alloc(pages).map_err(|_| ())?;
         let ptr = phys_to_virt(frame.start_address().as_u64()) as *mut u8;
         unsafe {
             ptr::write_bytes(ptr, 0, pages * PAGE_SIZE as usize);
@@ -70,8 +67,6 @@ impl DmaRegion {
 
 impl Drop for DmaRegion {
     fn drop(&mut self) {
-        let _ = frame_allocator()
-            .lock_irqsave()
-            .release(self.frame, self.pages);
+        let _ = frame_allocator().lock().release(self.frame, self.pages);
     }
 }

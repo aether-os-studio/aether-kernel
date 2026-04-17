@@ -45,7 +45,7 @@ impl SyscallRegistry {
             return;
         }
 
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         state.handlers[number] = Some(syscall.handle);
         state.names[number] = Some(syscall.name);
     }
@@ -57,7 +57,7 @@ impl SyscallRegistry {
         context: &mut dyn KernelSyscallContext,
         args: SyscallArgs,
     ) -> Option<SyscallDispatch> {
-        let guard = self.state.lock_irqsave();
+        let guard = self.state.lock();
         let handle = guard.handlers.get(number as usize).copied().flatten()?;
         let name = guard.names.get(number as usize).copied().flatten()?;
         drop(guard);

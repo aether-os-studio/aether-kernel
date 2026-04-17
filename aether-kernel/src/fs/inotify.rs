@@ -66,7 +66,7 @@ static REGISTRY: SpinLock<InotifyRegistry> = SpinLock::new(InotifyRegistry::new(
 pub fn create_inotify_instance() -> Arc<InotifyFile> {
     let instance = Arc::new(InotifyFile::new());
     REGISTRY
-        .lock_irqsave()
+        .lock()
         .instances
         .insert(instance.instance_id, Arc::downgrade(&instance));
     instance
@@ -220,7 +220,7 @@ impl InotifyFile {
     pub fn add_watch(&self, node: &NodeRef, mask: u32) -> FsResult<i32> {
         let target = watch_target(node);
         let normalized_mask = mask & !IN_MASK_ADD & !IN_MASK_CREATE;
-        let mut watches = self.watches.lock_irqsave();
+        let mut watches = self.watches.lock();
         if let Some((wd, watch)) = watches
             .iter_mut()
             .find(|(_, watch)| watch.target == target)
@@ -247,7 +247,7 @@ impl InotifyFile {
         );
         drop(watches);
 
-        REGISTRY.lock_irqsave().register(
+        REGISTRY.lock().register(
             target,
             WatchRegistration {
                 instance_id: self.instance_id,
@@ -260,35 +260,31 @@ impl InotifyFile {
     pub fn remove_watch(&self, wd: i32) -> FsResult<()> {
         let target = self.remove_watch_registration(wd)?;
         self.push_event(encode_event(wd, IN_IGNORED, 0, None));
-        REGISTRY
-            .lock_irqsave()
-            .unregister(target, self.instance_id, wd);
+        REGISTRY.lock().unregister(target, self.instance_id, wd);
         Ok(())
     }
 
     fn remove_watch_registration(&self, wd: i32) -> FsResult<WatchTarget> {
         self.watches
-            .lock_irqsave()
+            .lock()
             .remove(&wd)
             .map(|watch| watch.target)
             .ok_or(FsError::InvalidInput)
     }
 
     fn watch(&self, wd: i32) -> Option<InotifyWatch> {
-        self.watches.lock_irqsave().get(&wd).copied()
+        self.watches.lock().get(&wd).copied()
     }
 
     fn push_event(&self, event: Vec<u8>) {
-        self.events.lock_irqsave().push_back(event);
+        self.events.lock().push_back(event);
         self.waiters.notify(PollEvents::READ);
     }
 
     fn auto_remove_watch(&self, wd: i32, target: WatchTarget) {
-        let removed = self.watches.lock_irqsave().remove(&wd);
+        let removed = self.watches.lock().remove(&wd);
         if removed.is_some() {
-            REGISTRY
-                .lock_irqsave()
-                .unregister(target, self.instance_id, wd);
+            REGISTRY.lock().unregister(target, self.instance_id, wd);
             self.push_event(encode_event(wd, IN_IGNORED, 0, None));
         }
     }
@@ -304,7 +300,7 @@ impl FileOperations for InotifyFile {
             return Ok(0);
         }
 
-        let mut events = self.events.lock_irqsave();
+        let mut events = self.events.lock();
         let Some(first) = events.front() else {
             return Err(FsError::WouldBlock);
         };
@@ -325,7 +321,7 @@ impl FileOperations for InotifyFile {
     }
 
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
-        let ready = if events.contains(PollEvents::READ) && !self.events.lock_irqsave().is_empty() {
+        let ready = if events.contains(PollEvents::READ) && !self.events.lock().is_empty() {
             PollEvents::READ
         } else {
             PollEvents::empty()
@@ -357,7 +353,7 @@ fn dispatch_target_event(
 ) {
     let target = watch_target(node);
     let registrations = {
-        let mut registry = REGISTRY.lock_irqsave();
+        let mut registry = REGISTRY.lock();
         if remove_watch {
             registry.remove_target(target)
         } else {
@@ -368,7 +364,7 @@ fn dispatch_target_event(
     let mut oneshot = Vec::new();
     for registration in registrations {
         let Some(instance) = REGISTRY
-            .lock_irqsave()
+            .lock()
             .instances
             .get(&registration.instance_id)
             .and_then(Weak::upgrade)

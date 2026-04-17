@@ -83,6 +83,12 @@ impl DrmScanoutBackend for PlainFbBackend {
 
         if self.is_native_format(pixel_format) {
             let row_bytes = width.saturating_mul(4);
+            if pitch == self.surface.stride() && height.saturating_mul(row_bytes) <= bytes.len() {
+                self.surface
+                    .write_bytes(0, &bytes[..height.saturating_mul(row_bytes)])
+                    .map_err(|_| DrmIoctlError::Invalid)?;
+                return Ok(());
+            }
             for row in 0..height {
                 let start = row.saturating_mul(pitch);
                 let end = start.saturating_add(row_bytes);

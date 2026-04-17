@@ -22,15 +22,15 @@ pub fn init() -> Result<(), RegisterWriterError> {
 }
 
 pub fn install_kmsg(buffer: Arc<KmsgBuffer>) {
-    *KMSG_SINK.lock_irqsave() = Some(buffer);
+    *KMSG_SINK.lock() = Some(buffer);
 }
 
 pub fn install_terminal(console: Arc<FramebufferConsole>) {
-    *TERMINAL_SINK.lock_irqsave() = Some(console);
+    *TERMINAL_SINK.lock() = Some(console);
 }
 
 pub fn kmsg_writer(message: &LogMessage<'_>) {
-    let sink = KMSG_SINK.lock_irqsave().clone();
+    let sink = KMSG_SINK.lock().clone();
     if let Some(buffer) = sink {
         buffer.push(
             message.level,

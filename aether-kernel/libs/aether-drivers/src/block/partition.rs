@@ -342,5 +342,17 @@ fn partition_minor(parent_minor: u16, index: u32) -> u16 {
 fn block_on<T>(
     mut future: Pin<Box<dyn Future<Output = Result<T, FsError>> + Send + '_>>,
 ) -> Result<T, FsError> {
-    aether_frame::executor::block_on(async move { future.as_mut().await })
+    struct FrameParker;
+
+    impl aether_async::Parker for FrameParker {
+        fn can_park(&self) -> bool {
+            aether_frame::interrupt::are_enabled()
+        }
+
+        fn park(&self) {
+            aether_frame::arch::cpu::wait_for_interrupt();
+        }
+    }
+
+    aether_async::block_on_with(async move { future.as_mut().await }, &FrameParker)
 }

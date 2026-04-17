@@ -18,6 +18,6 @@ pub use self::inotify::{
 };
 pub use self::timerfd::{
     LinuxItimerSpec, TFD_CLOEXEC, TFD_CREATE_FLAGS, TFD_NONBLOCK, TFD_SETTIME_FLAGS, TimerFdFile,
-    deadline_due as timerfd_deadline_due, parse_timerfd_clock,
-    wake_expired_timers as wake_expired_timerfds,
+    deadline_due as timerfd_deadline_due, next_wakeup_deadline as next_timerfd_wakeup_deadline,
+    parse_timerfd_clock, wake_expired_timers as wake_expired_timerfds,
 };

@@ -85,6 +85,8 @@ static TIMER_TICK_PENDING: AtomicBool = AtomicBool::new(false);
 static NEXT_TIMER_DEADLINE_NANOS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
 
+const PRECISE_WAIT_THRESHOLD_NS: u64 = 10_000_000;
+
 pub(crate) fn publish_next_timer_deadline(deadline_nanos: Option<u64>) {
     NEXT_TIMER_DEADLINE_NANOS.store(deadline_nanos.unwrap_or(u64::MAX), Ordering::Release);
     if deadline_nanos.is_none() {
@@ -131,7 +133,7 @@ fn block_type_to_process_block(block: BlockType) -> ProcessBlock {
     }
 }
 
-fn process_kernel_syscall_entry(process: &mut KernelProcess) {
+fn process_kernel_syscall_entry(process: &mut KernelProcess) -> ! {
     let runtime = KernelRuntime::shared().expect("kernel syscall continuation requires runtime");
 
     loop {
@@ -184,6 +186,7 @@ fn process_kernel_syscall_entry(process: &mut KernelProcess) {
             .as_mut()
             .expect("completed syscall missing kernel context"),
     );
+    unreachable!("kernel syscall context resumed after completion");
 }
 
 fn runtime_send_process_group_signal(process_group: i32, signal: i32) {
@@ -196,17 +199,17 @@ fn runtime_send_process_group_signal(process_group: i32, signal: i32) {
     let info = crate::signal::SignalInfo::kernel(signal as u8, 0);
     let _ = runtime
         .processes
-        .lock_irqsave()
+        .lock()
         .send_signal_process_group(process_group as u32, info);
 }
 
 impl KernelRuntime {
     pub fn current_pid() -> Option<Pid> {
-        CURRENT_PIDS.lock_irqsave()[aether_frame::arch::cpu::current_cpu_index()]
+        CURRENT_PIDS.lock()[aether_frame::arch::cpu::current_cpu_index()]
     }
 
     pub fn procfs_snapshot(pid: Pid) -> Option<ProcFsProcessSnapshot> {
-        Self::shared().and_then(|runtime| runtime.processes.lock_irqsave().procfs_snapshot(pid))
+        Self::shared().and_then(|runtime| runtime.processes.lock().procfs_snapshot(pid))
     }
 
     pub fn bootstrap() -> Result<Self, RuntimeInitError> {
@@ -349,13 +352,13 @@ impl KernelRuntime {
 
     pub fn install(self) -> Arc<Self> {
         let runtime = Arc::new(self);
-        *SHARED_RUNTIME.lock_irqsave() = Some(runtime.clone());
+        *SHARED_RUNTIME.lock() = Some(runtime.clone());
         aether_frame::interrupt::timer::register_tick_handler(runtime_tick_handler);
         runtime
     }
 
     pub fn shared() -> Option<Arc<Self>> {
-        SHARED_RUNTIME.lock_irqsave().clone()
+        SHARED_RUNTIME.lock().clone()
     }
 
     pub fn run_secondary(cpu_index: usize) -> ! {
@@ -372,12 +375,15 @@ impl KernelRuntime {
         let mut scheduler_context = aether_frame::process::KernelContext::default();
         aether_frame::process::install_scheduler_context(&mut scheduler_context);
         loop {
-            aether_frame::executor::run_ready();
+            if !aether_frame::interrupt::are_enabled() {
+                aether_frame::interrupt::enable();
+            }
+            aether_async::run_ready();
             if aether_frame::preempt::take_need_resched() {
                 continue;
             }
             let work = {
-                let mut processes = self.processes.lock_irqsave();
+                let mut processes = self.processes.lock();
                 processes.wake_ready_file_blocks();
                 if TIMER_TICK_PENDING.swap(false, Ordering::AcqRel) {
                     crate::fs::wake_expired_timerfds();
@@ -390,13 +396,37 @@ impl KernelRuntime {
             };
             match work {
                 DispatchWork::Idle => {
-                    if !aether_frame::preempt::take_need_resched() {
-                        aether_frame::arch::cpu::wait_for_interrupt();
+                    if aether_frame::preempt::take_need_resched() {
+                        continue;
                     }
+
+                    let next_deadline = {
+                        let processes = self.processes.lock();
+                        let process_deadline = processes.next_timer_deadline_nanos();
+                        let timerfd_deadline = crate::fs::next_timerfd_wakeup_deadline();
+                        match (process_deadline, timerfd_deadline) {
+                            (Some(left), Some(right)) => Some(left.min(right)),
+                            (Some(value), None) | (None, Some(value)) => Some(value),
+                            (None, None) => None,
+                        }
+                    };
+
+                    if let Some(deadline) = next_deadline {
+                        let now = aether_frame::interrupt::timer::nanos_since_boot();
+                        let remaining = deadline.saturating_sub(now);
+                        if remaining != 0 && remaining <= PRECISE_WAIT_THRESHOLD_NS {
+                            if aether_frame::arch::timer::hpet::stall_nanos(remaining).is_ok() {
+                                TIMER_TICK_PENDING.store(true, Ordering::Release);
+                                continue;
+                            }
+                        }
+                    }
+
+                    aether_frame::arch::cpu::wait_for_interrupt();
                 }
                 DispatchWork::Event(event) => self.handle_event(event),
                 DispatchWork::Process(mut process) => {
-                    CURRENT_PIDS.lock_irqsave()[aether_frame::arch::cpu::current_cpu_index()] =
+                    CURRENT_PIDS.lock()[aether_frame::arch::cpu::current_cpu_index()] =
                         Some(process.identity.pid);
                     let result = process.task.process.run();
                     let event = match result.reason {
@@ -404,7 +434,7 @@ impl KernelRuntime {
                             let syscall_number = result.context.syscall_number();
                             let syscall_args = SyscallArgs::from_context(&result.context);
                             {
-                                let mut processes = self.processes.lock_irqsave();
+                                let mut processes = self.processes.lock();
                                 processes.mark_process_ran(process.identity.pid);
                             }
                             process.pending_syscall = Some(crate::process::PendingSyscall {
@@ -428,7 +458,7 @@ impl KernelRuntime {
                                     .as_ref()
                                     .expect("syscall continuation missing kernel context"),
                             );
-                            let mut processes = self.processes.lock_irqsave();
+                            let mut processes = self.processes.lock();
                             processes.finish_kernel_syscall_context(process)
                         }
                         _ => {
@@ -436,16 +466,15 @@ impl KernelRuntime {
                                 rootfs: &self.rootfs,
                                 processes: &self.processes,
                             };
-                            let mut processes = self.processes.lock_irqsave();
+                            let mut processes = self.processes.lock();
                             processes.finish_process(process, result, services)
                         }
                     };
-                    CURRENT_PIDS.lock_irqsave()[aether_frame::arch::cpu::current_cpu_index()] =
-                        None;
+                    CURRENT_PIDS.lock()[aether_frame::arch::cpu::current_cpu_index()] = None;
                     self.handle_event(event);
                 }
                 DispatchWork::KernelSyscall(process) => {
-                    CURRENT_PIDS.lock_irqsave()[aether_frame::arch::cpu::current_cpu_index()] =
+                    CURRENT_PIDS.lock()[aether_frame::arch::cpu::current_cpu_index()] =
                         Some(process.identity.pid);
                     aether_frame::process::resume_kernel_context(
                         &mut scheduler_context,
@@ -455,11 +484,10 @@ impl KernelRuntime {
                             .expect("resumed syscall missing kernel context"),
                     );
                     let event = {
-                        let mut processes = self.processes.lock_irqsave();
+                        let mut processes = self.processes.lock();
                         processes.finish_kernel_syscall_context(process)
                     };
-                    CURRENT_PIDS.lock_irqsave()[aether_frame::arch::cpu::current_cpu_index()] =
-                        None;
+                    CURRENT_PIDS.lock()[aether_frame::arch::cpu::current_cpu_index()] = None;
                     self.handle_event(event);
                 }
             }
@@ -661,7 +689,7 @@ impl ProcessServices for RuntimeServices<'_> {
 
     fn clone_process(&mut self, parent: &mut KernelProcess, params: CloneParams) -> SysResult<Pid> {
         params.validate()?;
-        let pid = self.processes.lock_irqsave().allocate_pid();
+        let pid = self.processes.lock().allocate_pid();
         let child_parent = if params.inherit_parent() {
             parent.identity.parent
         } else {
@@ -750,7 +778,7 @@ impl ProcessServices for RuntimeServices<'_> {
             state: ProcessState::Runnable,
         };
 
-        Ok(self.processes.lock_irqsave().insert_cloned_process(child))
+        Ok(self.processes.lock().insert_cloned_process(child))
     }
 
     fn reap_child_event(
@@ -760,30 +788,26 @@ impl ProcessServices for RuntimeServices<'_> {
         options: u64,
     ) -> Option<ChildEvent> {
         self.processes
-            .lock_irqsave()
+            .lock()
             .reap_child_event(parent_pid, requested, options)
     }
 
     fn has_child(&mut self, parent_pid: Pid, requested: i32) -> bool {
-        self.processes
-            .lock_irqsave()
-            .has_child(parent_pid, requested)
+        self.processes.lock().has_child(parent_pid, requested)
     }
 
     fn wake_vfork_parent(&mut self, parent_pid: Pid, child_pid: Pid) {
         self.processes
-            .lock_irqsave()
+            .lock()
             .wake_vfork_parent(parent_pid, child_pid);
     }
 
     fn send_kernel_signal(&mut self, pid: Pid, signal: crate::signal::SignalInfo) -> bool {
-        self.processes.lock_irqsave().send_signal(pid, signal)
+        self.processes.lock().send_signal(pid, signal)
     }
 
     fn wake_futex(&mut self, uaddr: u64, bitset: u32, count: usize) -> usize {
-        self.processes
-            .lock_irqsave()
-            .wake_futex(uaddr, bitset, count)
+        self.processes.lock().wake_futex(uaddr, bitset, count)
     }
 
     fn requeue_futex(
@@ -795,7 +819,7 @@ impl ProcessServices for RuntimeServices<'_> {
         bitset: u32,
     ) -> usize {
         self.processes
-            .lock_irqsave()
+            .lock()
             .requeue_futex(from, to, wake_count, requeue_count, bitset)
     }
 

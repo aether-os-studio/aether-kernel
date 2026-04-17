@@ -57,7 +57,7 @@ impl FileOperations for EventFdFile {
         }
 
         let (value, wake_writers) = {
-            let mut inner = self.inner.lock_irqsave();
+            let mut inner = self.inner.lock();
             if inner.counter == 0 {
                 return Err(FsError::WouldBlock);
             }
@@ -93,7 +93,7 @@ impl FileOperations for EventFdFile {
         }
 
         let wake_readers = {
-            let mut inner = self.inner.lock_irqsave();
+            let mut inner = self.inner.lock();
             let available = EVENTFD_COUNTER_MAX.saturating_sub(inner.counter);
             if value > available {
                 return Err(FsError::WouldBlock);
@@ -114,7 +114,7 @@ impl FileOperations for EventFdFile {
     }
 
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
-        let counter = self.inner.lock_irqsave().counter;
+        let counter = self.inner.lock().counter;
         let mut ready = PollEvents::empty();
 
         if events.contains(PollEvents::READ) && counter != 0 {

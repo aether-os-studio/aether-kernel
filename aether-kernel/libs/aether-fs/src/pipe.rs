@@ -40,7 +40,7 @@ impl PipeState {
     }
 
     fn add_reader(&self) {
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         inner.readers = inner.readers.saturating_add(1);
         drop(inner);
         self.bump();
@@ -49,7 +49,7 @@ impl PipeState {
     }
 
     fn add_writer(&self) {
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         inner.writers = inner.writers.saturating_add(1);
         drop(inner);
         self.bump();
@@ -58,7 +58,7 @@ impl PipeState {
     }
 
     fn remove_reader(&self) {
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         inner.readers = inner.readers.saturating_sub(1);
         drop(inner);
         self.bump();
@@ -67,7 +67,7 @@ impl PipeState {
     }
 
     fn remove_writer(&self) {
-        let mut inner = self.inner.lock_irqsave();
+        let mut inner = self.inner.lock();
         inner.writers = inner.writers.saturating_sub(1);
         drop(inner);
         self.bump();
@@ -134,7 +134,7 @@ impl FileOperations for PipeEndpoint {
             return Err(FsError::InvalidInput);
         }
 
-        let mut inner = self.state.inner.lock_irqsave();
+        let mut inner = self.state.inner.lock();
         if !inner.bytes.is_empty() {
             let count = buffer.len().min(inner.bytes.len());
             for slot in &mut buffer[..count] {
@@ -158,7 +158,7 @@ impl FileOperations for PipeEndpoint {
 
         let mut written = 0usize;
         while written < buffer.len() {
-            let mut inner = self.state.inner.lock_irqsave();
+            let mut inner = self.state.inner.lock();
             if inner.readers == 0 {
                 return if written == 0 {
                     Err(FsError::BrokenPipe)
@@ -183,7 +183,7 @@ impl FileOperations for PipeEndpoint {
     }
 
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
-        let inner = self.state.inner.lock_irqsave();
+        let inner = self.state.inner.lock();
         let mut ready = PollEvents::empty();
 
         if self.kind == PipeEndpointKind::Read && events.contains(PollEvents::READ) {

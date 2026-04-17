@@ -219,7 +219,7 @@ pub trait InputEventSink: Send + Sync {
 }
 
 pub fn register_input_sink(listener: Arc<dyn InputEventSink>) {
-    let mut listeners = LISTENERS.lock_irqsave();
+    let mut listeners = LISTENERS.lock();
     listeners.retain(|entry| entry.upgrade().is_some());
     listeners.push(Arc::downgrade(&listener));
 }
@@ -317,7 +317,7 @@ impl InputDevice {
 
     pub fn emit_event(&self, event: LinuxInputEvent) {
         {
-            let mut state = self.inner.state.lock_irqsave();
+            let mut state = self.inner.state.lock();
             if state.queue.len() >= INPUT_EVENT_QUEUE_CAPACITY {
                 let _ = state.queue.pop_front();
             }
@@ -563,7 +563,7 @@ impl FileOperations for EvdevFile {
             return Err(FsError::InvalidInput);
         }
 
-        let mut state = self.device.state.lock_irqsave();
+        let mut state = self.device.state.lock();
         if state.queue.is_empty() {
             return Err(FsError::WouldBlock);
         }
@@ -585,7 +585,7 @@ impl FileOperations for EvdevFile {
 
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
         let mut ready = PollEvents::empty();
-        let state = self.device.state.lock_irqsave();
+        let state = self.device.state.lock();
         if events.contains(PollEvents::READ) && !state.queue.is_empty() {
             ready = ready | PollEvents::READ;
         }
@@ -660,7 +660,7 @@ impl KernelDevice for InputDevice {
 
 fn notify_listeners(device: &InputDevice, event: LinuxInputEvent) {
     let listeners = {
-        let mut guard = LISTENERS.lock_irqsave();
+        let mut guard = LISTENERS.lock();
         guard.retain(|entry| entry.upgrade().is_some());
         guard.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
     };

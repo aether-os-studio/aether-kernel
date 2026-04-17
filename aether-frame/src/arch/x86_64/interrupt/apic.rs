@@ -1,4 +1,7 @@
-use x2apic::lapic::{IpiDestMode, LocalApic, LocalApicBuilder, TimerDivide, TimerMode, xapic_base};
+use x2apic::lapic::{
+    IpiDestMode, LocalApic, LocalApicBuildMode, LocalApicBuilder, TimerDivide, TimerMode,
+    xapic_base,
+};
 
 use crate::boot::MAX_CPUS;
 use crate::io::remap_mmio;
@@ -17,6 +20,7 @@ pub fn init(cpu_index: usize) -> Result<(), &'static str> {
     let mapped_apic = remap_mmio(apic_base, 4096).map_err(|_| "failed to remap local APIC")?;
     let mut builder = LocalApicBuilder::new();
     builder
+        .mode(LocalApicBuildMode::Auto)
         .timer_vector(TIMER_VECTOR as usize)
         .error_vector(ERROR_VECTOR as usize)
         .spurious_vector(SPURIOUS_VECTOR as usize)
@@ -102,7 +106,7 @@ pub fn calibrate_periodic_timer(target_hz: u32) -> Result<u32, &'static str> {
 fn with_current_lapic<R>(f: impl FnOnce(&mut LocalApic) -> R) -> Result<R, &'static str> {
     LOCAL_APICS
         .with(crate::arch::cpu::current_cpu_index(), |lapic| {
-            let mut lapic = lapic.lock_irqsave();
+            let mut lapic = lapic.lock();
             f(&mut lapic)
         })
         .map_err(|_| "local APIC is not initialized")

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aether-async = { path = "../aether-async" }
 aether-frame = { path = "../../../aether-frame" }
 aether-vfs = { path = "../aether-vfs" }
 async-trait = { version = "0.1.89", default-features = false }

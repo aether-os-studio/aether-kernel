@@ -235,7 +235,7 @@ impl DirectoryNode {
 
     fn insert(&self, name: impl Into<String>, node: NodeRef) -> FsResult<()> {
         let name = name.into();
-        let mut entries = self.entries.lock_irqsave();
+        let mut entries = self.entries.lock();
         if entries.contains_key(&name) {
             return Err(FsError::AlreadyExists);
         }
@@ -244,7 +244,7 @@ impl DirectoryNode {
     }
 
     fn remove(&self, name: &str, remove_directory: bool) -> FsResult<()> {
-        let mut entries = self.entries.lock_irqsave();
+        let mut entries = self.entries.lock();
         let Some(node) = entries.get(name) else {
             return Err(FsError::NotFound);
         };
@@ -273,7 +273,7 @@ impl DirectoryNode {
             .ok_or(FsError::NotDirectory)?;
 
         if core::ptr::eq(self, target) {
-            let mut entries = self.entries.lock_irqsave();
+            let mut entries = self.entries.lock();
             let node = entries.remove(old_name).ok_or(FsError::NotFound)?;
             if !replace && entries.contains_key(&new_name) {
                 entries.insert(String::from(old_name), node);
@@ -287,8 +287,8 @@ impl DirectoryNode {
         let self_ptr = self as *const Self as usize;
         let target_ptr = target as *const DirectoryNode as usize;
         if self_ptr < target_ptr {
-            let mut source_entries = self.entries.lock_irqsave();
-            let mut target_entries = target.entries.lock_irqsave();
+            let mut source_entries = self.entries.lock();
+            let mut target_entries = target.entries.lock();
             rename_between_maps(
                 &mut source_entries,
                 &mut target_entries,
@@ -297,8 +297,8 @@ impl DirectoryNode {
                 replace,
             )
         } else {
-            let mut target_entries = target.entries.lock_irqsave();
-            let mut source_entries = self.entries.lock_irqsave();
+            let mut target_entries = target.entries.lock();
+            let mut source_entries = self.entries.lock();
             rename_between_maps(
                 &mut source_entries,
                 &mut target_entries,
@@ -333,7 +333,7 @@ impl InodeOperations for DirectoryNode {
     }
 
     fn lookup(&self, name: &str) -> Option<NodeRef> {
-        self.entries.lock_irqsave().get(name).cloned()
+        self.entries.lock().get(name).cloned()
     }
 
     fn insert_child(&self, name: String, node: NodeRef) -> FsResult<()> {
@@ -366,7 +366,7 @@ impl InodeOperations for DirectoryNode {
     }
 
     fn create_dir(&self, name: String, mode: u32) -> FsResult<NodeRef> {
-        let device_id = self.metadata.lock_irqsave().device_id;
+        let device_id = self.metadata.lock().device_id;
         let node = DirectoryNode::new_with_metadata(
             name.clone(),
             NodeMetadata::directory(mode).with_device_id(device_id),
@@ -389,7 +389,7 @@ impl InodeOperations for DirectoryNode {
 
     fn entries(&self) -> Vec<DirectoryEntry> {
         self.entries
-            .lock_irqsave()
+            .lock()
             .iter()
             .map(|(name, node)| DirectoryEntry {
                 name: name.clone(),
@@ -399,23 +399,23 @@ impl InodeOperations for DirectoryNode {
     }
 
     fn mode(&self) -> Option<u32> {
-        Some(self.metadata.lock_irqsave().mode)
+        Some(self.metadata.lock().mode)
     }
 
     fn set_mode(&self, mode: u32) -> FsResult<()> {
-        self.metadata.lock_irqsave().mode = mode;
+        self.metadata.lock().mode = mode;
         Ok(())
     }
 
     fn set_owner(&self, uid: u32, gid: u32) -> FsResult<()> {
-        let mut metadata = self.metadata.lock_irqsave();
+        let mut metadata = self.metadata.lock();
         metadata.uid = uid;
         metadata.gid = gid;
         Ok(())
     }
 
     fn metadata(&self) -> NodeMetadata {
-        *self.metadata.lock_irqsave()
+        *self.metadata.lock()
     }
 }
 
@@ -514,22 +514,22 @@ impl InodeOperations for FileNode {
     }
 
     fn device_numbers(&self) -> Option<(u32, u32)> {
-        let metadata = self.metadata.lock_irqsave();
+        let metadata = self.metadata.lock();
         ((self.kind == NodeKind::BlockDevice) || (self.kind == NodeKind::CharDevice))
             .then_some((metadata.rdev_major, metadata.rdev_minor))
     }
 
     fn mode(&self) -> Option<u32> {
-        Some(self.metadata.lock_irqsave().mode)
+        Some(self.metadata.lock().mode)
     }
 
     fn set_mode(&self, mode: u32) -> FsResult<()> {
-        self.metadata.lock_irqsave().mode = mode;
+        self.metadata.lock().mode = mode;
         Ok(())
     }
 
     fn set_owner(&self, uid: u32, gid: u32) -> FsResult<()> {
-        let mut metadata = self.metadata.lock_irqsave();
+        let mut metadata = self.metadata.lock();
         metadata.uid = uid;
         metadata.gid = gid;
         Ok(())
@@ -537,7 +537,7 @@ impl InodeOperations for FileNode {
 
     fn metadata(&self) -> NodeMetadata {
         self.metadata
-            .lock_irqsave()
+            .lock()
             .with_size(self.operations.size() as u64)
     }
 }
@@ -621,7 +621,7 @@ impl SharedMemoryFile {
             return Ok(());
         }
 
-        let mut allocator = frame_allocator().lock_irqsave();
+        let mut allocator = frame_allocator().lock();
         while state.pages.len() < required_pages {
             let frame = allocator.alloc(1).map_err(|_| FsError::InvalidInput)?;
             zero_frame(frame);
@@ -711,7 +711,7 @@ impl SharedMemoryFile {
     }
 
     fn shared_pages(&self, offset: usize, len: usize) -> FsResult<Arc<[u64]>> {
-        let state = self.state.lock_irqsave();
+        let state = self.state.lock();
         let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
         let page_size = PAGE_SIZE as usize;
         let first_page = offset / page_size;
@@ -736,7 +736,7 @@ impl FileOperations for MutableMemoryFile {
     }
 
     fn read(&self, offset: usize, buffer: &mut [u8]) -> FsResult<usize> {
-        let bytes = self.bytes.lock_irqsave();
+        let bytes = self.bytes.lock();
         if offset >= bytes.len() {
             return Ok(0);
         }
@@ -747,7 +747,7 @@ impl FileOperations for MutableMemoryFile {
     }
 
     fn write(&self, offset: usize, buffer: &[u8]) -> FsResult<usize> {
-        let mut bytes = self.bytes.lock_irqsave();
+        let mut bytes = self.bytes.lock();
         let end = offset.saturating_add(buffer.len());
         if end > bytes.len() {
             bytes.resize(end, 0);
@@ -757,19 +757,19 @@ impl FileOperations for MutableMemoryFile {
     }
 
     fn size(&self) -> usize {
-        self.bytes.lock_irqsave().len()
+        self.bytes.lock().len()
     }
 
     fn truncate(&self, size: usize) -> FsResult<()> {
-        self.bytes.lock_irqsave().resize(size, 0);
+        self.bytes.lock().resize(size, 0);
         Ok(())
     }
 }
 
 impl Drop for SharedMemoryFile {
     fn drop(&mut self) {
-        let mut state = self.state.lock_irqsave();
-        let mut allocator = frame_allocator().lock_irqsave();
+        let mut state = self.state.lock();
+        let mut allocator = frame_allocator().lock();
         for frame in state.pages.drain(..) {
             let _ = allocator.release(frame, 1);
         }
@@ -782,14 +782,14 @@ impl FileOperations for SharedMemoryFile {
     }
 
     fn read(&self, offset: usize, buffer: &mut [u8]) -> FsResult<usize> {
-        let state = self.state.lock_irqsave();
+        let state = self.state.lock();
         Ok(Self::copy_out(&state, offset, buffer))
     }
 
     fn write(&self, offset: usize, buffer: &[u8]) -> FsResult<usize> {
         self.ensure_write_allowed()?;
 
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         let old_size = state.size;
         let end = offset
             .checked_add(buffer.len())
@@ -807,11 +807,11 @@ impl FileOperations for SharedMemoryFile {
     }
 
     fn size(&self) -> usize {
-        self.state.lock_irqsave().size
+        self.state.lock().size
     }
 
     fn truncate(&self, size: usize) -> FsResult<()> {
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         self.ensure_grow_allowed(size, state.size)?;
         self.ensure_shrink_allowed(size, state.size)?;
         if size > state.size {
@@ -836,7 +836,7 @@ impl FileOperations for SharedMemoryFile {
             .checked_add(len)
             .and_then(|value| usize::try_from(value).ok())
             .ok_or(FsError::InvalidInput)?;
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         self.ensure_grow_allowed(end, state.size)?;
         Self::ensure_capacity(&mut state, end)?;
         if (mode & FALLOC_FL_KEEP_SIZE) == 0 && end > state.size {
@@ -946,32 +946,32 @@ impl InodeOperations for SymlinkNode {
     }
 
     fn mode(&self) -> Option<u32> {
-        Some(self.metadata.lock_irqsave().mode)
+        Some(self.metadata.lock().mode)
     }
 
     fn set_mode(&self, mode: u32) -> FsResult<()> {
-        self.metadata.lock_irqsave().mode = mode;
+        self.metadata.lock().mode = mode;
         Ok(())
     }
 
     fn set_owner(&self, uid: u32, gid: u32) -> FsResult<()> {
-        let mut metadata = self.metadata.lock_irqsave();
+        let mut metadata = self.metadata.lock();
         metadata.uid = uid;
         metadata.gid = gid;
         Ok(())
     }
 
     fn metadata(&self) -> NodeMetadata {
-        *self.metadata.lock_irqsave()
+        *self.metadata.lock()
     }
 }
 
 fn adjust_link_count(node: &NodeRef, delta: i32) {
     if let Some(file) = node.operations().as_any().downcast_ref::<FileNode>() {
-        let mut metadata = file.metadata.lock_irqsave();
+        let mut metadata = file.metadata.lock();
         metadata.nlink = metadata.nlink.saturating_add_signed(delta);
     } else if let Some(symlink) = node.operations().as_any().downcast_ref::<SymlinkNode>() {
-        let mut metadata = symlink.metadata.lock_irqsave();
+        let mut metadata = symlink.metadata.lock();
         metadata.nlink = metadata.nlink.saturating_add_signed(delta);
     }
 }

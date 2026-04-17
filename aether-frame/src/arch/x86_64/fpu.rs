@@ -2,6 +2,9 @@ use core::arch::asm;
 use core::arch::x86_64::__cpuid_count;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use crate::boot::MAX_CPUS;
+use crate::libs::percpu::PerCpu;
+
 const CR0_MONITOR_COPROCESSOR: u64 = 1 << 1;
 const CR0_EMULATION: u64 = 1 << 2;
 const CR0_TASK_SWITCHED: u64 = 1 << 3;
@@ -52,6 +55,7 @@ static CONFIG_READY: AtomicBool = AtomicBool::new(false);
 static XSAVE_ENABLED: AtomicBool = AtomicBool::new(false);
 static XSAVE_MASK: AtomicU64 = AtomicU64::new(0);
 static STATE_SIZE: AtomicUsize = AtomicUsize::new(FXSAVE_AREA_SIZE);
+static KERNEL_INTERRUPT_STATES: PerCpu<FpuState, MAX_CPUS> = PerCpu::uninit();
 
 #[repr(C, align(64))]
 pub struct FpuState {
@@ -163,6 +167,9 @@ pub fn init_for_cpu(cpu_index: usize) -> Result<(), &'static str> {
 
     write_cr4(cr4);
     publish_config(cpu_index, selected);
+    KERNEL_INTERRUPT_STATES
+        .init(cpu_index, FpuState::default())
+        .map_err(|_| "failed to initialize per-cpu kernel interrupt fpu state")?;
     Ok(())
 }
 
@@ -216,6 +223,14 @@ pub fn restore(state: &FpuState) {
             options(nostack, preserves_flags),
         );
     }
+}
+
+pub fn save_kernel_interrupt_state() {
+    let _ = KERNEL_INTERRUPT_STATES.with_mut(crate::arch::cpu::current_cpu_index(), save);
+}
+
+pub fn restore_kernel_interrupt_state() {
+    let _ = KERNEL_INTERRUPT_STATES.with(crate::arch::cpu::current_cpu_index(), restore);
 }
 
 fn publish_config(cpu_index: usize, candidate: FpuConfig) {

@@ -134,18 +134,25 @@ const fn make_star_value() -> u64 {
 #[unsafe(no_mangle)]
 extern "C" fn aether_x86_dispatch_trap(frame: &mut TrapFrame) -> *const CurrentRun {
     let trap = Trap::from_frame(frame);
+    let kernel_trap = !frame.from_user();
+    if kernel_trap {
+        crate::arch::fpu::save_kernel_interrupt_state();
+    }
     crate::process::prepare_trap(trap);
     crate::interrupt::dispatch_trap(trap, frame);
     if matches!(trap.kind(), crate::interrupt::TrapKind::Interrupt) {
         super::finish_interrupt(trap.vector());
         crate::interrupt::softirq::drain_pending();
     }
-
-    if crate::process::on_trap(trap, frame).is_some() {
+    let result = if crate::process::on_trap(trap, frame).is_some() {
         current_run_for_current_cpu()
     } else {
         ptr::null()
+    };
+    if kernel_trap {
+        crate::arch::fpu::restore_kernel_interrupt_state();
     }
+    result
 }
 
 unsafe extern "C" {
@@ -410,6 +417,13 @@ global_asm!(
         mov r13, [rdx + {run_saved_r13_off}]
         mov r14, [rdx + {run_saved_r14_off}]
         mov r15, [rdx + {run_saved_r15_off}]
+        cmp qword ptr [rdx + {run_kernel_if_off}], 0
+        je 1f
+        sti
+        jmp 2f
+    1:
+        cli
+    2:
         ret
 
     aether_x86_trap_exit_to_kernel:
@@ -423,6 +437,13 @@ global_asm!(
         mov r13, [rdx + {run_saved_r13_off}]
         mov r14, [rdx + {run_saved_r14_off}]
         mov r15, [rdx + {run_saved_r15_off}]
+        cmp qword ptr [rdx + {run_kernel_if_off}], 0
+        je 3f
+        sti
+        jmp 4f
+    3:
+        cli
+    4:
         ret
     "#,
     frame_size = const core::mem::size_of::<TrapFrame>(),
@@ -464,6 +485,7 @@ global_asm!(
     run_saved_r13_off = const offset_of!(CurrentRun, saved_r13),
     run_saved_r14_off = const offset_of!(CurrentRun, saved_r14),
     run_saved_r15_off = const offset_of!(CurrentRun, saved_r15),
+    run_kernel_if_off = const offset_of!(CurrentRun, kernel_interrupts_enabled),
     entry_kernel_rsp_off =
         const offset_of!(SyscallEntryData, kernel_rsp),
     entry_user_rsp_off =

@@ -182,7 +182,7 @@ impl EpollNotifier {
             return;
         }
 
-        let mut ready = self.ready.lock_irqsave();
+        let mut ready = self.ready.lock();
         ready
             .entry(fd)
             .and_modify(|stored| stored.insert(events.bits()))
@@ -192,7 +192,7 @@ impl EpollNotifier {
     }
 
     fn take_ready(&self, max_events: usize) -> Vec<(u64, EpollEvents)> {
-        let mut ready = self.ready.lock_irqsave();
+        let mut ready = self.ready.lock();
         let fds = ready.keys().copied().take(max_events).collect::<Vec<_>>();
         let mut events = Vec::with_capacity(fds.len());
         for fd in fds {
@@ -204,7 +204,7 @@ impl EpollNotifier {
     }
 
     fn has_pending(&self) -> bool {
-        !self.ready.lock_irqsave().is_empty()
+        !self.ready.lock().is_empty()
     }
 }
 
@@ -279,7 +279,7 @@ impl EpollInstance {
     }
 
     pub fn ctl(&self, op: EpollCtlOp, fd: u64, node: NodeRef, event: EpollEvent) -> FsResult<()> {
-        let mut interests = self.interests.lock_irqsave();
+        let mut interests = self.interests.lock();
 
         match op {
             EpollCtlOp::Add => {
@@ -312,7 +312,7 @@ impl EpollInstance {
             EpollCtlOp::Del => {
                 let old = interests.remove(&fd).ok_or(FsError::NotFound)?;
                 Self::unregister_interest_waiter(&old);
-                let _ = self.notifier.ready.lock_irqsave().remove(&fd);
+                let _ = self.notifier.ready.lock().remove(&fd);
             }
         }
 
@@ -325,7 +325,7 @@ impl EpollInstance {
         }
 
         let ready = self.notifier.take_ready(max_events);
-        let interests = self.interests.lock_irqsave();
+        let interests = self.interests.lock();
         let mut result = Vec::with_capacity(ready.len());
 
         for (fd, ready_bits) in ready {
@@ -360,7 +360,7 @@ impl EpollInstance {
     }
 
     pub fn interest_count(&self) -> usize {
-        self.interests.lock_irqsave().len()
+        self.interests.lock().len()
     }
 }
 

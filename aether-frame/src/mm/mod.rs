@@ -74,7 +74,7 @@ pub fn init() -> Result<(), BuddyAllocatorError> {
                 VirtAddr::new(addr as u64),
                 MapSize::Size4KiB,
                 MapFlags::READ | MapFlags::WRITE,
-                &mut *frame_allocator().lock_irqsave(),
+                &mut *frame_allocator().lock(),
             )
             .expect("Failed to map heap");
     }

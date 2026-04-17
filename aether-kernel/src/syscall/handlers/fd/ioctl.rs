@@ -400,6 +400,12 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                     return Err(SysErr::Fault);
                 }
             }
+            drm_abi::DRM_IOCTL_MODE_SETPROPERTY => {
+                let _request = drm_abi::DrmModeConnectorSetProperty::from_bytes(&bytes)
+                    .ok_or(SysErr::Fault)?;
+                // Match naos's permissive legacy connector property path:
+                // accept the ioctl even when DPMS is not wired into backend state.
+            }
             drm_abi::DRM_IOCTL_MODE_GETPLANERESOURCES => {
                 let mut request =
                     drm_abi::DrmModeGetPlaneRes::from_bytes(&bytes).ok_or(SysErr::Fault)?;
@@ -453,6 +459,11 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 if !request.write_to_bytes(&mut bytes) {
                     return Err(SysErr::Fault);
                 }
+            }
+            drm_abi::DRM_IOCTL_MODE_OBJ_SETPROPERTY => {
+                let _request =
+                    drm_abi::DrmModeObjSetProperty::from_bytes(&bytes).ok_or(SysErr::Fault)?;
+                // Keep legacy/compat property sets permissive like naos.
             }
             drm_abi::DRM_IOCTL_MODE_GETFB => {
                 let mut request = drm_abi::DrmModeFbCmd::from_bytes(&bytes).ok_or(SysErr::Fault)?;
@@ -577,6 +588,16 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 }
                 device
                     .page_flip(request.fb_id, request.flags, request.user_data)
+                    .map_err(SysErr::from)?;
+            }
+            drm_abi::DRM_IOCTL_MODE_DIRTYFB => {
+                let request =
+                    drm_abi::DrmModeFbDirtyCmd::from_bytes(&bytes).ok_or(SysErr::Fault)?;
+                let _ = request.color;
+                let _ = request.num_clips;
+                let _ = request.clips_ptr;
+                device
+                    .dirty_framebuffer(request.fb_id, request.flags)
                     .map_err(SysErr::from)?;
             }
             _ => return Err(SysErr::NoTty),

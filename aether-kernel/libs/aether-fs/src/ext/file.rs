@@ -48,7 +48,7 @@ impl FileOperations for ExtInodeNode {
     }
 
     fn size(&self) -> usize {
-        self.metadata.lock_irqsave().size.min(usize::MAX as u64) as usize
+        self.metadata.lock().size.min(usize::MAX as u64) as usize
     }
 
     fn write(&self, offset: usize, buffer: &[u8]) -> FsResult<usize> {

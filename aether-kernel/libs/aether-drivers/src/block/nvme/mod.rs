@@ -295,7 +295,7 @@ impl Future for NvmeReadFuture<'_> {
         loop {
             if let Some(in_flight) = self.in_flight.as_ref() {
                 let (completion, wake_list) = {
-                    let mut state = self.transport.state.lock_irqsave();
+                    let mut state = self.transport.state.lock();
                     let _ = process_queue_completions_for_queue(
                         &self.transport.registers,
                         self.transport.capabilities,
@@ -356,7 +356,7 @@ impl Future for NvmeReadFuture<'_> {
             let bytes = blocks * block_size;
 
             let cid = loop {
-                let mut state = self.transport.state.lock_irqsave();
+                let mut state = self.transport.state.lock();
                 let cid = match alloc_cid(&mut state) {
                     Ok(cid) => cid,
                     Err(NvmeProbeError::QueueFull { .. }) => {
@@ -463,7 +463,7 @@ impl Future for NvmeWriteFuture<'_> {
         loop {
             if let Some(in_flight) = self.in_flight.as_ref() {
                 let (completion, wake_list) = {
-                    let mut state = self.transport.state.lock_irqsave();
+                    let mut state = self.transport.state.lock();
                     let _ = process_queue_completions_for_queue(
                         &self.transport.registers,
                         self.transport.capabilities,
@@ -519,7 +519,7 @@ impl Future for NvmeWriteFuture<'_> {
             let bytes = blocks * block_size;
 
             let cid = loop {
-                let mut state = self.transport.state.lock_irqsave();
+                let mut state = self.transport.state.lock();
                 let cid = match alloc_cid(&mut state) {
                     Ok(cid) => cid,
                     Err(NvmeProbeError::QueueFull { .. }) => {
@@ -682,16 +682,14 @@ impl NvmeTransport {
         aether_frame::interrupt::register_handler(vector, nvme_interrupt_handler)
             .map_err(|_| NvmeProbeError::InterruptSetup)?;
         enable_message_interrupt(address, vector).map_err(|_| NvmeProbeError::InterruptSetup)?;
-        NVME_INTERRUPT_REGISTRY
-            .lock_irqsave()
-            .insert(vector, self.clone());
+        NVME_INTERRUPT_REGISTRY.lock().insert(vector, self.clone());
         Ok(())
     }
 
     fn handle_interrupt(&self) {
         let mut wake_list = Vec::new();
         {
-            let mut state = self.state.lock_irqsave();
+            let mut state = self.state.lock();
             let admin_processed = process_queue_completions_for_queue(
                 &self.registers,
                 self.capabilities,
@@ -737,7 +735,7 @@ impl NvmeTransport {
     }
 
     fn identify_controller(&self) -> Result<ControllerInfo, NvmeProbeError> {
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         state.transfer.zero();
 
         let mut command = NvmeCommand::new(NVME_OPCODE_IDENTIFY, 0);
@@ -771,7 +769,7 @@ impl NvmeTransport {
     }
 
     fn identify_active_namespaces(&self) -> Result<Vec<u32>, NvmeProbeError> {
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         state.transfer.zero();
 
         let mut command = NvmeCommand::new(NVME_OPCODE_IDENTIFY, 0);
@@ -796,7 +794,7 @@ impl NvmeTransport {
     }
 
     fn identify_namespace(&self, namespace_id: u32) -> Result<NamespaceInfo, NvmeProbeError> {
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         state.transfer.zero();
 
         let mut command = NvmeCommand::new(NVME_OPCODE_IDENTIFY, namespace_id);
@@ -831,7 +829,7 @@ impl NvmeTransport {
     }
 
     fn create_io_queues(&self) -> Result<(), NvmeProbeError> {
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         let depth = state.io.depth;
 
         let mut set_features = NvmeCommand::new(NVME_OPCODE_SET_FEATURES, 0);
@@ -878,27 +876,57 @@ impl NvmeTransport {
             return Err(NvmeProbeError::UnsupportedPageSize);
         }
 
-        let mut state = self.state.lock_irqsave();
         let mut completed = 0usize;
         let mut current_lba = block;
         let mut remaining_blocks = buffer.len() / block_size;
 
         while remaining_blocks != 0 {
             let blocks = min(remaining_blocks, max_blocks_per_transfer);
-            state.transfer.zero();
-
-            let mut command = NvmeCommand::new(NVME_OPCODE_READ, namespace.namespace_id);
-            command.prp1 = state.transfer.phys_addr();
-            command.cdw10 = current_lba as u32;
-            command.cdw11 = (current_lba >> 32) as u32;
-            command.cdw12 = (blocks as u32).saturating_sub(1);
-            let completion = self.submit(&mut state, QueueSelect::Io, command)?;
-            fence(Ordering::Acquire);
-            ensure_io_success(command.opcode, completion)?;
-
             let bytes = blocks * block_size;
-            buffer[completed..completed + bytes]
-                .copy_from_slice(&state.transfer.as_slice()[..bytes]);
+            let cid = {
+                let mut state = self.state.lock();
+                let cid = alloc_cid(&mut state)?;
+                let slot = &mut state.requests[cid as usize];
+                slot.transfer.zero();
+                slot.bytes = bytes;
+                slot.opcode = NVME_OPCODE_READ;
+
+                let mut command = NvmeCommand::new(NVME_OPCODE_READ, namespace.namespace_id);
+                command.cid = cid;
+                command.prp1 = slot.transfer.phys_addr();
+                command.cdw10 = current_lba as u32;
+                command.cdw11 = (current_lba >> 32) as u32;
+                command.cdw12 = (blocks as u32).saturating_sub(1);
+
+                if state.io.write_command(command).is_err() {
+                    release_request(&mut state.requests, cid);
+                    return Err(NvmeProbeError::QueueSetup);
+                }
+                fence(Ordering::Release);
+                self.registers.ring_submission_doorbell(
+                    state.io.queue_id,
+                    state.io.sq_tail,
+                    self.capabilities,
+                );
+                cid
+            };
+            let completion = self.wait_for_polled_request_completion(
+                QueueSelect::Io,
+                cid,
+                NVME_COMPLETION_TIMEOUT_NS,
+            )?;
+            fence(Ordering::Acquire);
+            ensure_io_success(NVME_OPCODE_READ, completion)?;
+            {
+                let mut state = self.state.lock();
+                let slot = state
+                    .requests
+                    .get_mut(cid as usize)
+                    .ok_or(NvmeProbeError::QueueSetup)?;
+                buffer[completed..completed + bytes]
+                    .copy_from_slice(&slot.transfer.as_slice()[..bytes]);
+                release_request(&mut state.requests, cid);
+            }
 
             completed += bytes;
             current_lba = current_lba.saturating_add(blocks as u64);
@@ -924,7 +952,6 @@ impl NvmeTransport {
             return Err(NvmeProbeError::UnsupportedPageSize);
         }
 
-        let mut state = self.state.lock_irqsave();
         let mut completed = 0usize;
         let mut current_lba = block;
         let mut remaining_blocks = buffer.len() / block_size;
@@ -932,18 +959,46 @@ impl NvmeTransport {
         while remaining_blocks != 0 {
             let blocks = min(remaining_blocks, max_blocks_per_transfer);
             let bytes = blocks * block_size;
-            state.transfer.zero();
-            state.transfer.as_mut_slice()[..bytes]
-                .copy_from_slice(&buffer[completed..completed + bytes]);
+            let cid = {
+                let mut state = self.state.lock();
+                let cid = alloc_cid(&mut state)?;
+                let slot = &mut state.requests[cid as usize];
+                slot.transfer.zero();
+                slot.transfer.as_mut_slice()[..bytes]
+                    .copy_from_slice(&buffer[completed..completed + bytes]);
+                slot.bytes = bytes;
+                slot.opcode = NVME_OPCODE_WRITE;
 
-            let mut command = NvmeCommand::new(NVME_OPCODE_WRITE, namespace.namespace_id);
-            command.prp1 = state.transfer.phys_addr();
-            command.cdw10 = current_lba as u32;
-            command.cdw11 = (current_lba >> 32) as u32;
-            command.cdw12 = (blocks as u32).saturating_sub(1);
-            let completion = self.submit(&mut state, QueueSelect::Io, command)?;
+                let mut command = NvmeCommand::new(NVME_OPCODE_WRITE, namespace.namespace_id);
+                command.cid = cid;
+                command.prp1 = slot.transfer.phys_addr();
+                command.cdw10 = current_lba as u32;
+                command.cdw11 = (current_lba >> 32) as u32;
+                command.cdw12 = (blocks as u32).saturating_sub(1);
+
+                if state.io.write_command(command).is_err() {
+                    release_request(&mut state.requests, cid);
+                    return Err(NvmeProbeError::QueueSetup);
+                }
+                fence(Ordering::Release);
+                self.registers.ring_submission_doorbell(
+                    state.io.queue_id,
+                    state.io.sq_tail,
+                    self.capabilities,
+                );
+                cid
+            };
+            let completion = self.wait_for_polled_request_completion(
+                QueueSelect::Io,
+                cid,
+                NVME_COMPLETION_TIMEOUT_NS,
+            )?;
             fence(Ordering::Acquire);
-            ensure_io_success(command.opcode, completion)?;
+            ensure_io_success(NVME_OPCODE_WRITE, completion)?;
+            {
+                let mut state = self.state.lock();
+                release_request(&mut state.requests, cid);
+            }
 
             completed += bytes;
             current_lba = current_lba.saturating_add(blocks as u64);
@@ -951,6 +1006,55 @@ impl NvmeTransport {
         }
 
         Ok(completed)
+    }
+
+    fn wait_for_polled_request_completion(
+        &self,
+        queue: QueueSelect,
+        cid: u16,
+        timeout_ns: u64,
+    ) -> Result<NvmeCompletion, NvmeProbeError> {
+        let deadline = nvme_deadline(timeout_ns);
+        loop {
+            let poll = {
+                let mut state = self.state.lock();
+                process_queue_completions_for_queue(
+                    &self.registers,
+                    self.capabilities,
+                    &mut state,
+                    queue,
+                )?;
+
+                let completion = state
+                    .requests
+                    .get_mut(cid as usize)
+                    .and_then(|slot| slot.completion.take());
+                if let Some(completion) = completion {
+                    return Ok(completion);
+                }
+
+                if aether_frame::interrupt::timer::nanos_since_boot() >= deadline {
+                    let (queue_id, cq_head, expected_phase) = match queue {
+                        QueueSelect::Admin => (
+                            state.admin.queue_id,
+                            state.admin.cq_head,
+                            state.admin.cq_phase,
+                        ),
+                        QueueSelect::Io => (state.io.queue_id, state.io.cq_head, state.io.cq_phase),
+                    };
+                    release_request(&mut state.requests, cid);
+                    return Err(NvmeProbeError::QueueTimeout {
+                        queue_id,
+                        cid,
+                        cq_head,
+                        expected_phase,
+                    });
+                }
+                Ok::<(), NvmeProbeError>(())
+            };
+            poll?;
+            core::hint::spin_loop();
+        }
     }
 
     fn submit(
@@ -1290,10 +1394,7 @@ fn build_request_slots() -> Result<Vec<PendingRequest>, NvmeProbeError> {
 }
 
 fn nvme_interrupt_handler(trap: Trap, _frame: &mut aether_frame::interrupt::TrapFrame) {
-    let transport = NVME_INTERRUPT_REGISTRY
-        .lock_irqsave()
-        .get(&trap.vector())
-        .cloned();
+    let transport = NVME_INTERRUPT_REGISTRY.lock().get(&trap.vector()).cloned();
     if let Some(transport) = transport {
         transport.handle_interrupt();
     }

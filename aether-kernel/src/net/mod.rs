@@ -334,11 +334,11 @@ impl SocketDomainRegistry {
     }
 
     pub fn register(&self, domain: &'static dyn SocketDomain) {
-        self.entries.lock_irqsave().insert(domain.domain(), domain);
+        self.entries.lock().insert(domain.domain(), domain);
     }
 
     pub fn get(&self, domain: i32) -> Option<&'static dyn SocketDomain> {
-        self.entries.lock_irqsave().get(&domain).copied()
+        self.entries.lock().get(&domain).copied()
     }
 }
 

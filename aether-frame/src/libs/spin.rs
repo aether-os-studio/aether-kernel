@@ -3,7 +3,7 @@ use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::{arch, preempt};
+use crate::preempt;
 
 pub struct SpinLock<T> {
     locked: AtomicBool,
@@ -36,21 +36,7 @@ impl<T> SpinLock<T> {
         preempt::disable();
         self.acquire_lock();
 
-        SpinLockGuard {
-            lock: self,
-            interrupt_state: None,
-        }
-    }
-
-    pub fn lock_irqsave(&self) -> SpinLockGuard<'_, T> {
-        preempt::disable();
-        let interrupt_state = arch::interrupt::disable();
-        self.acquire_lock();
-
-        SpinLockGuard {
-            lock: self,
-            interrupt_state: Some(interrupt_state),
-        }
+        SpinLockGuard { lock: self }
     }
 
     fn acquire_lock(&self) {
@@ -77,7 +63,6 @@ impl<T: Default> Default for SpinLock<T> {
 
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
-    interrupt_state: Option<arch::interrupt::InterruptState>,
 }
 
 impl<T> Deref for SpinLockGuard<'_, T> {
@@ -97,9 +82,6 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
-        if let Some(interrupt_state) = self.interrupt_state {
-            arch::interrupt::restore(interrupt_state);
-        }
         preempt::enable();
     }
 }

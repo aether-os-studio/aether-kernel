@@ -36,10 +36,10 @@ impl SuperBlock {
     }
 
     pub fn root(&self) -> Option<DentryRef> {
-        self.root.lock_irqsave().clone()
+        self.root.lock().clone()
     }
 
     pub fn set_root(&self, root: DentryRef) {
-        *self.root.lock_irqsave() = Some(root);
+        *self.root.lock() = Some(root);
     }
 }

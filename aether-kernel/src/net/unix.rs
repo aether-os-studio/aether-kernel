@@ -113,6 +113,20 @@ struct UnixSocketState {
 }
 
 #[derive(Clone)]
+struct UnixStateSnapshot {
+    peer: Option<Weak<UnixSocket>>,
+    established: bool,
+    listening: bool,
+    backlog_nonempty: bool,
+    recv_stream_nonempty: bool,
+    recv_packets_nonempty: bool,
+    recv_size: usize,
+    rcvbuf: usize,
+    shut_rd: bool,
+    shut_wr: bool,
+}
+
+#[derive(Clone)]
 struct UnixPacket {
     data: Vec<u8>,
     source: Option<Vec<u8>>,
@@ -224,7 +238,7 @@ impl UnixSocket {
             version: AtomicU64::new(1),
             waiters: WaitQueue::new(),
         });
-        *socket.self_ref.lock_irqsave() = Arc::downgrade(&socket);
+        *socket.self_ref.lock() = Arc::downgrade(&socket);
         socket
     }
 
@@ -242,13 +256,13 @@ impl UnixSocket {
 
     fn pair(left: &Arc<Self>, right: &Arc<Self>) {
         {
-            let mut left_state = left.state.lock_irqsave();
+            let mut left_state = left.state.lock();
             left_state.peer = Some(Arc::downgrade(right));
             left_state.peer_credentials = Some(right.owner);
             left_state.established = true;
         }
         {
-            let mut right_state = right.state.lock_irqsave();
+            let mut right_state = right.state.lock();
             right_state.peer = Some(Arc::downgrade(left));
             right_state.peer_credentials = Some(left.owner);
             right_state.established = true;
@@ -258,15 +272,11 @@ impl UnixSocket {
     }
 
     fn peer(&self) -> Option<Arc<UnixSocket>> {
-        self.state
-            .lock_irqsave()
-            .peer
-            .as_ref()
-            .and_then(Weak::upgrade)
+        self.state.lock().peer.as_ref().and_then(Weak::upgrade)
     }
 
     fn shared_self(&self) -> Option<Arc<UnixSocket>> {
-        self.self_ref.lock_irqsave().upgrade()
+        self.self_ref.lock().upgrade()
     }
 
     fn local_name_locked(state: &UnixSocketState) -> Vec<u8> {
@@ -278,12 +288,12 @@ impl UnixSocket {
     }
 
     fn local_name(&self) -> Vec<u8> {
-        Self::local_name_locked(&self.state.lock_irqsave())
+        Self::local_name_locked(&self.state.lock())
     }
 
     fn peer_name_bytes(&self) -> SysResult<Vec<u8>> {
         let peer = self.peer().ok_or(SysErr::NotConn)?;
-        Ok(Self::local_name_locked(&peer.state.lock_irqsave()))
+        Ok(Self::local_name_locked(&peer.state.lock()))
     }
 
     fn bump(&self) {
@@ -295,43 +305,63 @@ impl UnixSocket {
         self.waiters.notify(events);
     }
 
-    fn read_ready_locked(&self, state: &UnixSocketState) -> bool {
-        if state.listening {
-            return !state.backlog.is_empty();
-        }
-        if state.shut_rd {
-            return true;
-        }
-        if self.is_stream_like() {
-            !state.recv_stream.is_empty() || self.stream_peer_eof_locked(state)
-        } else {
-            !state.recv_packets.is_empty()
+    fn state_snapshot(&self) -> UnixStateSnapshot {
+        let state = self.state.lock();
+        UnixStateSnapshot {
+            peer: state.peer.clone(),
+            established: state.established,
+            listening: state.listening,
+            backlog_nonempty: !state.backlog.is_empty(),
+            recv_stream_nonempty: !state.recv_stream.is_empty(),
+            recv_packets_nonempty: !state.recv_packets.is_empty(),
+            recv_size: state.recv_size,
+            rcvbuf: state.rcvbuf,
+            shut_rd: state.shut_rd,
+            shut_wr: state.shut_wr,
         }
     }
 
-    fn write_ready_locked(&self, state: &UnixSocketState) -> bool {
-        if state.shut_wr || state.listening {
+    fn peer_from_snapshot(snapshot: &UnixStateSnapshot) -> Option<Arc<UnixSocket>> {
+        snapshot.peer.as_ref().and_then(Weak::upgrade)
+    }
+
+    fn stream_peer_eof_snapshot(&self, snapshot: &UnixStateSnapshot) -> bool {
+        if !snapshot.established {
+            return false;
+        }
+
+        match Self::peer_from_snapshot(snapshot) {
+            Some(peer) => peer.state.lock().shut_wr,
+            None => true,
+        }
+    }
+
+    fn read_ready_snapshot(&self, snapshot: &UnixStateSnapshot) -> bool {
+        if snapshot.listening {
+            return snapshot.backlog_nonempty;
+        }
+        if snapshot.shut_rd {
+            return true;
+        }
+        if self.is_stream_like() {
+            snapshot.recv_stream_nonempty || self.stream_peer_eof_snapshot(snapshot)
+        } else {
+            snapshot.recv_packets_nonempty
+        }
+    }
+
+    fn write_ready_snapshot(&self, snapshot: &UnixStateSnapshot) -> bool {
+        if snapshot.shut_wr || snapshot.listening {
             return false;
         }
         if self.is_packet_like() {
             return true;
         }
-        let Some(peer) = state.peer.as_ref().and_then(Weak::upgrade) else {
+        let Some(peer) = Self::peer_from_snapshot(snapshot) else {
             return false;
         };
-        let peer_state = peer.state.lock_irqsave();
+        let peer_state = peer.state.lock();
         !peer_state.shut_rd && peer_state.recv_size < peer_state.rcvbuf
-    }
-
-    fn stream_peer_eof_locked(&self, state: &UnixSocketState) -> bool {
-        if !state.established {
-            return false;
-        }
-
-        match state.peer.as_ref().and_then(Weak::upgrade) {
-            Some(peer) => peer.state.lock_irqsave().shut_wr,
-            None => true,
-        }
     }
 
     fn enqueue_stream(
@@ -342,7 +372,7 @@ impl UnixSocket {
         if buffer.is_empty() {
             return Ok(0);
         }
-        let mut state = peer.state.lock_irqsave();
+        let mut state = peer.state.lock();
         if state.shut_rd {
             return Err(SysErr::Pipe);
         }
@@ -372,7 +402,7 @@ impl UnixSocket {
         source: Option<Vec<u8>>,
         ancillary: Option<UnixAncillary>,
     ) -> SysResult<usize> {
-        let mut state = peer.state.lock_irqsave();
+        let mut state = peer.state.lock();
         if state.shut_rd {
             return Err(SysErr::Pipe);
         }
@@ -392,7 +422,7 @@ impl UnixSocket {
     }
 
     fn peer_credentials(&self) -> Option<SocketCredentials> {
-        self.state.lock_irqsave().peer_credentials
+        self.state.lock().peer_credentials
     }
 
     fn serialize_peer_credentials(&self) -> SysResult<Vec<u8>> {
@@ -443,15 +473,18 @@ impl UnixSocket {
         include_control: bool,
     ) -> SysResult<super::SocketReceive> {
         let peek = (flags & MSG_PEEK) != 0;
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         if state.shut_rd {
             return Ok(Self::receive_from_ancillary(None, None, 0, 0));
         }
         if state.recv_stream.is_empty() {
-            if !state.established {
+            let established = state.established;
+            let peer = state.peer.as_ref().and_then(Weak::upgrade);
+            drop(state);
+            if !established {
                 return Err(SysErr::NotConn);
             }
-            if self.stream_peer_eof_locked(&state) {
+            if peer.map(|peer| peer.state.lock().shut_wr).unwrap_or(true) {
                 return Ok(Self::receive_from_ancillary(None, None, 0, 0));
             }
             return Err(SysErr::Again);
@@ -539,7 +572,7 @@ impl UnixSocket {
         include_control: bool,
     ) -> SysResult<super::SocketReceive> {
         let peek = (flags & MSG_PEEK) != 0;
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         if state.shut_rd {
             return Ok(Self::receive_from_ancillary(None, None, 0, 0));
         }
@@ -577,7 +610,7 @@ impl UnixSocket {
     }
 
     fn lookup_bound(address: &UnixAddress) -> Option<Arc<UnixSocket>> {
-        let mut bound = BOUND_SOCKETS.lock_irqsave();
+        let mut bound = BOUND_SOCKETS.lock();
         let socket = bound.get(address).and_then(Weak::upgrade);
         if socket.is_none() {
             let _ = bound.remove(address);
@@ -588,9 +621,9 @@ impl UnixSocket {
 
 impl Drop for UnixSocket {
     fn drop(&mut self) {
-        let bound_address = self.state.lock_irqsave().bound_address.clone();
+        let bound_address = self.state.lock().bound_address.clone();
         if let Some(address) = bound_address {
-            let mut bound = BOUND_SOCKETS.lock_irqsave();
+            let mut bound = BOUND_SOCKETS.lock();
             let remove = bound
                 .get(&address)
                 .map(|socket| ptr::eq(socket.as_ptr(), self))
@@ -600,13 +633,7 @@ impl Drop for UnixSocket {
             }
         }
 
-        if let Some(peer) = self
-            .state
-            .lock_irqsave()
-            .peer
-            .as_ref()
-            .and_then(Weak::upgrade)
-        {
+        if let Some(peer) = self.state.lock().peer.as_ref().and_then(Weak::upgrade) {
             peer.notify(PollEvents::READ | PollEvents::WRITE | PollEvents::ERROR);
         }
     }
@@ -664,7 +691,7 @@ impl KernelSocket for UnixSocket {
         let target = Self::lookup_bound(&address).ok_or(SysErr::NoEnt)?;
 
         if self.kind == SOCK_DGRAM {
-            let mut state = self.state.lock_irqsave();
+            let mut state = self.state.lock();
             state.peer = Some(Arc::downgrade(&target));
             state.peer_credentials = Some(target.owner);
             state.established = true;
@@ -674,21 +701,22 @@ impl KernelSocket for UnixSocket {
         }
 
         {
-            let state = target.state.lock_irqsave();
+            let state = target.state.lock();
             if !state.listening {
                 return Err(SysErr::ConnRefused);
             }
         }
 
+        let target_bound_address = target.state.lock().bound_address.clone();
         let server = UnixSocket::shared(self.kind, target.owner);
         {
-            let mut server_state = server.state.lock_irqsave();
-            server_state.bound_address = target.state.lock_irqsave().bound_address.clone();
+            let mut server_state = server.state.lock();
+            server_state.bound_address = target_bound_address;
             server_state.peer_credentials = Some(self.owner);
             server_state.established = true;
         }
         {
-            let mut client_state = self.state.lock_irqsave();
+            let mut client_state = self.state.lock();
             if client_state.peer.as_ref().and_then(Weak::upgrade).is_some() {
                 return Err(SysErr::IsConn);
             }
@@ -696,16 +724,16 @@ impl KernelSocket for UnixSocket {
             client_state.peer_credentials = Some(server.owner);
             client_state.established = true;
         }
+        let client = self.shared_self().ok_or(SysErr::ConnRefused)?;
         {
-            let mut listener_state = target.state.lock_irqsave();
+            let mut server_state = server.state.lock();
+            server_state.peer = Some(Arc::downgrade(&client));
+        }
+        {
+            let mut listener_state = target.state.lock();
             let backlog_limit = listener_state.backlog_limit.max(1);
             if listener_state.backlog.len() >= backlog_limit {
                 return Err(SysErr::Again);
-            }
-            let client = self.shared_self().ok_or(SysErr::ConnRefused)?;
-            {
-                let mut server_state = server.state.lock_irqsave();
-                server_state.peer = Some(Arc::downgrade(&client));
             }
             listener_state.backlog.push_back(server);
         }
@@ -717,13 +745,13 @@ impl KernelSocket for UnixSocket {
 
     fn bind(&self, address: &[u8]) -> SysResult<()> {
         let address = UnixAddress::from_raw(address)?;
-        let state = self.state.lock_irqsave();
+        let state = self.state.lock();
         if state.bound_address.is_some() {
             return Err(SysErr::Inval);
         }
         drop(state);
 
-        let mut bound = BOUND_SOCKETS.lock_irqsave();
+        let mut bound = BOUND_SOCKETS.lock();
         let this = self.shared_self().ok_or(SysErr::AddrInUse)?;
         if let Some(existing) = bound.get(&address).and_then(Weak::upgrade)
             && !Arc::ptr_eq(&existing, &this)
@@ -734,7 +762,7 @@ impl KernelSocket for UnixSocket {
         // participate in VFS lifetime rules. The current implementation keeps a kernel-only
         // bind table so connect()/sendto() can resolve the address correctly.
         bound.insert(address.clone(), Arc::downgrade(&this));
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         state.bound_address = Some(address);
         Ok(())
     }
@@ -743,7 +771,7 @@ impl KernelSocket for UnixSocket {
         if self.kind != SOCK_STREAM && self.kind != SOCK_SEQPACKET {
             return Err(SysErr::NoSys);
         }
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         state.listening = true;
         state.backlog_limit = backlog.max(1) as usize;
         state.backlog.clear();
@@ -753,19 +781,13 @@ impl KernelSocket for UnixSocket {
     }
 
     fn accept(&self) -> SysResult<AcceptedSocket> {
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         if !state.listening {
             return Err(SysErr::Inval);
         }
         let accepted = state.backlog.pop_front().ok_or(SysErr::Again)?;
-        let address = accepted
-            .state
-            .lock_irqsave()
-            .peer
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .map(|peer| Self::local_name_locked(&peer.state.lock_irqsave()));
         drop(state);
+        let address = accepted.peer().map(|peer| peer.local_name());
         self.notify(PollEvents::WRITE);
         Ok(AcceptedSocket {
             socket: accepted,
@@ -793,7 +815,7 @@ impl KernelSocket for UnixSocket {
         } else {
             let source = self
                 .state
-                .lock_irqsave()
+                .lock()
                 .bound_address
                 .as_ref()
                 .map(UnixAddress::serialize);
@@ -813,7 +835,7 @@ impl KernelSocket for UnixSocket {
             })?
         };
 
-        let passcred = peer.state.lock_irqsave().passcred;
+        let passcred = peer.state.lock().passcred;
         let ancillary = Self::build_outbound_ancillary(message, passcred);
         if ancillary.is_some() && message.data.is_empty() {
             return Err(SysErr::Inval);
@@ -824,7 +846,7 @@ impl KernelSocket for UnixSocket {
         } else {
             let source = self
                 .state
-                .lock_irqsave()
+                .lock()
                 .bound_address
                 .as_ref()
                 .map(UnixAddress::serialize);
@@ -834,7 +856,7 @@ impl KernelSocket for UnixSocket {
 
     fn shutdown(&self, how: i32) -> SysResult<()> {
         let peer = {
-            let mut state = self.state.lock_irqsave();
+            let mut state = self.state.lock();
             if !state.established && state.peer.as_ref().and_then(Weak::upgrade).is_none() {
                 return Err(SysErr::NotConn);
             }
@@ -868,21 +890,21 @@ impl KernelSocket for UnixSocket {
     }
 
     fn is_listening(&self) -> bool {
-        self.state.lock_irqsave().listening
+        self.state.lock().listening
     }
 
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
-        let state = self.state.lock_irqsave();
+        let snapshot = self.state_snapshot();
         let mut ready = PollEvents::empty();
-        let stream_peer_eof = self.is_stream_like() && self.stream_peer_eof_locked(&state);
+        let stream_peer_eof = self.is_stream_like() && self.stream_peer_eof_snapshot(&snapshot);
 
-        if events.contains(PollEvents::READ) && self.read_ready_locked(&state) {
+        if events.contains(PollEvents::READ) && self.read_ready_snapshot(&snapshot) {
             ready = ready | PollEvents::READ;
         }
-        if events.contains(PollEvents::WRITE) && self.write_ready_locked(&state) {
+        if events.contains(PollEvents::WRITE) && self.write_ready_snapshot(&snapshot) {
             ready = ready | PollEvents::WRITE;
         }
-        if state.shut_wr || stream_peer_eof {
+        if snapshot.shut_wr || stream_peer_eof {
             ready = ready | PollEvents::ERROR;
         }
 
@@ -914,7 +936,7 @@ impl KernelSocket for UnixSocket {
                 .try_into()
                 .map_err(|_| SysErr::Fault)?,
         );
-        let mut state = self.state.lock_irqsave();
+        let mut state = self.state.lock();
         match optname {
             SO_PASSCRED => {
                 state.passcred = parsed != 0;
@@ -936,7 +958,7 @@ impl KernelSocket for UnixSocket {
         if level != super::SOL_SOCKET {
             return Err(SysErr::NoProtoOpt);
         }
-        let state = self.state.lock_irqsave();
+        let state = self.state.lock();
         match optname {
             SO_PASSCRED => Ok(encode_sockopt_i32(state.passcred as i32)),
             SO_SNDBUF | SO_SNDBUFFORCE => Ok(encode_sockopt_i32(clamp_sockopt_i32(state.sndbuf))),

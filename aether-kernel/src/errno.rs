@@ -602,6 +602,7 @@ impl From<BuildError> for SysErr {
         match value {
             BuildError::Frame(_) => Self::NoMem,
             BuildError::Map(MappingError::OutOfMemory | MappingError::Frame(_)) => Self::NoMem,
+            BuildError::Map(MappingError::AlreadyMapped) => Self::Exists,
             BuildError::Map(MappingError::NotMapped) => Self::Fault,
             BuildError::AddressOverflow
             | BuildError::StackOverflow

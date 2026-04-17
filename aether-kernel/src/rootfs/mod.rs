@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 
 use aether_device::DeviceNamespace;
 use aether_frame::boot;
+use aether_frame::libs::mutex::Mutex;
 use aether_frame::libs::spin::SpinLock;
 use aether_initramfs::{InitramfsError, load_initramfs};
 use aether_tmpfs as tmpfs;
@@ -230,7 +231,7 @@ impl RootfsManager {
     }
 
     pub fn initial_fs_context(&self) -> ProcessFsContext {
-        ProcessFsContext::new(Arc::new(SpinLock::new(MountNamespace::new(
+        ProcessFsContext::new(Arc::new(Mutex::new(MountNamespace::new(
             self.boot_root.clone(),
         ))))
     }
@@ -1033,7 +1034,7 @@ impl RootfsManager {
     }
 
     fn allocate_mount_device_id(&self) -> u64 {
-        let mut next = self.next_mount_device.lock_irqsave();
+        let mut next = self.next_mount_device.lock();
         let device_id = *next;
         *next = next.saturating_add(1);
         device_id
