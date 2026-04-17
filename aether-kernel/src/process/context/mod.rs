@@ -692,6 +692,9 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     fn getgid(&self) -> SysResult<u64> {
         Self::syscall_getgid(self)
     }
+    fn getpgid(&self) -> SysResult<u64> {
+        Self::syscall_getpgid(self)
+    }
     fn getresuid(&mut self, ruid: u64, euid: u64, suid: u64) -> SysResult<u64> {
         Self::syscall_getresuid(self, ruid, euid, suid)
     }

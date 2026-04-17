@@ -230,6 +230,8 @@ mod getegid;
 mod geteuid;
 #[path = "process/getgid.rs"]
 mod getgid;
+#[path = "process/getpgid.rs"]
+mod getpgid;
 #[path = "process/getpid.rs"]
 mod getpid;
 #[path = "process/getppid.rs"]
@@ -369,6 +371,7 @@ pub fn init() {
             geteuid::GeteUidSyscall,
             getegid::GeteGidSyscall,
             getgid::GetGidSyscall,
+            getpgid::GetPgidSyscall,
             getresgid::GetResGidSyscall,
             getresuid::GetResUidSyscall,
             getrandom::GetrandomSyscall,
