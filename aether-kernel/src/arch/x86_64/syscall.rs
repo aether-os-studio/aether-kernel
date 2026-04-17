@@ -82,6 +82,7 @@ pub mod nr {
     pub const GETRESUID: u64 = 118;
     pub const SETRESGID: u64 = 119;
     pub const GETRESGID: u64 = 120;
+    pub const GETPGID: u64 = 121;
     pub const STATFS: u64 = 137;
     pub const FSTATFS: u64 = 138;
     pub const RT_SIGSUSPEND: u64 = 130;
