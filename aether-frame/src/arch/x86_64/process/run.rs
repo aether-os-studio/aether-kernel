@@ -10,7 +10,7 @@ use x86_64::registers::model_specific::Msr;
 
 use crate::boot::MAX_CPUS;
 use crate::interrupt::{PrivilegeLevel, Trap, TrapKind};
-use crate::libs::percpu::PerCpuPtr;
+use crate::libs::percpu::PerCpu;
 use crate::mm::{PageTableArch, PhysFrame};
 use crate::process::{RunFuture, RunReason, RunResult};
 
@@ -18,6 +18,8 @@ use super::super::fpu::FpuState;
 use super::context::{GeneralRegs, UserContext};
 
 const DEFAULT_KERNEL_STACK_SIZE: usize = 64 * 1024;
+const USER_ENTRY_STACK_RESERVE: usize = 4096;
+const MIN_KERNEL_STACK_SIZE: usize = 16 * 1024;
 const IA32_FS_BASE: u32 = 0xc000_0100;
 const IA32_GS_BASE: u32 = 0xc000_0101;
 
@@ -26,6 +28,7 @@ pub struct CurrentRun {
     pub kernel_rsp: u64,
     pub kernel_cr3: u64,
     pub kernel_interrupts_enabled: u64,
+    pub return_rip: u64,
     pub process: usize,
     pub saved_rbx: u64,
     pub saved_rbp: u64,
@@ -33,6 +36,24 @@ pub struct CurrentRun {
     pub saved_r13: u64,
     pub saved_r14: u64,
     pub saved_r15: u64,
+}
+
+impl Default for CurrentRun {
+    fn default() -> Self {
+        Self {
+            kernel_rsp: 0,
+            kernel_cr3: 0,
+            kernel_interrupts_enabled: 1,
+            return_rip: 0,
+            process: 0,
+            saved_rbx: 0,
+            saved_rbp: 0,
+            saved_r12: 0,
+            saved_r13: 0,
+            saved_r14: 0,
+            saved_r15: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -74,8 +95,9 @@ struct KernelContextStartFrame {
     entry: KernelContextEntry,
 }
 
-static CURRENT_RUNS: PerCpuPtr<CurrentRun, MAX_CPUS> = PerCpuPtr::new();
-static CURRENT_SCHEDULER_CONTEXTS: PerCpuPtr<KernelContext, MAX_CPUS> = PerCpuPtr::new();
+static CURRENT_RUNS: PerCpu<CurrentRun, MAX_CPUS> = PerCpu::uninit();
+static CURRENT_SCHEDULER_CONTEXTS: crate::libs::percpu::PerCpuPtr<KernelContext, MAX_CPUS> =
+    crate::libs::percpu::PerCpuPtr::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResumeMode {
@@ -111,7 +133,8 @@ impl ProcessBuilder {
 
     #[must_use]
     pub fn kernel_stack_size(mut self, kernel_stack_size: usize) -> Self {
-        self.kernel_stack_size = kernel_stack_size.max(4096);
+        self.kernel_stack_size =
+            kernel_stack_size.max(USER_ENTRY_STACK_RESERVE + MIN_KERNEL_STACK_SIZE);
         self
     }
 
@@ -167,6 +190,11 @@ impl Process {
     }
 
     #[must_use]
+    fn kernel_run_stack_top(&self) -> u64 {
+        self.kernel_stack_top - USER_ENTRY_STACK_RESERVE as u64
+    }
+
+    #[must_use]
     pub fn fork_with_root(&self, address_space_root: PhysFrame) -> Self {
         let mut process = ProcessBuilder::new(self.context.general.rip, self.context.general.rsp)
             .address_space_root(address_space_root)
@@ -186,13 +214,14 @@ impl Process {
     pub fn run(&mut self) -> RunResult {
         self.last_reason = None;
         let cpu_index = crate::arch::cpu::current_cpu_index();
-
-        let mut current_run = CurrentRun {
+        let current_run = unsafe { &mut *ensure_current_run_slot(cpu_index) };
+        *current_run = CurrentRun {
             kernel_rsp: 0,
             kernel_cr3: <crate::arch::mm::ArchitecturePageTable as PageTableArch>::root_frame()
                 .start_address()
                 .as_u64(),
             kernel_interrupts_enabled: 1,
+            return_rip: 0,
             process: core::ptr::from_mut(self) as usize,
             saved_rbx: 0,
             saved_rbp: 0,
@@ -202,34 +231,46 @@ impl Process {
             saved_r15: 0,
         };
 
-        crate::arch::interrupt::install_process_kernel_stack(self.kernel_stack_top);
-        crate::arch::fpu::restore(&self.fpu_state);
-        restore_user_tls_bases(&self.context);
+        loop {
+            crate::arch::interrupt::install_process_kernel_stack(self.kernel_stack_top);
+            crate::arch::interrupt::install_process_syscall_stack(self.kernel_stack_top);
+            crate::arch::interrupt::install_user_entry_context(
+                current_run as *const CurrentRun,
+                core::ptr::from_mut(&mut self.context),
+            );
+            crate::arch::fpu::restore(&self.fpu_state);
+            restore_user_tls_bases(&self.context);
+            run_on_kernel_stack(self.kernel_run_stack_top(), || unsafe {
+                match resume_mode_for_context(&self.context) {
+                    ResumeMode::Iret => {
+                        aether_x86_enter_user_iret(
+                            &raw const self.context,
+                            self.address_space_root.start_address().as_u64(),
+                            (current_run as *mut CurrentRun).cast::<()>(),
+                        );
+                    }
+                    ResumeMode::Sysret => {
+                        aether_x86_enter_user_sysret(
+                            &raw const self.context,
+                            self.address_space_root.start_address().as_u64(),
+                            (current_run as *mut CurrentRun).cast::<()>(),
+                        );
+                    }
+                }
+            });
 
-        unsafe {
-            let _ = CURRENT_RUNS.store(cpu_index, &raw mut current_run);
-            match resume_mode_for_context(&self.context) {
-                ResumeMode::Iret => {
-                    aether_x86_enter_user_iret(
-                        &raw const self.context,
-                        self.address_space_root.start_address().as_u64(),
-                        (&raw mut current_run).cast::<()>(),
-                    );
-                }
-                ResumeMode::Sysret => {
-                    aether_x86_enter_user_sysret(
-                        &raw const self.context,
-                        self.address_space_root.start_address().as_u64(),
-                        (&raw mut current_run).cast::<()>(),
-                    );
-                }
+            self.handle_user_exit();
+
+            if self.last_reason.is_some() {
+                break;
             }
-            let _ = CURRENT_RUNS.store(cpu_index, ptr::null_mut());
         }
+        current_run.process = 0;
 
         RunResult {
             reason: self
                 .last_reason
+                .take()
                 .expect("process returned to kernel without a recorded reason"),
             context: self.context,
         }
@@ -238,6 +279,22 @@ impl Process {
     #[must_use]
     pub const fn run_async(&mut self) -> RunFuture<'_> {
         RunFuture::new(self)
+    }
+
+    fn handle_user_exit(&mut self) {
+        let mut frame = self.context.as_trap_frame();
+        let trap = Trap::from_frame(&frame);
+
+        prepare_trap(trap);
+        crate::interrupt::dispatch_trap(trap, &mut frame);
+        self.context.apply_trap_frame(&frame);
+
+        if matches!(trap.kind(), TrapKind::Interrupt) {
+            crate::arch::interrupt::finish_interrupt(trap.vector());
+            crate::interrupt::softirq::drain_pending();
+        }
+
+        let _ = on_user_trap(trap);
     }
 }
 
@@ -262,7 +319,18 @@ pub fn on_trap(trap: Trap, frame: &crate::arch::interrupt::TrapFrame) -> Option<
 
     let current_run = unsafe { current_run_for_current_cpu().as_mut()? };
     let process = unsafe { &mut *(current_run.process as *mut Process) };
-    process.context.capture_from_trap(frame);
+    process.context.apply_trap_frame(frame);
+    on_user_trap(trap)
+}
+
+#[must_use]
+pub(crate) fn on_user_trap(trap: Trap) -> Option<RunReason> {
+    if trap.privilege() != PrivilegeLevel::User {
+        return None;
+    }
+
+    let current_run = unsafe { current_run_for_current_cpu().as_mut()? };
+    let process = unsafe { &mut *(current_run.process as *mut Process) };
 
     if trap.kind() == TrapKind::Interrupt && !crate::preempt::need_resched() {
         return None;
@@ -285,8 +353,21 @@ pub fn resume_current_user_context() {
 
 pub fn current_run_for_current_cpu() -> *mut CurrentRun {
     CURRENT_RUNS
-        .load(crate::arch::cpu::current_cpu_index())
+        .with_mut(crate::arch::cpu::current_cpu_index(), |current_run| {
+            if current_run.process == 0 {
+                ptr::null_mut()
+            } else {
+                current_run as *mut CurrentRun
+            }
+        })
         .unwrap_or(ptr::null_mut())
+}
+
+fn ensure_current_run_slot(cpu_index: usize) -> *mut CurrentRun {
+    let _ = CURRENT_RUNS.init(cpu_index, CurrentRun::default());
+    CURRENT_RUNS
+        .with_mut(cpu_index, |current_run| current_run as *mut CurrentRun)
+        .expect("failed to access per-cpu current run slot")
 }
 
 pub fn run_on_kernel_stack<R, F>(stack_top: u64, f: F) -> R
@@ -428,8 +509,6 @@ fn restore_user_tls_bases(context: &UserContext) {
 }
 
 fn resume_mode_for_context(context: &UserContext) -> ResumeMode {
-    // The continued kernel-side syscall execution model still relies on iret
-    // for architecturally conservative returns after a trapped syscall.
     let _ = context;
     ResumeMode::Iret
 }
@@ -478,6 +557,8 @@ global_asm!(
         mov [rdx + {run_saved_r14_off}], r14
         mov [rdx + {run_saved_r15_off}], r15
         mov [rdx + {run_kernel_rsp_off}], rsp
+        mov rax, [rsp]
+        mov [rdx + {run_return_rip_off}], rax
         pushfq
         pop rax
         shr rax, 9
@@ -515,6 +596,8 @@ global_asm!(
         mov [rdx + {run_saved_r14_off}], r14
         mov [rdx + {run_saved_r15_off}], r15
         mov [rdx + {run_kernel_rsp_off}], rsp
+        mov rax, [rsp]
+        mov [rdx + {run_return_rip_off}], rax
         pushfq
         pop rax
         shr rax, 9
@@ -598,6 +681,7 @@ global_asm!(
         ud2
     "#,
     run_kernel_rsp_off = const offset_of!(CurrentRun, kernel_rsp),
+    run_return_rip_off = const offset_of!(CurrentRun, return_rip),
     run_saved_rbx_off = const offset_of!(CurrentRun, saved_rbx),
     run_saved_rbp_off = const offset_of!(CurrentRun, saved_rbp),
     run_saved_r12_off = const offset_of!(CurrentRun, saved_r12),

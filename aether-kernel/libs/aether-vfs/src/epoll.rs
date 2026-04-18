@@ -227,12 +227,15 @@ impl EpollNotifier {
 
     fn take_ready(&self, max_events: usize) -> Vec<(u64, EpollEvents)> {
         let mut ready = self.ready.lock();
-        let fds = ready.keys().copied().take(max_events).collect::<Vec<_>>();
-        let mut events = Vec::with_capacity(fds.len());
-        for fd in fds {
-            if let Some(bits) = ready.remove(&fd) {
-                events.push((fd, bits));
-            }
+        let mut events = Vec::with_capacity(max_events.min(ready.len()));
+        while events.len() < max_events {
+            let Some((&fd, _)) = ready.first_key_value() else {
+                break;
+            };
+            let Some(bits) = ready.remove(&fd) else {
+                continue;
+            };
+            events.push((fd, bits));
         }
         events
     }

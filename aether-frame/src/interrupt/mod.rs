@@ -12,6 +12,14 @@ pub fn init_for_cpu(cpu_index: usize) -> Result<(), &'static str> {
     crate::arch::interrupt::init_for_cpu(cpu_index)
 }
 
+pub(crate) fn init_preempt_ipi() -> Result<(), &'static str> {
+    crate::arch::interrupt::init_preempt_ipi()
+}
+
+pub(crate) fn kick_cpu(cpu_index: usize) -> Result<(), &'static str> {
+    crate::arch::interrupt::kick_cpu(cpu_index)
+}
+
 #[must_use]
 pub fn current_lapic_id() -> Option<u32> {
     crate::arch::interrupt::apic::current_lapic_id()

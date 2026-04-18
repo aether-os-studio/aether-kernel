@@ -2,6 +2,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use aether_frame::libs::spin::{LocalIrqDisabled, SpinLock};
@@ -22,6 +23,7 @@ struct WaitRegistration {
 pub struct WaitQueue {
     next_id: AtomicU64,
     registrations: SpinLock<BTreeMap<u64, WaitRegistration>, LocalIrqDisabled>,
+    notify_scratch: SpinLock<Vec<(SharedWaitListener, PollEvents)>, LocalIrqDisabled>,
 }
 
 impl WaitQueue {
@@ -29,6 +31,7 @@ impl WaitQueue {
         Self {
             next_id: AtomicU64::new(1),
             registrations: SpinLock::new(BTreeMap::new()),
+            notify_scratch: SpinLock::new(Vec::new()),
         }
     }
 
@@ -45,18 +48,32 @@ impl WaitQueue {
     }
 
     pub fn notify(&self, events: PollEvents) {
-        let listeners = self
-            .registrations
-            .lock()
-            .values()
-            .filter_map(|registration| {
-                let matched = events.intersection(registration.events);
-                (matched != PollEvents::empty()).then(|| (registration.listener.clone(), matched))
-            })
-            .collect::<alloc::vec::Vec<_>>();
+        let mut listeners = {
+            let mut scratch = self.notify_scratch.lock();
+            core::mem::take(&mut *scratch)
+        };
+        listeners.clear();
 
-        for (listener, matched) in listeners {
-            listener.wake(matched);
+        {
+            let registrations = self.registrations.lock();
+            for registration in registrations.values() {
+                let matched = events.intersection(registration.events);
+                if matched != PollEvents::empty() {
+                    listeners.push((registration.listener.clone(), matched));
+                }
+            }
+        }
+
+        for (listener, matched) in &listeners {
+            listener.wake(*matched);
+        }
+
+        let mut scratch = self.notify_scratch.lock();
+        if scratch.capacity() < listeners.capacity() {
+            *scratch = listeners;
+        } else {
+            scratch.clear();
+            scratch.append(&mut listeners);
         }
     }
 }

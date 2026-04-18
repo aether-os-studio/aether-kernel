@@ -1,18 +1,22 @@
+use core::sync::atomic::{AtomicBool, Ordering};
 use x2apic::lapic::{
     IpiDestMode, LocalApic, LocalApicBuildMode, LocalApicBuilder, TimerDivide, TimerMode,
     xapic_base,
 };
 
 use crate::boot::MAX_CPUS;
+use crate::interrupt::{Trap, TrapFrame};
 use crate::io::remap_mmio;
 use crate::libs::percpu::PerCpu;
 use crate::libs::spin::{LocalIrqDisabled, SpinLock};
 
+pub const PREEMPT_VECTOR: u8 = 0xf1;
 pub const TIMER_VECTOR: u8 = 0xf0;
 pub const ERROR_VECTOR: u8 = 0xfe;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 
 static LOCAL_APICS: PerCpu<SpinLock<LocalApic, LocalIrqDisabled>, MAX_CPUS> = PerCpu::uninit();
+static PREEMPT_IPI_READY: AtomicBool = AtomicBool::new(false);
 const APIC_TIMER_CALIBRATION_NS: u64 = 10_000_000;
 
 pub fn init(cpu_index: usize) -> Result<(), &'static str> {
@@ -54,6 +58,20 @@ pub fn end_of_interrupt() {
     });
 }
 
+pub fn init_preempt_ipi() -> Result<(), &'static str> {
+    if PREEMPT_IPI_READY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    crate::interrupt::register_handler(PREEMPT_VECTOR, preempt_ipi_handler).map_err(|_| {
+        PREEMPT_IPI_READY.store(false, Ordering::Release);
+        "failed to register preempt IPI handler"
+    })
+}
+
 #[must_use]
 pub fn current_lapic_id() -> Option<u32> {
     with_current_lapic(|lapic| unsafe { lapic.id() }).ok()
@@ -70,6 +88,24 @@ pub fn program_periodic_timer(initial_count: u32) -> Result<(), &'static str> {
 pub fn disable_timer() -> Result<(), &'static str> {
     with_current_lapic(|lapic| unsafe {
         lapic.disable_timer();
+    })
+}
+
+pub fn kick_cpu(cpu_index: usize) -> Result<(), &'static str> {
+    let current_cpu = crate::arch::cpu::current_cpu_index();
+    if cpu_index == current_cpu {
+        return Ok(());
+    }
+
+    let destination = crate::boot::info()
+        .cpus
+        .as_slice()
+        .get(cpu_index)
+        .ok_or("invalid target cpu for preempt IPI")?
+        .lapic_id;
+
+    with_current_lapic(|lapic| unsafe {
+        lapic.send_ipi(PREEMPT_VECTOR, destination);
     })
 }
 
@@ -111,3 +147,5 @@ fn with_current_lapic<R>(f: impl FnOnce(&mut LocalApic) -> R) -> Result<R, &'sta
         })
         .map_err(|_| "local APIC is not initialized")
 }
+
+fn preempt_ipi_handler(_trap: Trap, _frame: &mut TrapFrame) {}

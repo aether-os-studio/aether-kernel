@@ -1,5 +1,6 @@
 use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use aether_frame::boot;
 use aether_frame::libs::percpu::{PerCpu, PerCpuError};
@@ -58,9 +59,45 @@ impl ProcessorState {
 }
 
 static PROCESSORS: PerCpu<ProcessorState, { boot::MAX_CPUS }> = PerCpu::uninit();
+static NEXT_ASSIGN_CPU: AtomicUsize = AtomicUsize::new(0);
 
 fn current_cpu() -> usize {
     aether_frame::arch::cpu::current_cpu_index()
+}
+
+fn discovered_cpu_count() -> usize {
+    boot::info().cpus.as_slice().len().max(1)
+}
+
+fn processor_load(cpu_index: usize) -> Option<usize> {
+    PROCESSORS
+        .with(cpu_index, |processor| {
+            usize::from(processor.current_process.is_some())
+                + processor.run_queue.lock().runnable.len()
+        })
+        .ok()
+}
+
+fn select_online_cpu(start_cpu: usize) -> usize {
+    let cpu_count = discovered_cpu_count();
+    let mut best_cpu = None;
+    let mut best_load = usize::MAX;
+
+    for offset in 0..cpu_count {
+        let cpu_index = (start_cpu + offset) % cpu_count;
+        let Some(load) = processor_load(cpu_index) else {
+            continue;
+        };
+        if load < best_load {
+            best_cpu = Some(cpu_index);
+            best_load = load;
+            if load == 0 {
+                break;
+            }
+        }
+    }
+
+    best_cpu.unwrap_or_else(current_cpu)
 }
 
 pub(crate) fn init_current_cpu() -> Result<(), &'static str> {
@@ -78,6 +115,20 @@ pub(crate) fn init_current_cpu() -> Result<(), &'static str> {
             aether_frame::process::install_scheduler_context(&mut processor.scheduler_context);
         })
         .map_err(|_| "failed to install cpu-local scheduler context")
+}
+
+pub(crate) fn select_cpu_for_new_process() -> usize {
+    let cpu_count = discovered_cpu_count();
+    let start_cpu = NEXT_ASSIGN_CPU.fetch_add(1, Ordering::Relaxed) % cpu_count;
+    select_online_cpu(start_cpu)
+}
+
+pub(crate) fn select_cpu_for_child(parent_cpu: usize) -> usize {
+    let cpu_count = discovered_cpu_count();
+    if cpu_count == 1 {
+        return 0;
+    }
+    select_online_cpu((parent_cpu + 1) % cpu_count)
 }
 
 pub(crate) fn current_pid() -> Option<Pid> {

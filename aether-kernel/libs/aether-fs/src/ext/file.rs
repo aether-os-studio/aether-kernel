@@ -15,7 +15,6 @@ impl FileOperations for ExtInodeNode {
             return;
         }
 
-        let _guard = self.lock_io();
         let mut state = self.open_state.lock();
         if state.refs == 0
             && let Ok(file) = self.open_file()
@@ -30,7 +29,6 @@ impl FileOperations for ExtInodeNode {
             return;
         }
 
-        let _guard = self.lock_io();
         let mut state = self.open_state.lock();
         if state.refs == 0 {
             return;

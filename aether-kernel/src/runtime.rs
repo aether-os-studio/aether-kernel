@@ -97,10 +97,9 @@ pub(crate) fn publish_next_timer_deadline(deadline_nanos: Option<u64>) {
 }
 
 fn runtime_tick_handler() {
-    if aether_frame::arch::cpu::current_cpu_index() != 0 {
-        return;
+    if aether_frame::arch::cpu::current_cpu_index() == 0 {
+        aether_drivers::drm::handle_vblank_tick();
     }
-    aether_drivers::drm::handle_vblank_tick();
     let deadline_nanos = NEXT_TIMER_DEADLINE_NANOS.load(Ordering::Acquire);
     let process_due = deadline_nanos != u64::MAX
         && aether_frame::interrupt::timer::nanos_since_boot() >= deadline_nanos;
@@ -699,6 +698,7 @@ impl ProcessServices for RuntimeServices<'_> {
         let vfork_parent = params.is_vfork().then_some(parent.identity.pid);
         let child_signals = parent.signals.fork_copy();
         let child_files = ProcessManager::clone_fd_table_for_fork(&parent.files, &child_signals);
+        let assigned_cpu = crate::processor::select_cpu_for_child(parent.assigned_cpu);
 
         let child = KernelProcess {
             identity: crate::process::ProcessIdentity {
@@ -710,7 +710,7 @@ impl ProcessServices for RuntimeServices<'_> {
             task: child_task,
             credentials: parent.credentials.clone(),
             prctl: child_prctl,
-            assigned_cpu: parent.assigned_cpu,
+            assigned_cpu,
             kernel_context: None,
             kernel_cpu: None,
             pending_exec: None,

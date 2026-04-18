@@ -473,7 +473,7 @@ pub fn wake_expired_timers() {
 
 fn wake_expired_class(class: DeadlineClass, now_ns: u64) {
     loop {
-        let ready = {
+        let ready_ids = {
             let mut registry = REGISTRY.lock();
             let Some((&deadline, _)) = registry.deadlines_mut(class).first_key_value() else {
                 registry.refresh_next_deadlines();
@@ -487,20 +487,22 @@ fn wake_expired_class(class: DeadlineClass, now_ns: u64) {
             let ids = registry
                 .deadlines_mut(class)
                 .remove(&deadline)
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<alloc::vec::Vec<_>>();
+                .unwrap_or_default();
             registry.refresh_next_deadlines();
-            ids.into_iter()
-                .filter_map(|id| registry.timers.get(&id).and_then(Weak::upgrade))
-                .collect::<alloc::vec::Vec<_>>()
+            ids
         };
 
-        if ready.is_empty() {
+        if ready_ids.is_empty() {
             continue;
         }
 
-        for timerfd in ready {
+        for id in ready_ids {
+            let Some(timerfd) = ({
+                let registry = REGISTRY.lock();
+                registry.timers.get(&id).and_then(Weak::upgrade)
+            }) else {
+                continue;
+            };
             let notify_readable = {
                 let mut registry = REGISTRY.lock();
                 let mut state = timerfd.inner.lock();

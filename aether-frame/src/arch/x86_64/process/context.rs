@@ -1,4 +1,7 @@
 use crate::arch::interrupt::TrapFrame;
+use crate::interrupt::SYSCALL_TRAP_VECTOR;
+
+use super::super::interrupt::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -64,7 +67,7 @@ impl UserContext {
         }
     }
 
-    pub(crate) fn capture_from_trap(&mut self, frame: &TrapFrame) {
+    pub(crate) fn apply_trap_frame(&mut self, frame: &TrapFrame) {
         self.general.r15 = frame.r15;
         self.general.r14 = frame.r14;
         self.general.r13 = frame.r13;
@@ -85,6 +88,39 @@ impl UserContext {
         self.general.rflags = frame.rflags;
         self.trap_num = u64::from(frame.vector());
         self.error_code = frame.error_code();
+    }
+
+    #[must_use]
+    pub(crate) const fn as_trap_frame(&self) -> TrapFrame {
+        TrapFrame {
+            r15: self.general.r15,
+            r14: self.general.r14,
+            r13: self.general.r13,
+            r12: self.general.r12,
+            r11: self.general.r11,
+            r10: self.general.r10,
+            r9: self.general.r9,
+            r8: self.general.r8,
+            rdi: self.general.rdi,
+            rsi: self.general.rsi,
+            rbp: self.general.rbp,
+            rbx: self.general.rbx,
+            rdx: self.general.rdx,
+            rcx: self.general.rcx,
+            rax: self.general.rax,
+            vector: self.trap_num,
+            error_code: self.error_code,
+            rip: self.general.rip,
+            cs: USER_CODE_SELECTOR as u64,
+            rflags: self.general.rflags,
+            rsp: self.general.rsp,
+            ss: USER_DATA_SELECTOR as u64,
+            kind: if self.trap_num == SYSCALL_TRAP_VECTOR as u64 {
+                1
+            } else {
+                0
+            },
+        }
     }
 
     #[must_use]

@@ -3,15 +3,17 @@ mod buddy;
 mod frame;
 mod mapper;
 
+use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use linked_list_allocator::LockedHeap;
+use linked_list_allocator::Heap;
 
 use crate::boot;
-use crate::libs::spin::SpinLock;
+use crate::libs::spin::{LocalIrqDisabled, SpinLock};
 
 pub use self::address::{PAGE_SHIFT, PAGE_SIZE, PhysAddr, VirtAddr};
 pub use self::buddy::{BuddyAllocatorError, BuddyFrameAllocator};
@@ -54,6 +56,33 @@ impl<T> GlobalSlot<T> {
 
 static FRAME_ALLOCATOR: GlobalSlot<SpinLock<BuddyFrameAllocator>> = GlobalSlot::uninit();
 
+pub struct LockedHeap(SpinLock<Heap, LocalIrqDisabled>);
+
+impl LockedHeap {
+    pub const fn empty() -> Self {
+        Self(SpinLock::new(Heap::empty()))
+    }
+
+    pub unsafe fn init(&self, start: *mut u8, size: usize) {
+        self.0.lock().init(start, size);
+    }
+}
+unsafe impl GlobalAlloc for LockedHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.0
+            .lock()
+            .allocate_first_fit(layout)
+            .ok()
+            .map_or(core::ptr::null_mut(), |allocation| allocation.as_ptr())
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.0
+            .lock()
+            .deallocate(NonNull::new_unchecked(ptr), layout)
+    }
+}
+
 #[global_allocator]
 static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
 
@@ -79,9 +108,7 @@ pub fn init() -> Result<(), BuddyAllocatorError> {
             .expect("Failed to map heap");
     }
     unsafe {
-        HEAP_ALLOCATOR
-            .lock()
-            .init(KERNEL_HEAP_START as *mut u8, KERNEL_HEAP_SIZE);
+        HEAP_ALLOCATOR.init(KERNEL_HEAP_START as *mut u8, KERNEL_HEAP_SIZE);
     }
     Ok(())
 }

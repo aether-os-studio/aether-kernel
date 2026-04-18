@@ -287,11 +287,18 @@ fn project_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn rust_profile_dir() -> &'static str {
+    if RUST_PROFILE == "dev" {
+        return "debug";
+    }
+    RUST_PROFILE
+}
+
 fn kernel_elf_path() -> PathBuf {
     project_root()
         .join("target")
         .join(Arch::X86_64.rust_target())
-        .join("release")
+        .join(rust_profile_dir())
         .join(KERNEL_PKG)
 }
 

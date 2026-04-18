@@ -109,7 +109,6 @@ impl ExtInodeNode {
         &self,
         f: impl FnOnce(&mut ExtFile) -> FsResult<T>,
     ) -> FsResult<T> {
-        let _guard = self.lock_io();
         let mut state = self.open_state.lock();
         if state.refs == 0 {
             let mut file = self.open_file()?;

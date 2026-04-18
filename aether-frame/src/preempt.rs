@@ -57,6 +57,7 @@ impl Drop for DisabledPreemptGuard {
 }
 
 pub fn init_for_cpu(cpu_index: usize) -> Result<(), &'static str> {
+    crate::interrupt::init_preempt_ipi()?;
     PREEMPT_STATE
         .init(cpu_index, PreemptState::new())
         .map_err(|_| "failed to initialize per-cpu preempt state")
@@ -101,6 +102,7 @@ pub fn request_reschedule() {
 pub fn request_reschedule_cpu(cpu_index: usize) {
     if let Ok(state) = PREEMPT_STATE.get(cpu_index) {
         state.info.fetch_and(!NEED_RESCHED_MASK, Ordering::AcqRel);
+        let _ = crate::interrupt::kick_cpu(cpu_index);
     }
 }
 

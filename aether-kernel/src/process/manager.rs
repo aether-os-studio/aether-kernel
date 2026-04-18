@@ -399,6 +399,7 @@ impl ProcessManager {
     ) -> Result<Pid, BuildError> {
         let pid = self.next_pid;
         self.next_pid = self.next_pid.saturating_add(1);
+        let assigned_cpu = crate::processor::select_cpu_for_new_process();
         let identity = ProcessIdentity {
             pid,
             parent,
@@ -414,7 +415,7 @@ impl ProcessManager {
                 task,
                 credentials: Credentials::root(),
                 prctl: crate::process::PrctlState::for_exec_path(_name),
-                assigned_cpu: aether_frame::arch::cpu::current_cpu_index(),
+                assigned_cpu,
                 kernel_context: None,
                 kernel_cpu: None,
                 pending_exec: None,
@@ -432,7 +433,7 @@ impl ProcessManager {
                 state: ProcessState::Runnable,
             }),
         );
-        self.enqueue_runnable_pid(pid, aether_frame::arch::cpu::current_cpu_index());
+        self.enqueue_runnable_pid(pid, assigned_cpu);
         Ok(pid)
     }
 

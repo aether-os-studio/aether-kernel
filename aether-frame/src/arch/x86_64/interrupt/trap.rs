@@ -4,12 +4,12 @@ use core::ptr;
 
 use x86_64::registers::model_specific::Msr;
 
-use crate::arch::process::{CurrentRun, current_run_for_current_cpu};
+use crate::arch::process::{CurrentRun, GeneralRegs, UserContext};
 use crate::boot::MAX_CPUS;
 use crate::interrupt::Trap;
 use crate::libs::percpu::PerCpu;
 
-use super::gdt::{KERNEL_CODE_SELECTOR, USER_CODE_SELECTOR, USER_DATA_SELECTOR};
+use super::gdt::{KERNEL_CODE_SELECTOR, USER_DATA_SELECTOR};
 
 const IA32_EFER: u32 = 0xc000_0080;
 const IA32_STAR: u32 = 0xc000_0081;
@@ -78,16 +78,19 @@ impl TrapFrame {
     #[must_use]
     pub const fn is_syscall(&self) -> bool {
         self.kind == FRAME_KIND_SYSCALL
+            || self.vector == crate::interrupt::SYSCALL_TRAP_VECTOR as u64
     }
 }
 
 #[repr(C)]
-pub struct SyscallEntryData {
+pub struct UserEntryState {
     pub kernel_rsp: u64,
     pub user_rsp: u64,
+    pub current_run: u64,
+    pub user_context: u64,
 }
 
-static SYSCALL_ENTRY_DATA: PerCpu<SyscallEntryData, MAX_CPUS> = PerCpu::uninit();
+static USER_ENTRY_STATE: PerCpu<UserEntryState, MAX_CPUS> = PerCpu::uninit();
 
 pub fn init_syscall(cpu_index: usize) -> Result<(), &'static str> {
     let mut efer = Msr::new(IA32_EFER);
@@ -95,18 +98,20 @@ pub fn init_syscall(cpu_index: usize) -> Result<(), &'static str> {
     let mut lstar = Msr::new(IA32_LSTAR);
     let mut fmask = Msr::new(IA32_FMASK);
     let mut kernel_gs_base = Msr::new(IA32_KERNEL_GS_BASE);
-    SYSCALL_ENTRY_DATA
+    USER_ENTRY_STATE
         .init(
             cpu_index,
-            SyscallEntryData {
+            UserEntryState {
                 kernel_rsp: 0,
                 user_rsp: 0,
+                current_run: 0,
+                user_context: 0,
             },
         )
-        .map_err(|_| "failed to initialize per-cpu syscall entry data")?;
-    let gs_base = SYSCALL_ENTRY_DATA
+        .map_err(|_| "failed to initialize per-cpu user entry state")?;
+    let gs_base = USER_ENTRY_STATE
         .with(cpu_index, |data| core::ptr::from_ref(data) as u64)
-        .map_err(|_| "per-cpu syscall entry data is unavailable")?;
+        .map_err(|_| "per-cpu user entry state is unavailable")?;
 
     unsafe {
         efer.write(efer.read() | EFER_SCE);
@@ -120,8 +125,15 @@ pub fn init_syscall(cpu_index: usize) -> Result<(), &'static str> {
 }
 
 pub fn set_syscall_kernel_stack(stack_top: u64) {
-    let _ = SYSCALL_ENTRY_DATA.with_mut(crate::arch::cpu::current_cpu_index(), |data| {
+    let _ = USER_ENTRY_STATE.with_mut(crate::arch::cpu::current_cpu_index(), |data| {
         data.kernel_rsp = stack_top;
+    });
+}
+
+pub fn set_user_entry_context(current_run: *const CurrentRun, user_context: *mut UserContext) {
+    let _ = USER_ENTRY_STATE.with_mut(crate::arch::cpu::current_cpu_index(), |data| {
+        data.current_run = current_run as u64;
+        data.user_context = user_context as u64;
     });
 }
 
@@ -132,30 +144,17 @@ const fn make_star_value() -> u64 {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn aether_x86_dispatch_trap(frame: &mut TrapFrame) -> *const CurrentRun {
+extern "C" fn aether_x86_dispatch_kernel_trap(frame: &mut TrapFrame) -> *const CurrentRun {
     let trap = Trap::from_frame(frame);
-    let kernel_trap = !frame.from_user();
-    if kernel_trap {
-        crate::arch::fpu::save_kernel_interrupt_state();
-    }
-    crate::process::prepare_trap(trap);
+
+    crate::arch::fpu::save_kernel_interrupt_state();
     crate::interrupt::dispatch_trap(trap, frame);
     if matches!(trap.kind(), crate::interrupt::TrapKind::Interrupt) {
         super::finish_interrupt(trap.vector());
         crate::interrupt::softirq::drain_pending();
     }
-    let result = if crate::process::on_trap(trap, frame).is_some() {
-        current_run_for_current_cpu()
-    } else {
-        if trap.privilege() == crate::interrupt::PrivilegeLevel::User {
-            crate::process::resume_current_user_context();
-        }
-        ptr::null()
-    };
-    if kernel_trap {
-        crate::arch::fpu::restore_kernel_interrupt_state();
-    }
-    result
+    crate::arch::fpu::restore_kernel_interrupt_state();
+    ptr::null()
 }
 
 unsafe extern "C" {
@@ -232,6 +231,49 @@ global_asm!(
         mov [\dst + {rcx_off}], rax
         mov rax, [\src + 112]
         mov [\dst + {rax_off}], rax
+    .endm
+
+    .macro AETHER_WRITE_USER_CONTEXT dst, src
+        mov rax, [\src + 0]
+        mov [\dst + {ctx_r15_off}], rax
+        mov rax, [\src + 8]
+        mov [\dst + {ctx_r14_off}], rax
+        mov rax, [\src + 16]
+        mov [\dst + {ctx_r13_off}], rax
+        mov rax, [\src + 24]
+        mov [\dst + {ctx_r12_off}], rax
+        mov rax, [\src + 32]
+        mov [\dst + {ctx_r11_off}], rax
+        mov rax, [\src + 40]
+        mov [\dst + {ctx_r10_off}], rax
+        mov rax, [\src + 48]
+        mov [\dst + {ctx_r9_off}], rax
+        mov rax, [\src + 56]
+        mov [\dst + {ctx_r8_off}], rax
+        mov rax, [\src + 64]
+        mov [\dst + {ctx_rdi_off}], rax
+        mov rax, [\src + 72]
+        mov [\dst + {ctx_rsi_off}], rax
+        mov rax, [\src + 80]
+        mov [\dst + {ctx_rbp_off}], rax
+        mov rax, [\src + 88]
+        mov [\dst + {ctx_rbx_off}], rax
+        mov rax, [\src + 96]
+        mov [\dst + {ctx_rdx_off}], rax
+        mov rax, [\src + 104]
+        mov [\dst + {ctx_rcx_off}], rax
+        mov rax, [\src + 112]
+        mov [\dst + {ctx_rax_off}], rax
+        mov rax, [\src + {reg_bytes}]
+        mov [\dst + {ctx_trap_num_off}], rax
+        mov rax, [\src + {reg_bytes} + 8]
+        mov [\dst + {ctx_error_off}], rax
+        mov rax, [\src + {reg_bytes} + 16]
+        mov [\dst + {ctx_rip_off}], rax
+        mov rax, [\src + {reg_bytes} + 32]
+        mov [\dst + {ctx_rflags_off}], rax
+        mov rax, [\src + {reg_bytes} + 40]
+        mov [\dst + {ctx_rsp_off}], rax
     .endm
 
     .macro AETHER_BUILD_INTERRUPT_FRAME
@@ -358,10 +400,19 @@ global_asm!(
     aether_x86_interrupt_entry:
         cld
         AETHER_PUSH_REGS
+        test byte ptr [rsp + {reg_bytes} + 24], 3
+        jz 1f
+        swapgs
+        mov rdi, gs:[{entry_user_ctx_off}]
+        AETHER_WRITE_USER_CONTEXT rdi, rsp
+        mov rax, gs:[{entry_current_run_off}]
+        swapgs
+        jmp aether_x86_trap_exit_to_kernel
+    1:
         sub rsp, {frame_size}
         AETHER_BUILD_INTERRUPT_FRAME
         mov rdi, rsp
-        call {dispatch}
+        call {dispatch_kernel}
         test rax, rax
         jnz aether_x86_trap_exit_to_kernel
         add rsp, {frame_size}
@@ -375,38 +426,35 @@ global_asm!(
         swapgs
         mov gs:[{entry_user_rsp_off}], rsp
         mov rsp, gs:[{entry_kernel_rsp_off}]
-        sub rsp, {frame_size}
+        push rdi
+        mov rdi, gs:[{entry_user_ctx_off}]
 
-        mov [rsp + {r15_off}], r15
-        mov [rsp + {r14_off}], r14
-        mov [rsp + {r13_off}], r13
-        mov [rsp + {r12_off}], r12
-        mov [rsp + {r11_off}], r11
-        mov [rsp + {r10_off}], r10
-        mov [rsp + {r9_off}], r9
-        mov [rsp + {r8_off}], r8
-        mov [rsp + {rdi_off}], rdi
-        mov [rsp + {rsi_off}], rsi
-        mov [rsp + {rbp_off}], rbp
-        mov [rsp + {rbx_off}], rbx
-        mov [rsp + {rdx_off}], rdx
-        mov [rsp + {rcx_off}], rcx
-        mov [rsp + {rax_off}], rax
-        mov qword ptr [rsp + {vector_off}], {syscall_vector}
-        mov qword ptr [rsp + {error_off}], 0
-        mov [rsp + {rip_off}], rcx
-        mov qword ptr [rsp + {cs_off}], {user_cs}
-        mov [rsp + {rflags_off}], r11
+        mov [rdi + {ctx_r15_off}], r15
+        mov [rdi + {ctx_r14_off}], r14
+        mov [rdi + {ctx_r13_off}], r13
+        mov [rdi + {ctx_r12_off}], r12
+        mov [rdi + {ctx_r11_off}], r11
+        mov [rdi + {ctx_r10_off}], r10
+        mov [rdi + {ctx_r9_off}], r9
+        mov [rdi + {ctx_r8_off}], r8
+        mov [rdi + {ctx_rax_off}], rax
+        mov rax, [rsp]
+        mov [rdi + {ctx_rdi_off}], rax
+        mov [rdi + {ctx_rsi_off}], rsi
+        mov [rdi + {ctx_rbp_off}], rbp
+        mov [rdi + {ctx_rbx_off}], rbx
+        mov [rdi + {ctx_rdx_off}], rdx
+        mov [rdi + {ctx_rcx_off}], rcx
+        mov qword ptr [rdi + {ctx_trap_num_off}], {syscall_vector}
+        mov qword ptr [rdi + {ctx_error_off}], 0
+        mov [rdi + {ctx_rip_off}], rcx
+        mov [rdi + {ctx_rflags_off}], r11
         mov rax, gs:[{entry_user_rsp_off}]
-        mov [rsp + {rsp_off}], rax
-        mov qword ptr [rsp + {ss_off}], {user_ss}
-        mov qword ptr [rsp + {kind_off}], {syscall_kind}
+        mov [rdi + {ctx_rsp_off}], rax
 
-        mov rdi, rsp
-        call {dispatch}
-        test rax, rax
-        jnz aether_x86_syscall_exit_to_kernel
-        ud2
+        mov rax, gs:[{entry_current_run_off}]
+        add rsp, 8
+        jmp aether_x86_syscall_exit_to_kernel
 
     aether_x86_syscall_exit_to_kernel:
         mov rdx, rax
@@ -476,10 +524,7 @@ global_asm!(
     kind_off = const offset_of!(TrapFrame, kind),
     syscall_vector = const crate::interrupt::SYSCALL_TRAP_VECTOR as u64,
     interrupt_kind = const FRAME_KIND_INTERRUPT,
-    syscall_kind = const FRAME_KIND_SYSCALL,
-    user_cs = const USER_CODE_SELECTOR as u64,
-    user_ss = const USER_DATA_SELECTOR as u64,
-    dispatch = sym aether_x86_dispatch_trap,
+    dispatch_kernel = sym aether_x86_dispatch_kernel_trap,
     run_kernel_rsp_off = const offset_of!(CurrentRun, kernel_rsp),
     run_kernel_cr3_off = const offset_of!(CurrentRun, kernel_cr3),
     run_saved_rbx_off = const offset_of!(CurrentRun, saved_rbx),
@@ -489,8 +534,32 @@ global_asm!(
     run_saved_r14_off = const offset_of!(CurrentRun, saved_r14),
     run_saved_r15_off = const offset_of!(CurrentRun, saved_r15),
     run_kernel_if_off = const offset_of!(CurrentRun, kernel_interrupts_enabled),
+    ctx_r15_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, r15),
+    ctx_r14_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, r14),
+    ctx_r13_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, r13),
+    ctx_r12_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, r12),
+    ctx_r11_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, r11),
+    ctx_r10_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, r10),
+    ctx_r9_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, r9),
+    ctx_r8_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, r8),
+    ctx_rdi_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, rdi),
+    ctx_rsi_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, rsi),
+    ctx_rbp_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, rbp),
+    ctx_rbx_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, rbx),
+    ctx_rdx_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, rdx),
+    ctx_rcx_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, rcx),
+    ctx_rax_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, rax),
+    ctx_rip_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, rip),
+    ctx_rsp_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, rsp),
+    ctx_rflags_off = const offset_of!(UserContext, general) + offset_of!(GeneralRegs, rflags),
+    ctx_trap_num_off = const offset_of!(UserContext, trap_num),
+    ctx_error_off = const offset_of!(UserContext, error_code),
     entry_kernel_rsp_off =
-        const offset_of!(SyscallEntryData, kernel_rsp),
+        const offset_of!(UserEntryState, kernel_rsp),
     entry_user_rsp_off =
-        const offset_of!(SyscallEntryData, user_rsp),
+        const offset_of!(UserEntryState, user_rsp),
+    entry_current_run_off =
+        const offset_of!(UserEntryState, current_run),
+    entry_user_ctx_off =
+        const offset_of!(UserEntryState, user_context),
 );
