@@ -11,3 +11,4 @@ aether-framebuffer = { path = "../aether-framebuffer" }
 aether-vfs = { path = "../aether-vfs" }
 log = "0.4.29"
 os-terminal = "=0.7.3"
+spin = "0.9"

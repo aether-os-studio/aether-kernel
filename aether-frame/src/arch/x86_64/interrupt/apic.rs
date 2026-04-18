@@ -6,13 +6,13 @@ use x2apic::lapic::{
 use crate::boot::MAX_CPUS;
 use crate::io::remap_mmio;
 use crate::libs::percpu::PerCpu;
-use crate::libs::spin::SpinLock;
+use crate::libs::spin::{LocalIrqDisabled, SpinLock};
 
 pub const TIMER_VECTOR: u8 = 0xf0;
 pub const ERROR_VECTOR: u8 = 0xfe;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 
-static LOCAL_APICS: PerCpu<SpinLock<LocalApic>, MAX_CPUS> = PerCpu::uninit();
+static LOCAL_APICS: PerCpu<SpinLock<LocalApic, LocalIrqDisabled>, MAX_CPUS> = PerCpu::uninit();
 const APIC_TIMER_CALIBRATION_NS: u64 = 10_000_000;
 
 pub fn init(cpu_index: usize) -> Result<(), &'static str> {

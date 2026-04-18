@@ -23,7 +23,12 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             .services
             .clone_process(self.process, CloneParams::vfork())
         {
-            Ok(child) => self.block_vfork(child),
+            Ok(child) => match self.wait_vfork(child) {
+                Ok(BlockResult::CompletedValue { value }) => SyscallDisposition::ok(value),
+                Ok(BlockResult::SignalInterrupted) => SyscallDisposition::err(SysErr::Intr),
+                Ok(_) => SyscallDisposition::err(SysErr::Intr),
+                Err(disposition) => disposition,
+            },
             Err(error) => SyscallDisposition::err(error),
         }
     }

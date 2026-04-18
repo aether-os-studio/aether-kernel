@@ -223,47 +223,44 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             let copy_len = old_size.min(new_size);
             let restore_flags = region.page_flags;
             let needs_temp_write = copy_len != 0 && !restore_flags.contains(MapFlags::WRITE);
-            if needs_temp_write {
-                if let Err(error) = self
+            if needs_temp_write
+                && let Err(error) = self
                     .process
                     .task
                     .address_space
                     .mprotect(target, copy_len, restore_flags | MapFlags::WRITE)
                     .map_err(SysErr::from)
-                {
-                    self.cleanup_mremap_target(target, new_len);
-                    return Err(error);
-                }
+            {
+                self.cleanup_mremap_target(target, new_len);
+                return Err(error);
             }
             if let Err(error) = self.copy_user_range(old_address, target, copy_len) {
                 self.cleanup_mremap_target(target, new_len);
                 return Err(error);
             }
-            if needs_temp_write {
-                if let Err(error) = self
+            if needs_temp_write
+                && let Err(error) = self
                     .process
                     .task
                     .address_space
                     .mprotect(target, copy_len, restore_flags)
                     .map_err(SysErr::from)
-                {
-                    self.cleanup_mremap_target(target, new_len);
-                    return Err(error);
-                }
+            {
+                self.cleanup_mremap_target(target, new_len);
+                return Err(error);
             }
         }
 
-        if (flags & MREMAP_DONTUNMAP) == 0 {
-            if let Err(error) = self
+        if (flags & MREMAP_DONTUNMAP) == 0
+            && let Err(error) = self
                 .process
                 .task
                 .address_space
                 .munmap(old_address, old_len)
                 .map_err(SysErr::from)
-            {
-                self.cleanup_mremap_target(target, new_len);
-                return Err(error);
-            }
+        {
+            self.cleanup_mremap_target(target, new_len);
+            return Err(error);
         }
         self.process
             .remove_mmap_region_range(target, target.saturating_add(new_len));

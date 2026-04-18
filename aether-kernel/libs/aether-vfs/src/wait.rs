@@ -4,7 +4,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use aether_frame::libs::spin::SpinLock;
+use aether_frame::libs::spin::{LocalIrqDisabled, SpinLock};
 
 use crate::PollEvents;
 
@@ -21,7 +21,7 @@ struct WaitRegistration {
 
 pub struct WaitQueue {
     next_id: AtomicU64,
-    registrations: SpinLock<BTreeMap<u64, WaitRegistration>>,
+    registrations: SpinLock<BTreeMap<u64, WaitRegistration>, LocalIrqDisabled>,
 }
 
 impl WaitQueue {

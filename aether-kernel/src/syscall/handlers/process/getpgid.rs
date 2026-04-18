@@ -1,5 +1,3 @@
-use core::u64;
-
 use crate::arch::syscall::nr;
 use crate::errno::SysResult;
 use crate::process::{ProcessServices, ProcessSyscallContext};

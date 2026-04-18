@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use aether_vfs::{FileOperations, FsResult};
+use aether_vfs::{FileOperations, FsResult, NodeKind, PollEvents};
 
 use super::inode::ExtInodeNode;
 use super::io::{block_on_future, map_ext_error};
@@ -45,6 +45,21 @@ impl FileOperations for ExtInodeNode {
         self.with_open_file(|file| {
             block_on_future(file.read_bytes_at(buffer, offset as u64)).map_err(map_ext_error)
         })
+    }
+
+    fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
+        if self.kind != NodeKind::File {
+            return Ok(PollEvents::empty());
+        }
+
+        let mut ready = PollEvents::empty();
+        if events.contains(PollEvents::READ) {
+            ready = ready | PollEvents::READ;
+        }
+        if events.contains(PollEvents::WRITE) {
+            ready = ready | PollEvents::WRITE;
+        }
+        Ok(ready)
     }
 
     fn size(&self) -> usize {

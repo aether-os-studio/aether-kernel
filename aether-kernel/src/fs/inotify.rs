@@ -277,8 +277,15 @@ impl InotifyFile {
     }
 
     fn push_event(&self, event: Vec<u8>) {
-        self.events.lock().push_back(event);
-        self.waiters.notify(PollEvents::READ);
+        let should_notify = {
+            let mut events = self.events.lock();
+            let was_empty = events.is_empty();
+            events.push_back(event);
+            was_empty
+        };
+        if should_notify {
+            self.waiters.notify(PollEvents::READ);
+        }
     }
 
     fn auto_remove_watch(&self, wd: i32, target: WatchTarget) {

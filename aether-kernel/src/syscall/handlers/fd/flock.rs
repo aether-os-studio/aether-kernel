@@ -3,7 +3,7 @@ use aether_vfs::{FlockOperation, PollEvents};
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
 use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::SyscallDisposition;
+use crate::syscall::{BlockResult, SyscallDisposition};
 
 const LOCK_SH: u64 = 1;
 const LOCK_EX: u64 = 2;
@@ -53,9 +53,19 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             return SyscallDisposition::Return(self.syscall_flock(fd, operation));
         }
 
-        self.restartable_blocking_syscall(
-            |ctx| ctx.syscall_flock(fd, operation),
-            |ctx| ctx.block_file(fd as u32, PollEvents::LOCK),
-        )
+        loop {
+            match self.syscall_flock(fd, operation) {
+                Ok(value) => return SyscallDisposition::ok(value),
+                Err(SysErr::Again) => match self.wait_file(fd as u32, PollEvents::LOCK) {
+                    Ok(BlockResult::File { ready: true }) => {}
+                    Ok(BlockResult::SignalInterrupted) => {
+                        return SyscallDisposition::err(SysErr::Intr);
+                    }
+                    Ok(_) => return SyscallDisposition::err(SysErr::Intr),
+                    Err(disposition) => return disposition,
+                },
+                Err(error) => return SyscallDisposition::err(error),
+            }
+        }
     }
 }

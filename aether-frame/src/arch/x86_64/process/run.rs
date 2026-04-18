@@ -15,7 +15,7 @@ use crate::mm::{PageTableArch, PhysFrame};
 use crate::process::{RunFuture, RunReason, RunResult};
 
 use super::super::fpu::FpuState;
-use super::context::UserContext;
+use super::context::{GeneralRegs, UserContext};
 
 const DEFAULT_KERNEL_STACK_SIZE: usize = 64 * 1024;
 const IA32_FS_BASE: u32 = 0xc000_0100;
@@ -36,16 +36,33 @@ pub struct CurrentRun {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct KernelContext {
     pub rip: u64,
     pub rsp: u64,
+    pub interrupts_enabled: u64,
     pub saved_rbx: u64,
     pub saved_rbp: u64,
     pub saved_r12: u64,
     pub saved_r13: u64,
     pub saved_r14: u64,
     pub saved_r15: u64,
+}
+
+impl Default for KernelContext {
+    fn default() -> Self {
+        Self {
+            rip: 0,
+            rsp: 0,
+            interrupts_enabled: 1,
+            saved_rbx: 0,
+            saved_rbp: 0,
+            saved_r12: 0,
+            saved_r13: 0,
+            saved_r14: 0,
+            saved_r15: 0,
+        }
+    }
 }
 
 pub type KernelContextEntry = unsafe extern "C" fn(*mut ()) -> !;
@@ -110,7 +127,6 @@ pub struct Process {
     address_space_root: PhysFrame,
     _kernel_stack: Box<[u64]>,
     kernel_stack_top: u64,
-    next_resume: ResumeMode,
     last_reason: Option<RunReason>,
 }
 
@@ -131,7 +147,6 @@ impl Process {
             address_space_root: builder.address_space_root,
             _kernel_stack: kernel_stack.into_boxed_slice(),
             kernel_stack_top: stack_top,
-            next_resume: ResumeMode::Iret,
             last_reason: None,
         }
     }
@@ -153,14 +168,13 @@ impl Process {
 
     #[must_use]
     pub fn fork_with_root(&self, address_space_root: PhysFrame) -> Self {
-        let mut process = ProcessBuilder::new(self.context.rip, self.context.rsp)
+        let mut process = ProcessBuilder::new(self.context.general.rip, self.context.general.rsp)
             .address_space_root(address_space_root)
             .kernel_stack_size(self._kernel_stack.len() * core::mem::size_of::<u64>())
             .build();
         process.context = self.context;
-        process.context.rax = 0;
+        process.context.general.rax = 0;
         process.fpu_state.copy_from(&self.fpu_state);
-        process.next_resume = self.next_resume;
         process
     }
 
@@ -194,7 +208,7 @@ impl Process {
 
         unsafe {
             let _ = CURRENT_RUNS.store(cpu_index, &raw mut current_run);
-            match self.next_resume {
+            match resume_mode_for_context(&self.context) {
                 ResumeMode::Iret => {
                     aether_x86_enter_user_iret(
                         &raw const self.context,
@@ -250,16 +264,23 @@ pub fn on_trap(trap: Trap, frame: &crate::arch::interrupt::TrapFrame) -> Option<
     let process = unsafe { &mut *(current_run.process as *mut Process) };
     process.context.capture_from_trap(frame);
 
+    if trap.kind() == TrapKind::Interrupt && !crate::preempt::need_resched() {
+        return None;
+    }
+
     let fault_address = super::fault_address_for_trap(trap);
     let reason = RunReason::from_trap(trap, fault_address);
-    process.next_resume = match trap.kind() {
-        // Keep syscall return on the iret path until the sysret fast path
-        // preserves privilege and return invariants across the continued
-        // kernel-side syscall execution model.
-        TrapKind::Syscall | TrapKind::Interrupt | TrapKind::Exception => ResumeMode::Iret,
-    };
     process.last_reason = Some(reason);
     Some(reason)
+}
+
+pub fn resume_current_user_context() {
+    let Some(current_run) = (unsafe { current_run_for_current_cpu().as_mut() }) else {
+        return;
+    };
+    let process = unsafe { &mut *(current_run.process as *mut Process) };
+    crate::arch::fpu::restore(&process.fpu_state);
+    restore_user_tls_bases(&process.context);
 }
 
 pub fn current_run_for_current_cpu() -> *mut CurrentRun {
@@ -320,6 +341,7 @@ pub fn initialize_kernel_context(
     KernelContext {
         rip: aether_x86_kernel_context_start as *const () as usize as u64,
         rsp,
+        interrupts_enabled: 1,
         ..KernelContext::default()
     }
 }
@@ -405,6 +427,18 @@ fn restore_user_tls_bases(context: &UserContext) {
     }
 }
 
+fn resume_mode_for_context(context: &UserContext) -> ResumeMode {
+    // The continued kernel-side syscall execution model still relies on iret
+    // for architecturally conservative returns after a trapped syscall.
+    let _ = context;
+    ResumeMode::Iret
+}
+
+const fn sanitized_user_rflags(rflags: u64) -> u64 {
+    const RFLAGS_FIXED: u64 = (1 << 1) | (1 << 9) | (1 << 21);
+    rflags | RFLAGS_FIXED
+}
+
 unsafe extern "C" {
     fn aether_x86_enter_user_iret(context: *const UserContext, user_cr3: u64, current_run: *mut ());
     fn aether_x86_enter_user_sysret(
@@ -420,19 +454,19 @@ unsafe extern "C" {
 global_asm!(
     r#"
     .macro LOAD_USER_GPRS ctx
-        mov r15, [\ctx + {r15_off}]
-        mov r14, [\ctx + {r14_off}]
-        mov r13, [\ctx + {r13_off}]
-        mov r12, [\ctx + {r12_off}]
-        mov r11, [\ctx + {r11_off}]
-        mov r10, [\ctx + {r10_off}]
-        mov r9, [\ctx + {r9_off}]
-        mov r8, [\ctx + {r8_off}]
-        mov rbp, [\ctx + {rbp_off}]
-        mov rbx, [\ctx + {rbx_off}]
-        mov rdx, [\ctx + {rdx_off}]
-        mov rcx, [\ctx + {rcx_off}]
-        mov rax, [\ctx + {rax_off}]
+        mov r15, [\ctx + {general_off} + {r15_off}]
+        mov r14, [\ctx + {general_off} + {r14_off}]
+        mov r13, [\ctx + {general_off} + {r13_off}]
+        mov r12, [\ctx + {general_off} + {r12_off}]
+        mov r11, [\ctx + {general_off} + {r11_off}]
+        mov r10, [\ctx + {general_off} + {r10_off}]
+        mov r9, [\ctx + {general_off} + {r9_off}]
+        mov r8, [\ctx + {general_off} + {r8_off}]
+        mov rbp, [\ctx + {general_off} + {rbp_off}]
+        mov rbx, [\ctx + {general_off} + {rbx_off}]
+        mov rdx, [\ctx + {general_off} + {rdx_off}]
+        mov rcx, [\ctx + {general_off} + {rcx_off}]
+        mov rax, [\ctx + {general_off} + {rax_off}]
     .endm
 
     .global aether_x86_enter_user_iret
@@ -453,22 +487,23 @@ global_asm!(
         mov rsi, rdi
 
         push {user_ss}
-        mov rax, [rsi + {rsp_off}]
+        mov rax, [rsi + {general_off} + {rsp_off}]
         push rax
-        mov rax, [rsi + {rflags_off}]
+        mov rax, [rsi + {general_off} + {rflags_off}]
+        or rax, {user_rflags_fixed}
         push rax
         push {user_cs}
-        mov rax, [rsi + {rip_off}]
+        mov rax, [rsi + {general_off} + {rip_off}]
         push rax
 
         LOAD_USER_GPRS rsi
-        mov rdi, [rsi + {rdi_off}]
-        mov rbp, [rsi + {rbp_off}]
-        mov rbx, [rsi + {rbx_off}]
-        mov rdx, [rsi + {rdx_off}]
-        mov rcx, [rsi + {rcx_off}]
-        mov rax, [rsi + {rax_off}]
-        mov rsi, [rsi + {rsi_off}]
+        mov rdi, [rsi + {general_off} + {rdi_off}]
+        mov rbp, [rsi + {general_off} + {rbp_off}]
+        mov rbx, [rsi + {general_off} + {rbx_off}]
+        mov rdx, [rsi + {general_off} + {rdx_off}]
+        mov rcx, [rsi + {general_off} + {rcx_off}]
+        mov rax, [rsi + {general_off} + {rax_off}]
+        mov rsi, [rsi + {general_off} + {rsi_off}]
         iretq
 
     .global aether_x86_enter_user_sysret
@@ -488,22 +523,23 @@ global_asm!(
         mov cr3, rsi
         mov rsi, rdi
 
-        mov rsp, [rsi + {rsp_off}]
-        mov rcx, [rsi + {rip_off}]
-        mov r11, [rsi + {rflags_off}]
-        mov r15, [rsi + {r15_off}]
-        mov r14, [rsi + {r14_off}]
-        mov r13, [rsi + {r13_off}]
-        mov r12, [rsi + {r12_off}]
-        mov r10, [rsi + {r10_off}]
-        mov r9, [rsi + {r9_off}]
-        mov r8, [rsi + {r8_off}]
-        mov rbp, [rsi + {rbp_off}]
-        mov rbx, [rsi + {rbx_off}]
-        mov rdx, [rsi + {rdx_off}]
-        mov rax, [rsi + {rax_off}]
-        mov rdi, [rsi + {rdi_off}]
-        mov rsi, [rsi + {rsi_off}]
+        mov rsp, [rsi + {general_off} + {rsp_off}]
+        mov rcx, [rsi + {general_off} + {rip_off}]
+        mov r11, [rsi + {general_off} + {rflags_off}]
+        or r11, {user_rflags_fixed}
+        mov r15, [rsi + {general_off} + {r15_off}]
+        mov r14, [rsi + {general_off} + {r14_off}]
+        mov r13, [rsi + {general_off} + {r13_off}]
+        mov r12, [rsi + {general_off} + {r12_off}]
+        mov r10, [rsi + {general_off} + {r10_off}]
+        mov r9, [rsi + {general_off} + {r9_off}]
+        mov r8, [rsi + {general_off} + {r8_off}]
+        mov rbp, [rsi + {general_off} + {rbp_off}]
+        mov rbx, [rsi + {general_off} + {rbx_off}]
+        mov rdx, [rsi + {general_off} + {rdx_off}]
+        mov rax, [rsi + {general_off} + {rax_off}]
+        mov rdi, [rsi + {general_off} + {rdi_off}]
+        mov rsi, [rsi + {general_off} + {rsi_off}]
         sysretq
 
     .global aether_x86_call_on_stack
@@ -524,6 +560,11 @@ global_asm!(
         lea rax, [rip + 1f]
         mov [rdi + {ctx_rip_off}], rax
         mov [rdi + {ctx_rsp_off}], rsp
+        pushfq
+        pop rax
+        shr rax, 9
+        and eax, 1
+        mov [rdi + {ctx_if_off}], rax
         mov [rdi + {ctx_saved_rbx_off}], rbx
         mov [rdi + {ctx_saved_rbp_off}], rbp
         mov [rdi + {ctx_saved_r12_off}], r12
@@ -538,6 +579,13 @@ global_asm!(
         mov r13, [rsi + {ctx_saved_r13_off}]
         mov r14, [rsi + {ctx_saved_r14_off}]
         mov r15, [rsi + {ctx_saved_r15_off}]
+        cmp qword ptr [rsi + {ctx_if_off}], 0
+        je 2f
+        sti
+        jmp 3f
+    2:
+        cli
+    3:
         jmp rax
     1:
         ret
@@ -559,30 +607,33 @@ global_asm!(
     run_kernel_if_off = const offset_of!(CurrentRun, kernel_interrupts_enabled),
     ctx_rip_off = const offset_of!(KernelContext, rip),
     ctx_rsp_off = const offset_of!(KernelContext, rsp),
+    ctx_if_off = const offset_of!(KernelContext, interrupts_enabled),
     ctx_saved_rbx_off = const offset_of!(KernelContext, saved_rbx),
     ctx_saved_rbp_off = const offset_of!(KernelContext, saved_rbp),
     ctx_saved_r12_off = const offset_of!(KernelContext, saved_r12),
     ctx_saved_r13_off = const offset_of!(KernelContext, saved_r13),
     ctx_saved_r14_off = const offset_of!(KernelContext, saved_r14),
     ctx_saved_r15_off = const offset_of!(KernelContext, saved_r15),
-    r15_off = const offset_of!(UserContext, r15),
-    r14_off = const offset_of!(UserContext, r14),
-    r13_off = const offset_of!(UserContext, r13),
-    r12_off = const offset_of!(UserContext, r12),
-    r11_off = const offset_of!(UserContext, r11),
-    r10_off = const offset_of!(UserContext, r10),
-    r9_off = const offset_of!(UserContext, r9),
-    r8_off = const offset_of!(UserContext, r8),
-    rdi_off = const offset_of!(UserContext, rdi),
-    rsi_off = const offset_of!(UserContext, rsi),
-    rbp_off = const offset_of!(UserContext, rbp),
-    rbx_off = const offset_of!(UserContext, rbx),
-    rdx_off = const offset_of!(UserContext, rdx),
-    rcx_off = const offset_of!(UserContext, rcx),
-    rax_off = const offset_of!(UserContext, rax),
-    rip_off = const offset_of!(UserContext, rip),
-    rsp_off = const offset_of!(UserContext, rsp),
-    rflags_off = const offset_of!(UserContext, rflags),
+    general_off = const offset_of!(UserContext, general),
+    r15_off = const offset_of!(GeneralRegs, r15),
+    r14_off = const offset_of!(GeneralRegs, r14),
+    r13_off = const offset_of!(GeneralRegs, r13),
+    r12_off = const offset_of!(GeneralRegs, r12),
+    r11_off = const offset_of!(GeneralRegs, r11),
+    r10_off = const offset_of!(GeneralRegs, r10),
+    r9_off = const offset_of!(GeneralRegs, r9),
+    r8_off = const offset_of!(GeneralRegs, r8),
+    rdi_off = const offset_of!(GeneralRegs, rdi),
+    rsi_off = const offset_of!(GeneralRegs, rsi),
+    rbp_off = const offset_of!(GeneralRegs, rbp),
+    rbx_off = const offset_of!(GeneralRegs, rbx),
+    rdx_off = const offset_of!(GeneralRegs, rdx),
+    rcx_off = const offset_of!(GeneralRegs, rcx),
+    rax_off = const offset_of!(GeneralRegs, rax),
+    rip_off = const offset_of!(GeneralRegs, rip),
+    rsp_off = const offset_of!(GeneralRegs, rsp),
+    rflags_off = const offset_of!(GeneralRegs, rflags),
+    user_rflags_fixed = const sanitized_user_rflags(0),
     user_cs = const super::super::interrupt::gdt::USER_CODE_SELECTOR as u64,
     user_ss = const super::super::interrupt::gdt::USER_DATA_SELECTOR as u64,
 );

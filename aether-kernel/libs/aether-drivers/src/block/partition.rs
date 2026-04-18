@@ -23,6 +23,7 @@ const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
 const GPT_ENTRY_SIZE_MIN: u32 = 128;
 const GPT_ENTRY_SIZE_MAX: u32 = 4096;
 const GPT_ENTRY_COUNT_MAX: u32 = 1024;
+const GPT_TABLE_READ_CHUNK_BYTES: usize = 64 * 1024;
 const EXTENDED_PARTITION_TYPES: [u8; 3] = [0x05, 0x0f, 0x85];
 
 pub fn probe(
@@ -179,29 +180,42 @@ fn parse_gpt(
         return Err(());
     }
 
-    let table_bytes = entry_count as usize * entry_size as usize;
-    let entry_blocks = table_bytes.div_ceil(geometry.block_size);
-    let table = read_lba_span(device, entry_lba, entry_blocks, geometry.block_size)?;
-
     let mut partitions = Vec::new();
-    for index in 0..entry_count as usize {
-        let offset = index * entry_size as usize;
-        let entry = table.get(offset..offset + entry_size as usize).ok_or(())?;
-        if entry[..16].iter().all(|byte| *byte == 0) {
-            continue;
+    let entry_size = entry_size as usize;
+    let entry_count = entry_count as usize;
+    let max_chunk_entries = (GPT_TABLE_READ_CHUNK_BYTES / entry_size).max(1);
+    let mut index = 0usize;
+    while index < entry_count {
+        let chunk_entries = (entry_count - index).min(max_chunk_entries);
+        let chunk = read_lba_range(
+            device.clone(),
+            entry_lba,
+            index.saturating_mul(entry_size),
+            chunk_entries.saturating_mul(entry_size),
+            geometry.block_size,
+        )?;
+
+        for chunk_index in 0..chunk_entries {
+            let offset = chunk_index * entry_size;
+            let entry = chunk.get(offset..offset + entry_size).ok_or(())?;
+            if entry[..16].iter().all(|byte| *byte == 0) {
+                continue;
+            }
+
+            let first_lba = read_u64(entry, 32)?;
+            let last_lba = read_u64(entry, 40)?;
+            if first_lba == 0 || last_lba < first_lba {
+                continue;
+            }
+
+            partitions.push(PartitionEntry {
+                index: (index + chunk_index) as u32 + 1,
+                first_lba,
+                block_count: last_lba.saturating_sub(first_lba).saturating_add(1),
+            });
         }
 
-        let first_lba = read_u64(entry, 32)?;
-        let last_lba = read_u64(entry, 40)?;
-        if first_lba == 0 || last_lba < first_lba {
-            continue;
-        }
-
-        partitions.push(PartitionEntry {
-            index: index as u32 + 1,
-            first_lba,
-            block_count: last_lba.saturating_sub(first_lba).saturating_add(1),
-        });
+        index += chunk_entries;
     }
 
     Ok(partitions)
@@ -322,6 +336,31 @@ fn read_lba_span(
         return Err(());
     }
     Ok(buffer)
+}
+
+fn read_lba_range(
+    device: Arc<dyn AsyncBlockDevice>,
+    lba: u64,
+    offset_bytes: usize,
+    len: usize,
+    block_size: usize,
+) -> Result<Vec<u8>, ()> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let start_block = offset_bytes / block_size;
+    let start_offset = offset_bytes % block_size;
+    let total_bytes = start_offset.checked_add(len).ok_or(())?;
+    let blocks = total_bytes.div_ceil(block_size);
+    let buffer = read_lba_span(
+        device,
+        lba.saturating_add(start_block as u64),
+        blocks,
+        block_size,
+    )?;
+    let end = start_offset.checked_add(len).ok_or(())?;
+    buffer.get(start_offset..end).ok_or(()).map(<[u8]>::to_vec)
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ()> {

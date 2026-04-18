@@ -1,5 +1,10 @@
 #![no_std]
 #![allow(dead_code)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::extend_with_drain)]
+#![allow(clippy::manual_is_multiple_of)]
+#![allow(clippy::never_loop)]
+#![allow(clippy::result_unit_err)]
 
 extern crate alloc;
 

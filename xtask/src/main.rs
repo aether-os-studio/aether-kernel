@@ -35,6 +35,7 @@ const ISO_IMAGE_NAME: &str = "aether-kernel.iso";
 const USER_DIR: &str = "user";
 const INITRAMFS_IMAGE_NAME: &str = "initramfs.img";
 const INITRAMFS_BUILD_SCRIPT: &str = "user/build_initramfs.sh";
+const RUST_PROFILE: &str = "release";
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Arch {
@@ -105,7 +106,7 @@ fn build(sh: &Shell, arch: Arch) -> Result<()> {
     println!("> Building kernel for {}", target);
     cmd!(
         sh,
-        "cargo build --release --target {target} -p {KERNEL_PKG}"
+        "cargo build --profile {RUST_PROFILE} --target {target} -p {KERNEL_PKG}"
     )
     .run()
     .context("Build failed")?;

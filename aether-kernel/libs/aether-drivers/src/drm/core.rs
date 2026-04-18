@@ -922,11 +922,16 @@ impl DrmDevice {
         event[24..28].copy_from_slice(&0u32.to_ne_bytes());
         event[28..32].copy_from_slice(&self.crtc_id.to_ne_bytes());
 
-        let mut state = self.state.lock();
-        state.event_queue.extend(event);
-        drop(state);
+        let should_notify = {
+            let mut state = self.state.lock();
+            let was_empty = state.event_queue.is_empty();
+            state.event_queue.extend(event);
+            was_empty
+        };
         self.bump();
-        self.waiters.notify(PollEvents::READ);
+        if should_notify {
+            self.waiters.notify(PollEvents::READ);
+        }
     }
 
     fn drain_events(&self, buffer: &mut [u8]) -> FsResult<usize> {

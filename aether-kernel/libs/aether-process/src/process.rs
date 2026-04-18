@@ -496,6 +496,22 @@ impl UserAddressSpace {
             .mmap_bytes(addr, len, flags, page_flags, bytes)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn mmap_image<S: ProgramImageSource + ?Sized>(
+        &mut self,
+        addr: u64,
+        len: u64,
+        flags: u64,
+        page_flags: MapFlags,
+        image: &S,
+        image_offset: u64,
+        image_len: u64,
+    ) -> Result<u64, BuildError> {
+        self.inner
+            .lock()
+            .mmap_image(addr, len, flags, page_flags, image, image_offset, image_len)
+    }
+
     pub fn mmap_physical(
         &mut self,
         addr: u64,
@@ -800,6 +816,50 @@ impl UserAddressSpaceInner {
             let end = core::cmp::min(start.saturating_add(PAGE_SIZE as usize), bytes.len());
             let slice = if start < bytes.len() {
                 &bytes[start..end]
+            } else {
+                &[]
+            };
+            self.map_page(base + page, page_flags, 0, slice)?;
+        }
+
+        self.record_vma(
+            base,
+            base + aligned_len,
+            page_flags,
+            UserVmaKind::Anonymous,
+            false,
+        );
+        Ok(base)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mmap_image<S: ProgramImageSource + ?Sized>(
+        &mut self,
+        addr: u64,
+        len: u64,
+        flags: u64,
+        page_flags: MapFlags,
+        image: &S,
+        image_offset: u64,
+        image_len: u64,
+    ) -> Result<u64, BuildError> {
+        if len == 0 {
+            return Err(BuildError::AddressOverflow);
+        }
+
+        let aligned_len = align_up(len, PAGE_SIZE);
+        let base = self.prepare_mapping_base(addr, aligned_len, flags)?;
+        let mut page_buffer = vec![0u8; PAGE_SIZE as usize];
+        for page in (0..aligned_len).step_by(PAGE_SIZE as usize) {
+            let slice = if page < image_len {
+                let copy_len = core::cmp::min(PAGE_SIZE, image_len - page) as usize;
+                image.read_exact_at(
+                    image_offset
+                        .checked_add(page)
+                        .ok_or(BuildError::AddressOverflow)? as usize,
+                    &mut page_buffer[..copy_len],
+                )?;
+                &page_buffer[..copy_len]
             } else {
                 &[]
             };

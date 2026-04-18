@@ -2,7 +2,7 @@ use core::fmt;
 
 use log::{Level, LevelFilter, Log, Metadata, Record, set_logger, set_max_level};
 
-use crate::libs::spin::SpinLock;
+use crate::libs::spin::{LocalIrqDisabled, SpinLock};
 
 const MAX_LOG_WRITERS: usize = 8;
 
@@ -22,7 +22,7 @@ pub enum RegisterWriterError {
     CapacityExceeded,
 }
 
-static LOG_WRITERS: SpinLock<[Option<LogWriter>; MAX_LOG_WRITERS]> =
+static LOG_WRITERS: SpinLock<[Option<LogWriter>; MAX_LOG_WRITERS], LocalIrqDisabled> =
     SpinLock::new([None; MAX_LOG_WRITERS]);
 
 pub struct KernelLogger;

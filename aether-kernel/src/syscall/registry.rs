@@ -1,4 +1,4 @@
-use aether_frame::libs::spin::SpinLock;
+use spin::Once;
 
 use super::{KernelSyscallContext, SyscallArgs, SyscallDisposition};
 
@@ -12,29 +12,19 @@ pub struct SyscallEntry {
     pub handle: fn(&mut dyn KernelSyscallContext, SyscallArgs) -> SyscallDisposition,
 }
 
-type SyscallHandler = fn(&mut dyn KernelSyscallContext, SyscallArgs) -> SyscallDisposition;
-
 pub struct SyscallDispatch {
     pub disposition: SyscallDisposition,
     pub name: &'static str,
 }
 
-struct SyscallRegistryState {
-    handlers: [Option<SyscallHandler>; MAX_SYSCALLS],
-    names: [Option<&'static str>; MAX_SYSCALLS],
-}
-
 pub struct SyscallRegistry {
-    state: SpinLock<SyscallRegistryState>,
+    entries: [Once<SyscallEntry>; MAX_SYSCALLS],
 }
 
 impl SyscallRegistry {
     pub const fn new() -> Self {
         Self {
-            state: SpinLock::new(SyscallRegistryState {
-                handlers: [None; MAX_SYSCALLS],
-                names: [None; MAX_SYSCALLS],
-            }),
+            entries: [const { Once::new() }; MAX_SYSCALLS],
         }
     }
 
@@ -45,9 +35,7 @@ impl SyscallRegistry {
             return;
         }
 
-        let mut state = self.state.lock();
-        state.handlers[number] = Some(syscall.handle);
-        state.names[number] = Some(syscall.name);
+        self.entries[number].call_once(|| syscall);
     }
 
     #[inline(never)]
@@ -57,13 +45,10 @@ impl SyscallRegistry {
         context: &mut dyn KernelSyscallContext,
         args: SyscallArgs,
     ) -> Option<SyscallDispatch> {
-        let guard = self.state.lock();
-        let handle = guard.handlers.get(number as usize).copied().flatten()?;
-        let name = guard.names.get(number as usize).copied().flatten()?;
-        drop(guard);
+        let entry = self.entries.get(number as usize)?.get()?;
         Some(SyscallDispatch {
-            disposition: handle(context, args),
-            name,
+            disposition: (entry.handle)(context, args),
+            name: entry.name,
         })
     }
 }

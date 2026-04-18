@@ -706,6 +706,7 @@ fn render_uptime() -> String {
     alloc::format!("{secs}.{centis:02} 0.00\n")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_uevent_file(
     class: DeviceClass,
     name: &str,
@@ -735,6 +736,7 @@ fn render_uevent_file(
     content
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_uevent_message(
     action: &str,
     class: DeviceClass,

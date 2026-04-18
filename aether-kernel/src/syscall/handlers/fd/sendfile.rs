@@ -49,22 +49,32 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         offset: u64,
         count: usize,
     ) -> SyscallDisposition {
-        self.restartable_blocking_syscall(
-            |ctx| match ctx.sendfile_step(out_fd, in_fd, offset, count)? {
-                SendfileStep::Complete(value) => Ok(value),
-                SendfileStep::WouldBlock(_) => Err(SysErr::Again),
-            },
-            |ctx| match ctx.sendfile_step(out_fd, in_fd, offset, count) {
+        loop {
+            match self.sendfile_step(out_fd, in_fd, offset, count) {
+                Ok(SendfileStep::Complete(value)) => return SyscallDisposition::ok(value),
                 Ok(SendfileStep::WouldBlock(SendfileBlock::Read)) => {
-                    ctx.block_file(in_fd as u32, PollEvents::READ)
+                    match self.wait_file(in_fd as u32, PollEvents::READ) {
+                        Ok(crate::syscall::BlockResult::File { ready: true }) => {}
+                        Ok(crate::syscall::BlockResult::SignalInterrupted) => {
+                            return SyscallDisposition::err(SysErr::Intr);
+                        }
+                        Ok(_) => return SyscallDisposition::err(SysErr::Intr),
+                        Err(disposition) => return disposition,
+                    }
                 }
                 Ok(SendfileStep::WouldBlock(SendfileBlock::Write)) => {
-                    ctx.block_file(out_fd as u32, PollEvents::WRITE)
+                    match self.wait_file(out_fd as u32, PollEvents::WRITE) {
+                        Ok(crate::syscall::BlockResult::File { ready: true }) => {}
+                        Ok(crate::syscall::BlockResult::SignalInterrupted) => {
+                            return SyscallDisposition::err(SysErr::Intr);
+                        }
+                        Ok(_) => return SyscallDisposition::err(SysErr::Intr),
+                        Err(disposition) => return disposition,
+                    }
                 }
-                Ok(SendfileStep::Complete(value)) => SyscallDisposition::ok(value),
-                Err(error) => SyscallDisposition::err(error),
-            },
-        )
+                Err(error) => return SyscallDisposition::err(error),
+            }
+        }
     }
 
     fn sendfile_step(

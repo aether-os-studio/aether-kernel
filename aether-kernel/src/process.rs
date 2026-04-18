@@ -13,7 +13,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
 
-use aether_frame::libs::spin::SpinLock;
+use aether_frame::libs::spin::{LocalIrqDisabled, SpinLock};
 use aether_frame::mm::MapFlags;
 use aether_frame::process::KernelContext;
 use aether_process::BuiltProcess;
@@ -23,7 +23,7 @@ use crate::credentials::Credentials;
 use crate::errno::SysResult;
 use crate::fs::{FdTable, FileSystemIdentity, LinuxStatFs};
 use crate::rootfs::ProcessFsContext;
-use crate::signal::{SigSet, SignalState};
+use crate::signal::SignalState;
 use crate::syscall::{BlockResult, SyscallArgs};
 
 pub type Pid = u32;
@@ -95,7 +95,7 @@ pub struct KernelProcess {
     pub pending_exec: Option<BuiltProcess>,
     pub pending_syscall: Option<PendingSyscall>,
     pub pending_syscall_name: &'static str,
-    pub pending_poll: Option<PendingPollState>,
+    pub pending_file_waits: Vec<PendingPollRegistration>,
     pub mmap_regions: Vec<MmapRegion>,
     pub vfork_parent: Option<Pid>,
     pub clear_child_tid: Option<u64>,
@@ -111,23 +111,6 @@ pub struct KernelProcess {
 pub struct PendingPollRegistration {
     pub fd: u32,
     pub events: PollEvents,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PendingPollFd {
-    pub fd: i32,
-    pub events: i16,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PendingPollState {
-    pub user_fds: u64,
-    pub deadline_nanos: Option<u64>,
-    pub timeout_nanos: Option<u64>,
-    pub timeout_address: Option<u64>,
-    pub restore_sigmask: Option<SigSet>,
-    pub items: Vec<PendingPollFd>,
-    pub registrations: Vec<PendingPollRegistration>,
 }
 
 #[derive(Clone)]
@@ -148,6 +131,16 @@ pub struct MmapRegion {
 }
 
 impl KernelProcess {
+    pub(crate) fn running_snapshot(&self) -> RunningProcessSnapshot {
+        RunningProcessSnapshot {
+            pid: self.identity.pid,
+            parent: self.identity.parent,
+            name: *self.prctl.name_bytes(),
+            credentials: self.credentials.clone(),
+            umask: self.umask,
+        }
+    }
+
     fn mmap_backing_is_mergeable(lhs: &MmapRegion, rhs: &MmapRegion) -> bool {
         if lhs.end != rhs.start
             || lhs.page_flags != rhs.page_flags
@@ -451,11 +444,12 @@ struct ZombieProcess {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RunningProcess {
-    parent: Option<Pid>,
-    name: [u8; 16],
-    credentials: Credentials,
-    umask: u16,
+pub(crate) struct RunningProcessSnapshot {
+    pub pid: Pid,
+    pub parent: Option<Pid>,
+    pub name: [u8; 16],
+    pub credentials: Credentials,
+    pub umask: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,9 +546,7 @@ pub trait ProcessServices {
 
 pub struct ProcessManager {
     next_pid: Pid,
-    run_queue: VecDeque<Pid>,
     processes: BTreeMap<Pid, ProcessBox>,
-    running: BTreeMap<Pid, RunningProcess>,
     zombies: BTreeMap<Pid, ZombieProcess>,
     parent_children: BTreeMap<Pid, BTreeSet<Pid>>,
     child_events: BTreeMap<Pid, VecDeque<ChildEvent>>,
@@ -562,7 +554,8 @@ pub struct ProcessManager {
     blocked_timers: BTreeMap<u64, BTreeSet<Pid>>,
     next_timer_deadline_nanos: Option<u64>,
     blocked_futexes: BTreeMap<u64, BTreeSet<Pid>>,
-    file_wait_queue: Arc<SpinLock<VecDeque<Pid>>>,
+    file_wait_queue: Arc<SpinLock<VecDeque<Pid>, LocalIrqDisabled>>,
+    file_wait_enqueued: Arc<SpinLock<BTreeSet<Pid>, LocalIrqDisabled>>,
     file_wait_pending: Arc<AtomicBool>,
     file_wait_registrations: BTreeMap<Pid, Vec<FileWaitRegistration>>,
     initial_files: FdTable,

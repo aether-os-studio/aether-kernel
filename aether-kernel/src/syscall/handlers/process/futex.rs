@@ -107,6 +107,14 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
 
         let command = operation & FUTEX_CMD_MASK;
+        if let Some(result) = self.process.wake_result.take() {
+            return match result {
+                BlockResult::Futex { woke: true } => SyscallDisposition::ok(0),
+                BlockResult::SignalInterrupted => SyscallDisposition::err(SysErr::Intr),
+                _ => SyscallDisposition::err(SysErr::Intr),
+            };
+        }
+
         if command != FUTEX_WAIT && command != FUTEX_WAIT_BITSET {
             return SyscallDisposition::Return(
                 self.syscall_futex(uaddr, operation, val, timeout, uaddr2, val3),
@@ -120,15 +128,21 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         } else {
             FUTEX_BITSET_MATCH_ANY
         };
-        self.resumable_blocking_syscall(
-            |_ctx, result| match result {
-                BlockResult::Futex { woke: true } => SyscallDisposition::ok(0),
-                BlockResult::SignalInterrupted => SyscallDisposition::err(SysErr::Intr),
-                _ => SyscallDisposition::err(SysErr::Intr),
-            },
-            |ctx| ctx.syscall_futex(uaddr, operation, val, timeout, uaddr2, val3),
-            |ctx| ctx.block_futex(uaddr, bitset),
-        )
+        match self.read_futex_word(uaddr) {
+            Ok(current) if current != val as u32 => return SyscallDisposition::err(SysErr::Again),
+            Ok(_) => {}
+            Err(error) => return SyscallDisposition::err(error),
+        }
+
+        let _ = timeout;
+        let _ = uaddr2;
+
+        match self.wait_futex(uaddr, bitset) {
+            Ok(BlockResult::Futex { woke: true }) => SyscallDisposition::ok(0),
+            Ok(BlockResult::SignalInterrupted) => SyscallDisposition::err(SysErr::Intr),
+            Ok(_) => SyscallDisposition::err(SysErr::Intr),
+            Err(disposition) => disposition,
+        }
     }
 
     fn read_futex_word(&self, uaddr: u64) -> SysResult<u32> {

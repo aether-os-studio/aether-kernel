@@ -11,6 +11,7 @@ use crate::errno::{SysErr, SysResult};
 use crate::rootfs::filesystem::MountedNode;
 use crate::rootfs::path::normalize_absolute_path;
 
+#[derive(Clone)]
 pub struct MountNamespace {
     root_stack: alloc::vec::Vec<MountedNode>,
     mounts: BTreeMap<String, alloc::vec::Vec<MountedNode>>,

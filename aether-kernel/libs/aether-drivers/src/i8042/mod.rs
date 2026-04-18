@@ -246,9 +246,12 @@ impl I8042Controller {
         if code == 0 {
             return;
         }
-        self.keyboard
-            .emit(EV_KEY, code, if pressed { 1 } else { 0 });
-        self.keyboard.emit(EV_SYN, SYN_REPORT, 0);
+        let events = [
+            self.keyboard
+                .emit_event_spec(EV_KEY, code, if pressed { 1 } else { 0 }),
+            self.keyboard.emit_event_spec(EV_SYN, SYN_REPORT, 0),
+        ];
+        self.keyboard.emit_events(&events);
     }
 
     fn handle_mouse_data(&self, data: u8) {
@@ -294,17 +297,22 @@ impl I8042Controller {
             0
         };
 
+        let mut events = [crate::input::LinuxInputEvent::default(); 7];
+        let mut count = 0usize;
         let mut emitted = false;
         if x != 0 {
-            mouse.emit(EV_REL, REL_X, x as i32);
+            events[count] = mouse.emit_event_spec(EV_REL, REL_X, x as i32);
+            count += 1;
             emitted = true;
         }
         if y != 0 {
-            mouse.emit(EV_REL, REL_Y, y as i32);
+            events[count] = mouse.emit_event_spec(EV_REL, REL_Y, y as i32);
+            count += 1;
             emitted = true;
         }
         if wheel != 0 {
-            mouse.emit(EV_REL, REL_WHEEL, -(wheel as i32));
+            events[count] = mouse.emit_event_spec(EV_REL, REL_WHEEL, -(wheel as i32));
+            count += 1;
             emitted = true;
         }
 
@@ -312,23 +320,29 @@ impl I8042Controller {
             let mut state = self.state.lock();
             if state.mouse_left_pressed != left {
                 state.mouse_left_pressed = left;
-                mouse.emit(EV_KEY, BTN_LEFT, if left { 1 } else { 0 });
+                events[count] = mouse.emit_event_spec(EV_KEY, BTN_LEFT, if left { 1 } else { 0 });
+                count += 1;
                 emitted = true;
             }
             if state.mouse_right_pressed != right {
                 state.mouse_right_pressed = right;
-                mouse.emit(EV_KEY, BTN_RIGHT, if right { 1 } else { 0 });
+                events[count] = mouse.emit_event_spec(EV_KEY, BTN_RIGHT, if right { 1 } else { 0 });
+                count += 1;
                 emitted = true;
             }
             if state.mouse_middle_pressed != middle {
                 state.mouse_middle_pressed = middle;
-                mouse.emit(EV_KEY, BTN_MIDDLE, if middle { 1 } else { 0 });
+                events[count] =
+                    mouse.emit_event_spec(EV_KEY, BTN_MIDDLE, if middle { 1 } else { 0 });
+                count += 1;
                 emitted = true;
             }
         }
 
         if emitted {
-            mouse.emit(EV_SYN, SYN_REPORT, 0);
+            events[count] = mouse.emit_event_spec(EV_SYN, SYN_REPORT, 0);
+            count += 1;
+            mouse.emit_events(&events[..count]);
         }
     }
 }

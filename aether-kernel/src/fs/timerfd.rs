@@ -251,7 +251,10 @@ impl TimerFdFile {
             state.expires_ns = 0;
         } else {
             let delta = now_ns.saturating_sub(state.expires_ns);
-            let periods = delta / state.interval_ns + 1;
+            let periods = delta
+                .checked_div(state.interval_ns)
+                .expect("non-zero interval already checked")
+                + 1;
             state.ticks = state.ticks.saturating_add(periods);
             state.expires_ns = state
                 .expires_ns
@@ -301,6 +304,7 @@ impl TimerFdFile {
         let (old_spec, notify_readable) = {
             let mut registry = REGISTRY.lock();
             let mut state = self.inner.lock();
+            let was_readable = state.ticks != 0;
             let _ =
                 Self::refresh_due_locked(&mut registry, self.id, self.clock, &mut state, now_ns);
 
@@ -337,7 +341,7 @@ impl TimerFdFile {
                 }
             }
 
-            (old, state.ticks != 0)
+            (old, !was_readable && state.ticks != 0)
         };
 
         self.bump();
@@ -500,6 +504,7 @@ fn wake_expired_class(class: DeadlineClass, now_ns: u64) {
             let notify_readable = {
                 let mut registry = REGISTRY.lock();
                 let mut state = timerfd.inner.lock();
+                let was_readable = state.ticks != 0;
                 let changed = TimerFdFile::refresh_due_locked(
                     &mut registry,
                     timerfd.id,
@@ -507,7 +512,7 @@ fn wake_expired_class(class: DeadlineClass, now_ns: u64) {
                     &mut state,
                     now_ns,
                 );
-                changed && state.ticks != 0
+                changed && !was_readable && state.ticks != 0
             };
             if notify_readable {
                 timerfd.bump();

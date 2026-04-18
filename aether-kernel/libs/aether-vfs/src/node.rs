@@ -217,6 +217,7 @@ pub struct DirectoryNode {
 }
 
 impl DirectoryNode {
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(name: impl Into<String>) -> NodeRef {
         Self::new_with_mode(name, 0o040755)
     }
@@ -427,6 +428,7 @@ pub struct FileNode {
 }
 
 impl FileNode {
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(name: impl Into<String>, operations: Arc<dyn FileOperations>) -> NodeRef {
         Self::new_with_mode(name, 0o100644, 0, operations)
     }
@@ -546,6 +548,15 @@ pub struct MemoryFile {
     bytes: Arc<[u8]>,
 }
 
+enum CowMemoryBytes {
+    Borrowed(&'static [u8]),
+    Owned(Vec<u8>),
+}
+
+pub struct CowMemoryFile {
+    bytes: SpinLock<CowMemoryBytes>,
+}
+
 pub struct MutableMemoryFile {
     bytes: SpinLock<Vec<u8>>,
 }
@@ -565,6 +576,25 @@ impl MutableMemoryFile {
     pub fn new(bytes: &[u8]) -> Self {
         Self {
             bytes: SpinLock::new(bytes.to_vec()),
+        }
+    }
+}
+
+impl CowMemoryFile {
+    pub fn new_borrowed(bytes: &'static [u8]) -> Self {
+        Self {
+            bytes: SpinLock::new(CowMemoryBytes::Borrowed(bytes)),
+        }
+    }
+
+    fn materialize(bytes: &mut CowMemoryBytes) -> &mut Vec<u8> {
+        if let CowMemoryBytes::Borrowed(borrowed) = bytes {
+            *bytes = CowMemoryBytes::Owned(borrowed.to_vec());
+        }
+
+        match bytes {
+            CowMemoryBytes::Owned(owned) => owned,
+            CowMemoryBytes::Borrowed(_) => unreachable!("borrowed bytes not materialized"),
         }
     }
 }
@@ -730,6 +760,12 @@ impl SharedMemoryFile {
     }
 }
 
+impl Default for SharedMemoryFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileOperations for MutableMemoryFile {
     fn as_any(&self) -> &dyn Any {
         self
@@ -762,6 +798,52 @@ impl FileOperations for MutableMemoryFile {
 
     fn truncate(&self, size: usize) -> FsResult<()> {
         self.bytes.lock().resize(size, 0);
+        Ok(())
+    }
+}
+
+impl FileOperations for CowMemoryFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn read(&self, offset: usize, buffer: &mut [u8]) -> FsResult<usize> {
+        let bytes = self.bytes.lock();
+        let bytes = match &*bytes {
+            CowMemoryBytes::Borrowed(bytes) => *bytes,
+            CowMemoryBytes::Owned(bytes) => bytes.as_slice(),
+        };
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+
+        let len = core::cmp::min(buffer.len(), bytes.len() - offset);
+        buffer[..len].copy_from_slice(&bytes[offset..offset + len]);
+        Ok(len)
+    }
+
+    fn write(&self, offset: usize, buffer: &[u8]) -> FsResult<usize> {
+        let mut bytes = self.bytes.lock();
+        let bytes = Self::materialize(&mut bytes);
+        let end = offset.saturating_add(buffer.len());
+        if end > bytes.len() {
+            bytes.resize(end, 0);
+        }
+        bytes[offset..end].copy_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn size(&self) -> usize {
+        let bytes = self.bytes.lock();
+        match &*bytes {
+            CowMemoryBytes::Borrowed(bytes) => bytes.len(),
+            CowMemoryBytes::Owned(bytes) => bytes.len(),
+        }
+    }
+
+    fn truncate(&self, size: usize) -> FsResult<()> {
+        let mut bytes = self.bytes.lock();
+        Self::materialize(&mut bytes).resize(size, 0);
         Ok(())
     }
 }
@@ -914,6 +996,7 @@ pub struct SymlinkNode {
 }
 
 impl SymlinkNode {
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(name: impl Into<String>, target: impl Into<String>) -> NodeRef {
         Self::new_with_mode(name, target, 0o120777)
     }

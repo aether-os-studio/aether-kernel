@@ -2,7 +2,7 @@ use core::fmt::{self, Write};
 
 use lazy_static::lazy_static;
 
-use crate::libs::spin::SpinLock;
+use crate::libs::spin::{LocalIrqDisabled, SpinLock};
 
 use super::io;
 
@@ -21,7 +21,7 @@ const FIFO_ENABLE_CLEAR_14B: u8 = 0xC7;
 const MODEM_CONTROL_DTR_RTS_OUT2: u8 = 0x0B;
 
 lazy_static! {
-    static ref SERIAL1: SpinLock<Uart16550> = {
+    static ref SERIAL1: SpinLock<Uart16550, LocalIrqDisabled> = {
         let mut uart = Uart16550::new(COM1_BASE);
         uart.init();
         SpinLock::new(uart)

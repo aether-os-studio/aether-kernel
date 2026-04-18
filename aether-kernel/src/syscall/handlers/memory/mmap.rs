@@ -1,11 +1,10 @@
-use alloc::vec;
-
 use aether_frame::mm::MapFlags;
 use aether_frame::mm::PAGE_SIZE;
 use aether_vfs::{MmapCachePolicy, MmapKind, MmapRequest};
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
+use crate::fs::NodeImageSource;
 use crate::process::{
     KernelProcess, MmapRegion, MmapRegionBacking, ProcessServices, ProcessSyscallContext,
 };
@@ -70,26 +69,24 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let size = node.size();
         let start = core::cmp::min(offset as usize, size);
         let end = core::cmp::min(start.saturating_add(len as usize), size);
-        let mut bytes = vec![0; end.saturating_sub(start)];
-        let mut filled = 0usize;
-        while filled < bytes.len() {
-            let read = node
-                .read(start + filled, &mut bytes[filled..])
-                .map_err(SysErr::from)?;
-            if read == 0 {
-                break;
-            }
-            filled += read;
-        }
-        bytes.truncate(filled);
+        let source = NodeImageSource::new(node).ok_or(SysErr::Inval)?;
 
         process
             .task
             .address_space
-            .mmap_bytes(address, len, flags, page_flags, &bytes)
+            .mmap_image(
+                address,
+                len,
+                flags,
+                page_flags,
+                &source,
+                start as u64,
+                end.saturating_sub(start) as u64,
+            )
             .map_err(SysErr::from)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn map_file_region(
         process: &mut KernelProcess,
         file: aether_vfs::SharedOpenFile,

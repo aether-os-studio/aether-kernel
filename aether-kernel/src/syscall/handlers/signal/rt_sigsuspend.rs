@@ -34,10 +34,18 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         mask: u64,
         sigsetsize: u64,
     ) -> SyscallDisposition {
-        self.resumable_blocking_syscall(
-            |_ctx, _result| SyscallDisposition::err(SysErr::Intr),
-            |ctx| ctx.syscall_rt_sigsuspend(mask, sigsetsize),
-            |ctx| ctx.block_signal_suspend(),
-        )
+        match self.syscall_rt_sigsuspend(mask, sigsetsize) {
+            Err(SysErr::Again) => {}
+            Ok(value) => return SyscallDisposition::ok(value),
+            Err(error) => return SyscallDisposition::err(error),
+        }
+
+        match self.wait_signal_suspend() {
+            Ok(crate::syscall::BlockResult::SignalInterrupted) => {
+                SyscallDisposition::err(SysErr::Intr)
+            }
+            Ok(_) => SyscallDisposition::err(SysErr::Intr),
+            Err(disposition) => disposition,
+        }
     }
 }

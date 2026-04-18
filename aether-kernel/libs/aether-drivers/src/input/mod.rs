@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use aether_device::{DeviceClass, DeviceMetadata, DeviceNode, KernelDevice, SysfsEntry};
 use aether_frame::interrupt::timer;
-use aether_frame::libs::spin::SpinLock;
+use aether_frame::libs::spin::{LocalIrqDisabled, SpinLock};
 use aether_vfs::{
     FileNode, FileOperations, FsError, FsResult, IoctlResponse, NodeRef, PollEvents,
     SharedWaitListener, WaitQueue,
@@ -36,7 +36,8 @@ const IOC_SIZESHIFT: u64 = IOC_TYPESHIFT + IOC_TYPEBITS;
 
 static NEXT_EVENT_INDEX: AtomicUsize = AtomicUsize::new(0);
 static NEXT_INPUT_INDEX: AtomicUsize = AtomicUsize::new(0);
-static LISTENERS: SpinLock<Vec<Weak<dyn InputEventSink>>> = SpinLock::new(Vec::new());
+static LISTENERS: SpinLock<Vec<Weak<dyn InputEventSink>>, LocalIrqDisabled> =
+    SpinLock::new(Vec::new());
 
 pub const fn input_bitmap_bytes(nr: usize) -> usize {
     nr.div_ceil(8)
@@ -243,7 +244,7 @@ struct InputDeviceInner {
     topology: InputTopology,
     descriptor: InputDeviceDescriptor,
     clock_id: AtomicI32,
-    state: SpinLock<InputDeviceState>,
+    state: SpinLock<InputDeviceState, LocalIrqDisabled>,
     version: AtomicU64,
     waiters: WaitQueue,
 }
@@ -311,21 +312,40 @@ impl InputDevice {
     }
 
     pub fn emit(&self, type_: u16, code: u16, value: i32) {
-        let event = LinuxInputEvent::now(type_, code, value, self.inner.clock_id());
-        self.emit_event(event);
+        self.emit_event(self.emit_event_spec(type_, code, value));
+    }
+
+    pub fn emit_event_spec(&self, type_: u16, code: u16, value: i32) -> LinuxInputEvent {
+        LinuxInputEvent::now(type_, code, value, self.inner.clock_id())
     }
 
     pub fn emit_event(&self, event: LinuxInputEvent) {
-        {
-            let mut state = self.inner.state.lock();
-            if state.queue.len() >= INPUT_EVENT_QUEUE_CAPACITY {
-                let _ = state.queue.pop_front();
-            }
-            state.queue.push_back(event);
+        self.emit_events(core::slice::from_ref(&event));
+    }
+
+    pub fn emit_events(&self, events: &[LinuxInputEvent]) {
+        if events.is_empty() {
+            return;
         }
+
+        let should_notify = {
+            let mut state = self.inner.state.lock();
+            let was_empty = state.queue.is_empty();
+            for event in events {
+                if state.queue.len() >= INPUT_EVENT_QUEUE_CAPACITY {
+                    let _ = state.queue.pop_front();
+                }
+                state.queue.push_back(*event);
+            }
+            was_empty
+        };
         self.inner.bump_version();
-        self.inner.waiters.notify(PollEvents::READ);
-        notify_listeners(self, event);
+        if should_notify {
+            self.inner.waiters.notify(PollEvents::READ);
+        }
+        for event in events {
+            notify_listeners(self, *event);
+        }
     }
 }
 
@@ -563,16 +583,23 @@ impl FileOperations for EvdevFile {
             return Err(FsError::InvalidInput);
         }
 
-        let mut state = self.device.state.lock();
-        if state.queue.is_empty() {
-            return Err(FsError::WouldBlock);
+        let max_events = buffer.len() / event_size;
+        let mut events = Vec::with_capacity(max_events.min(INPUT_EVENT_QUEUE_CAPACITY));
+        {
+            let mut state = self.device.state.lock();
+            if state.queue.is_empty() {
+                return Err(FsError::WouldBlock);
+            }
+            while events.len() < max_events {
+                let Some(event) = state.queue.pop_front() else {
+                    break;
+                };
+                events.push(event);
+            }
         }
 
         let mut written = 0usize;
-        while written + event_size <= buffer.len() {
-            let Some(event) = state.queue.pop_front() else {
-                break;
-            };
+        for event in events {
             buffer[written..written + event_size].copy_from_slice(&event.to_bytes());
             written += event_size;
         }

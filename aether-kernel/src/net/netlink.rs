@@ -193,15 +193,20 @@ impl NetlinkSocket {
     }
 
     fn enqueue(&self, message: NetlinkMessage) -> SysResult<()> {
-        let mut state = self.state.lock();
-        let next = state.recv_bytes.saturating_add(message.data.len());
-        if next > state.rcvbuf {
-            return Err(SysErr::NoBufs);
+        let should_notify = {
+            let mut state = self.state.lock();
+            let next = state.recv_bytes.saturating_add(message.data.len());
+            if next > state.rcvbuf {
+                return Err(SysErr::NoBufs);
+            }
+            let was_empty = state.recv_queue.is_empty();
+            state.recv_bytes = next;
+            state.recv_queue.push_back(message);
+            was_empty
+        };
+        if should_notify {
+            self.waiters.notify(PollEvents::READ);
         }
-        state.recv_bytes = next;
-        state.recv_queue.push_back(message);
-        drop(state);
-        self.waiters.notify(PollEvents::READ);
         Ok(())
     }
 

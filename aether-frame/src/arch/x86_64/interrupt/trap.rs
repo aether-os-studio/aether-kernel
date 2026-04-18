@@ -147,6 +147,9 @@ extern "C" fn aether_x86_dispatch_trap(frame: &mut TrapFrame) -> *const CurrentR
     let result = if crate::process::on_trap(trap, frame).is_some() {
         current_run_for_current_cpu()
     } else {
+        if trap.privilege() == crate::interrupt::PrivilegeLevel::User {
+            crate::process::resume_current_user_context();
+        }
         ptr::null()
     };
     if kernel_trap {

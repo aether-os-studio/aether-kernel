@@ -136,19 +136,22 @@ impl FileOperations for PipeEndpoint {
 
         let mut inner = self.state.inner.lock();
         if !inner.bytes.is_empty() {
+            let was_full = inner.bytes.len() == PIPE_CAPACITY;
             let count = buffer.len().min(inner.bytes.len());
             for slot in &mut buffer[..count] {
                 *slot = inner.bytes.pop_front().expect("pipe data available");
             }
             drop(inner);
             self.state.bump();
-            self.state.waiters.notify(PollEvents::WRITE);
+            if was_full {
+                self.state.waiters.notify(PollEvents::WRITE);
+            }
             return Ok(count);
         }
         if inner.writers == 0 {
             return Ok(0);
         }
-        return Err(FsError::WouldBlock);
+        Err(FsError::WouldBlock)
     }
 
     fn write(&self, _offset: usize, buffer: &[u8]) -> FsResult<usize> {
@@ -172,12 +175,15 @@ impl FileOperations for PipeEndpoint {
                 return Err(FsError::WouldBlock);
             }
 
+            let was_empty = inner.bytes.is_empty();
             let chunk = (buffer.len() - written).min(space);
             inner.bytes.extend(&buffer[written..written + chunk]);
             written += chunk;
             drop(inner);
             self.state.bump();
-            self.state.waiters.notify(PollEvents::READ);
+            if was_empty {
+                self.state.waiters.notify(PollEvents::READ);
+            }
         }
         Ok(written)
     }
@@ -186,16 +192,18 @@ impl FileOperations for PipeEndpoint {
         let inner = self.state.inner.lock();
         let mut ready = PollEvents::empty();
 
-        if self.kind == PipeEndpointKind::Read && events.contains(PollEvents::READ) {
-            if !inner.bytes.is_empty() || inner.writers == 0 {
-                ready = ready | PollEvents::READ;
-            }
+        if self.kind == PipeEndpointKind::Read
+            && events.contains(PollEvents::READ)
+            && (!inner.bytes.is_empty() || inner.writers == 0)
+        {
+            ready = ready | PollEvents::READ;
         }
 
-        if self.kind == PipeEndpointKind::Write && events.contains(PollEvents::WRITE) {
-            if inner.readers == 0 || inner.bytes.len() < PIPE_CAPACITY {
-                ready = ready | PollEvents::WRITE;
-            }
+        if self.kind == PipeEndpointKind::Write
+            && events.contains(PollEvents::WRITE)
+            && (inner.readers == 0 || inner.bytes.len() < PIPE_CAPACITY)
+        {
+            ready = ready | PollEvents::WRITE;
         }
 
         if self.kind == PipeEndpointKind::Write && inner.readers == 0 {

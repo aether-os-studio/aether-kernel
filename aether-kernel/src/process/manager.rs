@@ -4,7 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use aether_frame::libs::spin::SpinLock;
+use aether_frame::libs::spin::{LocalIrqDisabled, SpinLock};
 use aether_frame::process::{RunReason, RunResult};
 use aether_process::{BuildError, BuiltProcess};
 use aether_vfs::{OpenFileDescription, PollEvents, SharedWaitListener, WaitListener};
@@ -12,8 +12,7 @@ use aether_vfs::{OpenFileDescription, PollEvents, SharedWaitListener, WaitListen
 use super::{
     ChildEvent, ChildEventKind, DispatchWork, FileWaitRegistration, KernelProcess,
     PendingPollRegistration, Pid, ProcessBlock, ProcessBox, ProcessIdentity, ProcessManager,
-    ProcessServices, ProcessState, ProcessStateSnapshot, RunningProcess, ScheduleEvent,
-    ZombieProcess,
+    ProcessServices, ProcessState, ProcessStateSnapshot, ScheduleEvent, ZombieProcess,
 };
 use crate::arch::ArchContext;
 use crate::arch::{
@@ -28,18 +27,30 @@ use crate::syscall::{self, BlockResult, BlockType, SyscallArgs, SyscallDispositi
 
 struct FileBlockListener {
     pid: Pid,
-    queue: Arc<SpinLock<alloc::collections::VecDeque<Pid>>>,
+    queue: Arc<SpinLock<alloc::collections::VecDeque<Pid>, LocalIrqDisabled>>,
+    enqueued: Arc<SpinLock<alloc::collections::BTreeSet<Pid>, LocalIrqDisabled>>,
     pending: Arc<core::sync::atomic::AtomicBool>,
 }
 
 impl WaitListener for FileBlockListener {
     fn wake(&self, _events: PollEvents) {
-        self.queue.lock().push_back(self.pid);
+        let should_queue = {
+            let mut enqueued = self.enqueued.lock();
+            enqueued.insert(self.pid)
+        };
+        if should_queue {
+            self.queue.lock().push_back(self.pid);
+        }
         self.pending.store(true, Ordering::Release);
+        aether_frame::preempt::request_reschedule();
     }
 }
 
 impl ProcessManager {
+    fn enqueue_runnable_pid(&mut self, pid: Pid, assigned_cpu: usize) {
+        crate::processor::enqueue_runnable_pid(pid, assigned_cpu);
+    }
+
     fn unregister_file_wait_registrations(&mut self, pid: Pid) {
         let Some(registrations) = self.file_wait_registrations.remove(&pid) else {
             return;
@@ -64,8 +75,7 @@ impl ProcessManager {
                     .then_some(BlockResult::File { ready: true })
             }
             ProcessState::Blocked(ProcessBlock::Poll { .. }) => {
-                let pending = process.pending_poll.as_ref()?;
-                if pending.registrations.iter().any(|registration| {
+                if process.pending_file_waits.iter().any(|registration| {
                     let Some(descriptor) = process.files.get(registration.fd) else {
                         return true;
                     };
@@ -183,16 +193,13 @@ impl ProcessManager {
             ProcessState::Blocked(ProcessBlock::File { fd, events }) => {
                 vec![PendingPollRegistration { fd, events }]
             }
-            ProcessState::Blocked(ProcessBlock::Poll { .. }) => process
-                .pending_poll
-                .as_ref()
-                .map(|pending| pending.registrations.clone())
-                .unwrap_or_default(),
+            ProcessState::Blocked(ProcessBlock::Poll { .. }) => process.pending_file_waits.clone(),
             _ => return,
         };
         let listener: SharedWaitListener = Arc::new(FileBlockListener {
             pid,
             queue: self.file_wait_queue.clone(),
+            enqueued: self.file_wait_enqueued.clone(),
             pending: self.file_wait_pending.clone(),
         });
         let mut waiter_registrations = Vec::new();
@@ -269,7 +276,9 @@ impl ProcessManager {
         };
         process.wake_result = Some(result);
         process.state = ProcessState::Runnable;
-        self.run_queue.push_back(pid);
+        let assigned_cpu = process.assigned_cpu;
+        let _ = process;
+        self.enqueue_runnable_pid(pid, assigned_cpu);
     }
 
     fn track_blocked_process(&mut self, pid: Pid, state: ProcessState) {
@@ -356,9 +365,7 @@ impl ProcessManager {
     pub fn new() -> Self {
         Self {
             next_pid: 1,
-            run_queue: alloc::collections::VecDeque::new(),
             processes: alloc::collections::BTreeMap::new(),
-            running: alloc::collections::BTreeMap::new(),
             zombies: alloc::collections::BTreeMap::new(),
             parent_children: alloc::collections::BTreeMap::new(),
             child_events: alloc::collections::BTreeMap::new(),
@@ -367,6 +374,7 @@ impl ProcessManager {
             next_timer_deadline_nanos: None,
             blocked_futexes: alloc::collections::BTreeMap::new(),
             file_wait_queue: Arc::new(SpinLock::new(alloc::collections::VecDeque::new())),
+            file_wait_enqueued: Arc::new(SpinLock::new(alloc::collections::BTreeSet::new())),
             file_wait_pending: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             file_wait_registrations: alloc::collections::BTreeMap::new(),
             initial_files: crate::fs::FdTable::empty(),
@@ -411,7 +419,7 @@ impl ProcessManager {
                 pending_exec: None,
                 pending_syscall: None,
                 pending_syscall_name: "",
-                pending_poll: None,
+                pending_file_waits: Vec::new(),
                 mmap_regions: Vec::new(),
                 vfork_parent: None,
                 clear_child_tid: None,
@@ -423,7 +431,7 @@ impl ProcessManager {
                 state: ProcessState::Runnable,
             }),
         );
-        self.run_queue.push_back(pid);
+        self.enqueue_runnable_pid(pid, aether_frame::arch::cpu::current_cpu_index());
         Ok(pid)
     }
 
@@ -447,35 +455,23 @@ impl ProcessManager {
     }
 
     pub fn take_next_process(&mut self) -> DispatchWork {
-        let current_cpu = aether_frame::arch::cpu::current_cpu_index();
-        let mut scanned = self.run_queue.len();
-        loop {
-            if scanned == 0 {
-                return DispatchWork::Idle;
-            }
-            scanned -= 1;
-            let Some(pid) = self.run_queue.pop_front() else {
-                return DispatchWork::Idle;
-            };
+        crate::processor::try_take_current_cpu_work(self).unwrap_or(DispatchWork::Idle)
+    }
 
-            let Some(mut process) = self.processes.remove(&pid) else {
-                continue;
-            };
-            if process.assigned_cpu != current_cpu {
-                self.processes.insert(pid, process);
-                self.run_queue.push_back(pid);
-                continue;
-            }
-            self.running.insert(
-                pid,
-                RunningProcess {
-                    parent: process.identity.parent,
-                    name: *process.prctl.name_bytes(),
-                    credentials: process.credentials.clone(),
-                    umask: process.umask,
-                },
-            );
+    pub(crate) fn take_next_process_for_pid(
+        &mut self,
+        pid: Pid,
+        current_cpu: usize,
+    ) -> Option<DispatchWork> {
+        let mut process = self.processes.remove(&pid)?;
+        if process.assigned_cpu != current_cpu {
+            let assigned_cpu = process.assigned_cpu;
+            self.processes.insert(pid, process);
+            self.enqueue_runnable_pid(pid, assigned_cpu);
+            return None;
+        }
 
+        if process.pending_syscall.is_none() {
             match process
                 .signals
                 .take_next_delivery(crate::arch::supports_user_handlers())
@@ -508,8 +504,10 @@ impl ProcessManager {
                             kind: ChildEventKind::Stopped(info.signal),
                         },
                     );
-                    let _ = self.running.remove(&pid);
-                    return DispatchWork::Event(ScheduleEvent::Interrupted { pid, vector: 0 });
+                    return Some(DispatchWork::Event(ScheduleEvent::Interrupted {
+                        pid,
+                        vector: 0,
+                    }));
                 }
                 SignalDelivery::Continue(_) => {
                     if matches!(process.state, ProcessState::Stopped(_)) {
@@ -521,46 +519,38 @@ impl ProcessManager {
                                 kind: ChildEventKind::Continued,
                             },
                         );
-                        let _ = self.running.remove(&pid);
                         self.processes.insert(pid, process);
-                        self.run_queue.push_back(pid);
-                        return DispatchWork::Event(ScheduleEvent::Interrupted { pid, vector: 0 });
+                        self.enqueue_runnable_pid(pid, current_cpu);
+                        return Some(DispatchWork::Event(ScheduleEvent::Interrupted {
+                            pid,
+                            vector: 0,
+                        }));
                     }
                 }
             }
-
-            if let ProcessState::Exited(status) = process.state {
-                self.finish_process_exit(&mut process);
-                let parent = process.identity.parent;
-                let _ = self.running.remove(&pid);
-                self.zombies.insert(pid, ZombieProcess { parent });
-                self.notify_child_event(
-                    parent,
-                    ChildEvent {
-                        pid,
-                        kind: ChildEventKind::Exited(status),
-                    },
-                );
-                return DispatchWork::Event(ScheduleEvent::Exited { pid, status });
-            }
-
-            if process.pending_syscall.is_some() && process.kernel_context.is_some() {
-                if process.kernel_cpu != Some(current_cpu) {
-                    self.processes.insert(pid, process);
-                    self.run_queue.push_back(pid);
-                    continue;
-                }
-                process.state = ProcessState::Running;
-                return DispatchWork::KernelSyscall(process);
-            }
-
-            process.state = ProcessState::Running;
-            return DispatchWork::Process(process);
         }
-    }
 
-    pub(crate) fn mark_process_ran(&mut self, pid: Pid) {
-        let _ = self.running.remove(&pid);
+        if let ProcessState::Exited(status) = process.state {
+            self.finish_process_exit(&mut process);
+            let parent = process.identity.parent;
+            self.zombies.insert(pid, ZombieProcess { parent });
+            self.notify_child_event(
+                parent,
+                ChildEvent {
+                    pid,
+                    kind: ChildEventKind::Exited(status),
+                },
+            );
+            return Some(DispatchWork::Event(ScheduleEvent::Exited { pid, status }));
+        }
+
+        if process.pending_syscall.is_some() {
+            process.state = ProcessState::Running;
+            return Some(DispatchWork::KernelSyscall(process));
+        }
+
+        process.state = ProcessState::Running;
+        Some(DispatchWork::Process(process))
     }
 
     pub fn finish_process<S: ProcessServices>(
@@ -570,7 +560,6 @@ impl ProcessManager {
         services: S,
     ) -> ScheduleEvent {
         let pid = process.identity.pid;
-        let _ = self.running.remove(&pid);
         let event = match result.reason {
             RunReason::Syscall => {
                 let syscall_number = result.context.syscall_number();
@@ -757,35 +746,6 @@ impl ProcessManager {
         event
     }
 
-    pub(crate) fn finish_kernel_syscall_context(
-        &mut self,
-        mut process: ProcessBox,
-    ) -> ScheduleEvent {
-        let pid = process.identity.pid;
-        let pending = process
-            .pending_syscall
-            .expect("kernel syscall context requires a saved syscall");
-        let event = match process.state {
-            ProcessState::Exited(status) => ScheduleEvent::Exited { pid, status },
-            _ => ScheduleEvent::Syscall {
-                pid,
-                number: pending.number,
-                name: process.pending_syscall_name,
-            },
-        };
-
-        if !matches!(process.state, ProcessState::Blocked(_)) {
-            let _ = self.commit_pending_exec(&mut process);
-            process.pending_syscall = None;
-            process.pending_syscall_name = "";
-            process.kernel_context = None;
-            process.kernel_cpu = None;
-        }
-
-        self.requeue_process(process);
-        event
-    }
-
     fn commit_pending_exec(&mut self, process: &mut KernelProcess) -> bool {
         let Some(new_task) = process.pending_exec.take() else {
             return false;
@@ -801,7 +761,7 @@ impl ProcessManager {
         let pid = process.identity.pid;
         match process.state {
             ProcessState::Runnable => {
-                self.run_queue.push_back(pid);
+                self.enqueue_runnable_pid(pid, process.assigned_cpu);
                 self.processes.insert(pid, process);
             }
             ProcessState::Stopped(_) | ProcessState::Blocked(_) => {
@@ -810,7 +770,7 @@ impl ProcessManager {
                     self.unregister_file_wait_registrations(pid);
                     process.wake_result = Some(result);
                     process.state = ProcessState::Runnable;
-                    self.run_queue.push_back(pid);
+                    self.enqueue_runnable_pid(pid, process.assigned_cpu);
                     self.processes.insert(pid, process);
                 } else {
                     self.track_blocked_process(pid, process.state);
@@ -842,22 +802,21 @@ impl ProcessManager {
 
     #[allow(dead_code)]
     pub fn has_live_processes(&self) -> bool {
-        !self.processes.is_empty() || !self.running.is_empty()
+        !self.processes.is_empty() || crate::processor::has_running_processes()
     }
 
     #[allow(dead_code)]
     pub fn state_snapshots(&self) -> Vec<ProcessStateSnapshot> {
-        self.processes
+        let mut snapshots = self
+            .processes
             .iter()
             .map(|(pid, process)| ProcessStateSnapshot {
                 pid: *pid,
                 state: process.state,
             })
-            .chain(self.running.keys().map(|pid| ProcessStateSnapshot {
-                pid: *pid,
-                state: ProcessState::Running,
-            }))
-            .collect()
+            .collect::<Vec<_>>();
+        snapshots.extend(crate::processor::running_state_snapshots());
+        snapshots
     }
 
     pub fn procfs_snapshot(&self, pid: Pid) -> Option<crate::process::ProcFsProcessSnapshot> {
@@ -872,23 +831,15 @@ impl ProcessManager {
             });
         }
 
-        self.running
-            .get(&pid)
-            .map(|process| crate::process::ProcFsProcessSnapshot {
-                pid,
-                parent: process.parent,
-                state: ProcessState::Running,
-                name: process.name,
-                credentials: process.credentials.clone(),
-                umask: process.umask,
-            })
+        crate::processor::running_procfs_snapshot(pid)
     }
 
     pub(crate) fn insert_cloned_process(&mut self, process: KernelProcess) -> Pid {
         let pid = process.identity.pid;
+        let assigned_cpu = process.assigned_cpu;
         self.track_child_link(process.identity.parent, pid);
         self.processes.insert(pid, Box::new(process));
-        self.run_queue.push_back(pid);
+        self.enqueue_runnable_pid(pid, assigned_cpu);
         pid
     }
 
@@ -947,9 +898,12 @@ impl ProcessManager {
 
         let mut ready = alloc::collections::BTreeSet::new();
         let mut queue = self.file_wait_queue.lock();
+        let mut enqueued = self.file_wait_enqueued.lock();
         while let Some(pid) = queue.pop_front() {
+            enqueued.remove(&pid);
             ready.insert(pid);
         }
+        drop(enqueued);
         drop(queue);
 
         for pid in ready {
@@ -1009,6 +963,7 @@ impl ProcessManager {
 
     pub(crate) fn notify_signal(&mut self, pid: Pid, info: SignalInfo) {
         let mut child_event = None;
+        let mut queue_assigned_cpu = None;
         let Some(mut_state) = self.processes.get(&pid).map(|process| process.state) else {
             return;
         };
@@ -1018,7 +973,7 @@ impl ProcessManager {
                 return;
             };
             process.state = ProcessState::Runnable;
-            self.run_queue.push_back(pid);
+            queue_assigned_cpu = Some(process.assigned_cpu);
             child_event = Some((
                 process.identity.parent,
                 ChildEvent {
@@ -1042,7 +997,7 @@ impl ProcessManager {
                 process.signals.leave_sigsuspend();
                 process.wake_result = Some(BlockResult::SignalInterrupted);
                 process.state = ProcessState::Runnable;
-                self.run_queue.push_back(pid);
+                queue_assigned_cpu = Some(process.assigned_cpu);
             }
 
             if let ProcessState::Blocked(ProcessBlock::Timer {
@@ -1071,15 +1026,18 @@ impl ProcessManager {
                 });
                 unblock_block = Some(process.state);
                 process.state = ProcessState::Runnable;
-                self.run_queue.push_back(pid);
+                queue_assigned_cpu = Some(process.assigned_cpu);
             }
 
             if let ProcessState::Blocked(ProcessBlock::Poll { .. }) = process.state {
                 process.wake_result = Some(BlockResult::SignalInterrupted);
                 unblock_block = Some(process.state);
                 process.state = ProcessState::Runnable;
-                self.run_queue.push_back(pid);
+                queue_assigned_cpu = Some(process.assigned_cpu);
             }
+        }
+        if let Some(assigned_cpu) = queue_assigned_cpu {
+            self.enqueue_runnable_pid(pid, assigned_cpu);
         }
         if let Some(blocked_state) = unblock_block {
             self.untrack_blocked_process(pid, blocked_state);
@@ -1102,7 +1060,9 @@ impl ProcessManager {
                 value: child_pid as u64,
             });
             parent.state = ProcessState::Runnable;
-            self.run_queue.push_back(parent_pid);
+            let assigned_cpu = parent.assigned_cpu;
+            let _ = parent;
+            self.enqueue_runnable_pid(parent_pid, assigned_cpu);
         }
     }
 
@@ -1161,7 +1121,9 @@ impl ProcessManager {
             };
             process.wake_result = Some(BlockResult::Futex { woke: true });
             process.state = ProcessState::Runnable;
-            self.run_queue.push_back(pid);
+            let assigned_cpu = process.assigned_cpu;
+            let _ = process;
+            self.enqueue_runnable_pid(pid, assigned_cpu);
             woke += 1;
         }
         woke
@@ -1239,7 +1201,9 @@ impl ProcessManager {
                     value: event.pid as u64,
                 });
                 parent_process.state = ProcessState::Runnable;
-                self.run_queue.push_back(parent_pid);
+                let assigned_cpu = parent_process.assigned_cpu;
+                let _ = parent_process;
+                self.enqueue_runnable_pid(parent_pid, assigned_cpu);
                 if matches!(event.kind, ChildEventKind::Exited(_)) {
                     let parent = self
                         .zombies

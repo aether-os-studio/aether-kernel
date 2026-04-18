@@ -50,7 +50,7 @@ const NVME_INTERRUPT_VECTOR_INDEX: u16 = 0;
 const NVME_IO_COMPLETION_PHASE: u16 = 0x1;
 const NVME_COMPLETION_TIMEOUT_NS: u64 = 1_000_000_000;
 const NVME_CID_SLOTS: usize = 256;
-const NVME_TRANSFER_PAGES: usize = 1;
+const NVME_TRANSFER_PAGES: usize = 4;
 const NVME_USE_POLLING_COMPLETIONS: bool = true;
 
 static NVME_INTERRUPT_REGISTRY: SpinLock<BTreeMap<u8, Arc<NvmeTransport>>> =

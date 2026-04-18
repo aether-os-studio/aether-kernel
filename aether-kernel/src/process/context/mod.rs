@@ -92,22 +92,52 @@ impl<S> ProcessSyscallContext<'_, S> {
             .ok_or(SysErr::BadFd)
     }
 
-    pub(crate) fn block_file(&mut self, fd: u32, events: PollEvents) -> SyscallDisposition {
-        SyscallDisposition::block(BlockType::File { fd, events })
+    fn block_current_syscall(&mut self, block: BlockType) -> SyscallDisposition {
+        SyscallDisposition::block(block)
     }
 
-    pub(crate) fn block_poll(&mut self, deadline_nanos: Option<u64>) -> SyscallDisposition {
-        SyscallDisposition::block(BlockType::Poll { deadline_nanos })
+    fn take_wake_result_or_block(
+        &mut self,
+        block: BlockType,
+    ) -> Result<BlockResult, SyscallDisposition> {
+        if let Some(result) = self.process.wake_result.take() {
+            return Ok(result);
+        }
+        Err(self.block_current_syscall(block))
     }
 
-    pub(crate) fn block_timer(
+    pub(crate) fn wait_file(
+        &mut self,
+        fd: u32,
+        events: PollEvents,
+    ) -> Result<BlockResult, SyscallDisposition> {
+        self.take_wake_result_or_block(BlockType::File { fd, events })
+    }
+
+    pub(crate) fn wait_poll(
+        &mut self,
+        deadline_nanos: Option<u64>,
+        registrations: &[crate::process::PendingPollRegistration],
+    ) -> Result<BlockResult, SyscallDisposition> {
+        if let Some(result) = self.process.wake_result.take() {
+            self.process.pending_file_waits.clear();
+            return Ok(result);
+        }
+        self.process.pending_file_waits.clear();
+        self.process
+            .pending_file_waits
+            .extend_from_slice(registrations);
+        Err(self.block_current_syscall(BlockType::Poll { deadline_nanos }))
+    }
+
+    pub(crate) fn wait_timer(
         &mut self,
         target_nanos: u64,
         request_nanos: u64,
         rmtp: u64,
         flags: u64,
-    ) -> SyscallDisposition {
-        SyscallDisposition::block(BlockType::Timer {
+    ) -> Result<BlockResult, SyscallDisposition> {
+        self.take_wake_result_or_block(BlockType::Timer {
             target_nanos,
             request_nanos,
             rmtp,
@@ -115,70 +145,33 @@ impl<S> ProcessSyscallContext<'_, S> {
         })
     }
 
-    pub(crate) fn block_futex(&mut self, uaddr: u64, bitset: u32) -> SyscallDisposition {
-        SyscallDisposition::block(BlockType::Futex { uaddr, bitset })
+    pub(crate) fn wait_futex(
+        &mut self,
+        uaddr: u64,
+        bitset: u32,
+    ) -> Result<BlockResult, SyscallDisposition> {
+        self.take_wake_result_or_block(BlockType::Futex { uaddr, bitset })
     }
 
-    pub(crate) fn block_wait_child(
+    pub(crate) fn wait_wait_child(
         &mut self,
         pid: i32,
         status_ptr: u64,
         options: u64,
-    ) -> SyscallDisposition {
-        SyscallDisposition::block(BlockType::WaitChild {
+    ) -> Result<BlockResult, SyscallDisposition> {
+        self.take_wake_result_or_block(BlockType::WaitChild {
             pid,
             status_ptr,
             options,
         })
     }
 
-    pub(crate) fn block_vfork(&mut self, child: u32) -> SyscallDisposition {
-        SyscallDisposition::block(BlockType::Vfork { child })
+    pub(crate) fn wait_vfork(&mut self, child: u32) -> Result<BlockResult, SyscallDisposition> {
+        self.take_wake_result_or_block(BlockType::Vfork { child })
     }
 
-    pub(crate) fn block_signal_suspend(&mut self) -> SyscallDisposition {
-        SyscallDisposition::block(BlockType::SignalSuspend)
-    }
-
-    pub(crate) fn restartable_blocking_syscall<F, B>(
-        &mut self,
-        mut syscall: F,
-        mut block: B,
-    ) -> SyscallDisposition
-    where
-        F: FnMut(&mut Self) -> SysResult<u64>,
-        B: FnMut(&mut Self) -> SyscallDisposition,
-    {
-        loop {
-            let _ = self.process.wake_result.take();
-            match syscall(self) {
-                Ok(value) => return SyscallDisposition::ok(value),
-                Err(SysErr::Again) => return block(self),
-                Err(error) => return SyscallDisposition::err(error),
-            }
-        }
-    }
-
-    pub(crate) fn resumable_blocking_syscall<R, F, B>(
-        &mut self,
-        resume: R,
-        syscall: F,
-        block: B,
-    ) -> SyscallDisposition
-    where
-        R: FnOnce(&mut Self, BlockResult) -> SyscallDisposition,
-        F: FnOnce(&mut Self) -> SysResult<u64>,
-        B: FnOnce(&mut Self) -> SyscallDisposition,
-    {
-        if let Some(result) = self.process.wake_result.take() {
-            return resume(self, result);
-        }
-
-        match syscall(self) {
-            Ok(value) => SyscallDisposition::ok(value),
-            Err(SysErr::Again) => block(self),
-            Err(error) => SyscallDisposition::err(error),
-        }
+    pub(crate) fn wait_signal_suspend(&mut self) -> Result<BlockResult, SyscallDisposition> {
+        self.take_wake_result_or_block(BlockType::SignalSuspend)
     }
 
     pub(crate) fn file_blocking_syscall<F>(
@@ -202,7 +195,21 @@ impl<S> ProcessSyscallContext<'_, S> {
                 Err(error) => SyscallDisposition::err(error),
             };
         }
-        self.restartable_blocking_syscall(syscall, |ctx| ctx.block_file(fd, events))
+
+        loop {
+            match syscall(self) {
+                Ok(value) => return SyscallDisposition::ok(value),
+                Err(SysErr::Again) => match self.wait_file(fd, events) {
+                    Ok(BlockResult::File { ready: true }) => {}
+                    Ok(BlockResult::SignalInterrupted) => {
+                        return SyscallDisposition::err(SysErr::Intr);
+                    }
+                    Ok(_) => return SyscallDisposition::err(SysErr::Intr),
+                    Err(disposition) => return disposition,
+                },
+                Err(error) => return SyscallDisposition::err(error),
+            }
+        }
     }
 }
 

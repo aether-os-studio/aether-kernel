@@ -2,7 +2,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use aether_frame::libs::spin::SpinLock;
+use aether_frame::libs::spin::{LocalIrqDisabled, SpinLock};
 
 use crate::{
     FileOperations, FsError, FsResult, NodeRef, PollEvents, SharedWaitListener, WaitListener,
@@ -172,7 +172,7 @@ impl EpollCtlOp {
 }
 
 struct EpollNotifier {
-    ready: SpinLock<BTreeMap<u64, EpollEvents>>,
+    ready: SpinLock<BTreeMap<u64, EpollEvents>, LocalIrqDisabled>,
     waiters: WaitQueue,
 }
 
@@ -182,13 +182,23 @@ impl EpollNotifier {
             return;
         }
 
-        let mut ready = self.ready.lock();
-        ready
-            .entry(fd)
-            .and_modify(|stored| stored.insert(events.bits()))
-            .or_insert(events);
-        drop(ready);
-        self.waiters.notify(PollEvents::READ);
+        let should_notify = {
+            let mut ready = self.ready.lock();
+            match ready.get_mut(&fd) {
+                Some(stored) => {
+                    let previous = stored.bits();
+                    stored.insert(events.bits());
+                    stored.bits() != previous
+                }
+                None => {
+                    ready.insert(fd, events);
+                    true
+                }
+            }
+        };
+        if should_notify {
+            self.waiters.notify(PollEvents::READ);
+        }
     }
 
     fn take_ready(&self, max_events: usize) -> Vec<(u64, EpollEvents)> {

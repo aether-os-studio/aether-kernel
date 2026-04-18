@@ -24,7 +24,7 @@ const AF_UNIX: i32 = 1;
 const SOCK_STREAM: u32 = 1;
 const SOCK_DGRAM: u32 = 2;
 const SOCK_SEQPACKET: u32 = 5;
-const UNIX_BUFFER_SIZE: usize = 256 * 1024;
+const UNIX_BUFFER_SIZE: usize = 64 * 1024;
 const MSG_PEEK: u64 = 0x0002;
 const MSG_TRUNC: u32 = 0x0020;
 
@@ -96,11 +96,13 @@ struct UnixSocket {
 struct UnixSocketState {
     bound_address: Option<UnixAddress>,
     peer: Option<Weak<UnixSocket>>,
+    pending_connect: Option<Weak<UnixSocket>>,
     peer_credentials: Option<SocketCredentials>,
     established: bool,
     listening: bool,
     backlog_limit: usize,
     backlog: VecDeque<Arc<UnixSocket>>,
+    pending_connects: Vec<Weak<UnixSocket>>,
     recv_stream: VecDeque<UnixStreamChunk>,
     recv_packets: VecDeque<UnixPacket>,
     recv_size: usize,
@@ -115,8 +117,11 @@ struct UnixSocketState {
 #[derive(Clone)]
 struct UnixStateSnapshot {
     peer: Option<Weak<UnixSocket>>,
+    pending_connect: Option<Weak<UnixSocket>>,
     established: bool,
     listening: bool,
+    backlog_len: usize,
+    backlog_limit: usize,
     backlog_nonempty: bool,
     recv_stream_nonempty: bool,
     recv_packets_nonempty: bool,
@@ -124,6 +129,7 @@ struct UnixStateSnapshot {
     rcvbuf: usize,
     shut_rd: bool,
     shut_wr: bool,
+    closed: bool,
 }
 
 #[derive(Clone)]
@@ -220,11 +226,13 @@ impl UnixSocket {
             state: SpinLock::new(UnixSocketState {
                 bound_address: None,
                 peer: None,
+                pending_connect: None,
                 peer_credentials: None,
                 established: false,
                 listening: false,
                 backlog_limit: 0,
                 backlog: VecDeque::new(),
+                pending_connects: Vec::new(),
                 recv_stream: VecDeque::new(),
                 recv_packets: VecDeque::new(),
                 recv_size: 0,
@@ -309,8 +317,11 @@ impl UnixSocket {
         let state = self.state.lock();
         UnixStateSnapshot {
             peer: state.peer.clone(),
+            pending_connect: state.pending_connect.clone(),
             established: state.established,
             listening: state.listening,
+            backlog_len: state.backlog.len(),
+            backlog_limit: state.backlog_limit,
             backlog_nonempty: !state.backlog.is_empty(),
             recv_stream_nonempty: !state.recv_stream.is_empty(),
             recv_packets_nonempty: !state.recv_packets.is_empty(),
@@ -318,11 +329,59 @@ impl UnixSocket {
             rcvbuf: state.rcvbuf,
             shut_rd: state.shut_rd,
             shut_wr: state.shut_wr,
+            closed: state.closed,
         }
     }
 
     fn peer_from_snapshot(snapshot: &UnixStateSnapshot) -> Option<Arc<UnixSocket>> {
         snapshot.peer.as_ref().and_then(Weak::upgrade)
+    }
+
+    fn pending_connect_target_from_snapshot(
+        snapshot: &UnixStateSnapshot,
+    ) -> Option<Arc<UnixSocket>> {
+        snapshot.pending_connect.as_ref().and_then(Weak::upgrade)
+    }
+
+    fn same_socket(socket: &Arc<UnixSocket>, weak: &Weak<UnixSocket>) -> bool {
+        weak.ptr_eq(&Arc::downgrade(socket))
+    }
+
+    fn collect_pending_connects_locked(state: &mut UnixSocketState) -> Vec<Arc<UnixSocket>> {
+        let mut connectors = Vec::new();
+        state.pending_connects.retain(|weak| {
+            if let Some(socket) = weak.upgrade() {
+                connectors.push(socket);
+                true
+            } else {
+                false
+            }
+        });
+        connectors
+    }
+
+    fn notify_pending_connects(listener: &Arc<UnixSocket>, events: PollEvents) {
+        let connectors = {
+            let mut state = listener.state.lock();
+            Self::collect_pending_connects_locked(&mut state)
+        };
+        for connector in connectors {
+            connector.notify(events);
+        }
+    }
+
+    fn clear_pending_connect(client: &Arc<UnixSocket>) {
+        let pending_listener = {
+            let mut client_state = client.state.lock();
+            client_state.pending_connect.take()
+        };
+        let Some(listener) = pending_listener.and_then(|weak| weak.upgrade()) else {
+            return;
+        };
+        let mut listener_state = listener.state.lock();
+        listener_state
+            .pending_connects
+            .retain(|weak| !Self::same_socket(client, weak));
     }
 
     fn stream_peer_eof_snapshot(&self, snapshot: &UnixStateSnapshot) -> bool {
@@ -340,10 +399,10 @@ impl UnixSocket {
         if snapshot.listening {
             return snapshot.backlog_nonempty;
         }
-        if snapshot.shut_rd {
-            return true;
-        }
         if self.is_stream_like() {
+            if snapshot.shut_rd {
+                return true;
+            }
             snapshot.recv_stream_nonempty || self.stream_peer_eof_snapshot(snapshot)
         } else {
             snapshot.recv_packets_nonempty
@@ -351,11 +410,20 @@ impl UnixSocket {
     }
 
     fn write_ready_snapshot(&self, snapshot: &UnixStateSnapshot) -> bool {
-        if snapshot.shut_wr || snapshot.listening {
+        if snapshot.shut_wr {
             return false;
+        }
+        if snapshot.listening {
+            return snapshot.backlog_limit != 0 && snapshot.backlog_len < snapshot.backlog_limit;
         }
         if self.is_packet_like() {
             return true;
+        }
+        if let Some(listener) = Self::pending_connect_target_from_snapshot(snapshot) {
+            let listener_state = listener.state.lock();
+            return !listener_state.listening
+                || (listener_state.backlog_limit != 0
+                    && listener_state.backlog.len() < listener_state.backlog_limit);
         }
         let Some(peer) = Self::peer_from_snapshot(snapshot) else {
             return false;
@@ -381,6 +449,7 @@ impl UnixSocket {
             return Err(SysErr::Again);
         }
         let count = min(space, buffer.len());
+        let was_empty = state.recv_size == 0;
         state.recv_stream.push_back(UnixStreamChunk {
             data: buffer[..count].to_vec(),
             read_offset: 0,
@@ -388,7 +457,11 @@ impl UnixSocket {
         });
         state.recv_size = state.recv_size.saturating_add(count);
         drop(state);
-        peer.notify(PollEvents::READ);
+        if was_empty {
+            peer.notify(PollEvents::READ);
+        } else {
+            peer.bump();
+        }
         Ok(count)
     }
 
@@ -410,6 +483,7 @@ impl UnixSocket {
         if next > state.rcvbuf {
             return Err(SysErr::Again);
         }
+        let was_empty = state.recv_size == 0;
         state.recv_packets.push_back(UnixPacket {
             data: buffer.to_vec(),
             source,
@@ -417,7 +491,11 @@ impl UnixSocket {
         });
         state.recv_size = next;
         drop(state);
-        peer.notify(PollEvents::READ);
+        if was_empty {
+            peer.notify(PollEvents::READ);
+        } else {
+            peer.bump();
+        }
         Ok(buffer.len())
     }
 
@@ -517,6 +595,7 @@ impl UnixSocket {
             ));
         }
 
+        let was_full = state.recv_size == state.rcvbuf;
         while written < buffer.len() {
             let remove_front;
             let mut consumed = 0usize;
@@ -554,7 +633,7 @@ impl UnixSocket {
 
         let peer = state.peer.as_ref().and_then(Weak::upgrade);
         drop(state);
-        if let Some(peer) = peer {
+        if was_full && let Some(peer) = peer {
             peer.notify(PollEvents::WRITE);
         }
         Ok(Self::receive_from_ancillary(
@@ -585,6 +664,7 @@ impl UnixSocket {
             return Err(SysErr::Again);
         };
 
+        let was_full = state.recv_size == state.rcvbuf;
         let count = min(buffer.len(), packet.data.len());
         buffer[..count].copy_from_slice(&packet.data[..count]);
         if !peek {
@@ -592,7 +672,10 @@ impl UnixSocket {
         }
         let peer = state.peer.as_ref().and_then(Weak::upgrade);
         drop(state);
-        if !peek && let Some(peer) = peer {
+        if !peek
+            && was_full
+            && let Some(peer) = peer
+        {
             peer.notify(PollEvents::WRITE);
         }
 
@@ -621,7 +704,11 @@ impl UnixSocket {
 
 impl Drop for UnixSocket {
     fn drop(&mut self) {
-        let bound_address = self.state.lock().bound_address.clone();
+        let (bound_address, pending_connects) = {
+            let mut state = self.state.lock();
+            let pending_connects = Self::collect_pending_connects_locked(&mut state);
+            (state.bound_address.clone(), pending_connects)
+        };
         if let Some(address) = bound_address {
             let mut bound = BOUND_SOCKETS.lock();
             let remove = bound
@@ -631,6 +718,10 @@ impl Drop for UnixSocket {
             if remove {
                 let _ = bound.remove(&address);
             }
+        }
+
+        for connector in pending_connects {
+            connector.notify(PollEvents::WRITE | PollEvents::ERROR);
         }
 
         if let Some(peer) = self.state.lock().peer.as_ref().and_then(Weak::upgrade) {
@@ -688,11 +779,16 @@ impl KernelSocket for UnixSocket {
 
     fn connect(&self, address: &[u8]) -> SysResult<()> {
         let address = UnixAddress::from_raw(address)?;
+        let client = self.shared_self();
+        if let Some(client) = &client {
+            Self::clear_pending_connect(client);
+        }
         let target = Self::lookup_bound(&address).ok_or(SysErr::NoEnt)?;
 
         if self.kind == SOCK_DGRAM {
             let mut state = self.state.lock();
             state.peer = Some(Arc::downgrade(&target));
+            state.pending_connect = None;
             state.peer_credentials = Some(target.owner);
             state.established = true;
             drop(state);
@@ -700,45 +796,55 @@ impl KernelSocket for UnixSocket {
             return Ok(());
         }
 
-        {
-            let state = target.state.lock();
-            if !state.listening {
+        let client = client.ok_or(SysErr::ConnRefused)?;
+        let server = UnixSocket::shared(self.kind, target.owner);
+        let backlog_was_empty = {
+            let mut listener_state = target.state.lock();
+            if !listener_state.listening {
                 return Err(SysErr::ConnRefused);
             }
-        }
-
-        let target_bound_address = target.state.lock().bound_address.clone();
-        let server = UnixSocket::shared(self.kind, target.owner);
-        {
-            let mut server_state = server.state.lock();
-            server_state.bound_address = target_bound_address;
-            server_state.peer_credentials = Some(self.owner);
-            server_state.established = true;
-        }
-        {
-            let mut client_state = self.state.lock();
-            if client_state.peer.as_ref().and_then(Weak::upgrade).is_some() {
-                return Err(SysErr::IsConn);
-            }
-            client_state.peer = Some(Arc::downgrade(&server));
-            client_state.peer_credentials = Some(server.owner);
-            client_state.established = true;
-        }
-        let client = self.shared_self().ok_or(SysErr::ConnRefused)?;
-        {
-            let mut server_state = server.state.lock();
-            server_state.peer = Some(Arc::downgrade(&client));
-        }
-        {
-            let mut listener_state = target.state.lock();
-            let backlog_limit = listener_state.backlog_limit.max(1);
-            if listener_state.backlog.len() >= backlog_limit {
+            let backlog_limit = listener_state.backlog_limit;
+            if backlog_limit == 0 || listener_state.backlog.len() >= backlog_limit {
+                {
+                    let mut client_state = self.state.lock();
+                    client_state.pending_connect = Some(Arc::downgrade(&target));
+                }
+                listener_state.pending_connects.retain(|weak| {
+                    weak.upgrade()
+                        .is_some_and(|socket| !Arc::ptr_eq(&socket, &client))
+                });
+                listener_state
+                    .pending_connects
+                    .push(Arc::downgrade(&client));
                 return Err(SysErr::Again);
             }
-            listener_state.backlog.push_back(server);
-        }
 
-        target.notify(PollEvents::READ);
+            {
+                let mut client_state = self.state.lock();
+                if client_state.peer.as_ref().and_then(Weak::upgrade).is_some() {
+                    return Err(SysErr::IsConn);
+                }
+                let mut server_state = server.state.lock();
+                client_state.pending_connect = None;
+                server_state.bound_address = listener_state.bound_address.clone();
+                server_state.peer = Some(Arc::downgrade(&client));
+                server_state.peer_credentials = Some(self.owner);
+                server_state.established = true;
+                client_state.peer = Some(Arc::downgrade(&server));
+                client_state.peer_credentials = Some(server.owner);
+                client_state.established = true;
+            }
+
+            let was_empty = listener_state.backlog.is_empty();
+            listener_state.backlog.push_back(server);
+            was_empty
+        };
+        if backlog_was_empty {
+            target.notify(PollEvents::READ);
+        } else {
+            target.bump();
+        }
+        Self::clear_pending_connect(&client);
         self.notify(PollEvents::WRITE);
         Ok(())
     }
@@ -773,7 +879,11 @@ impl KernelSocket for UnixSocket {
         }
         let mut state = self.state.lock();
         state.listening = true;
-        state.backlog_limit = backlog.max(1) as usize;
+        state.backlog_limit = if backlog == 0 {
+            16
+        } else {
+            backlog.max(0) as usize
+        };
         state.backlog.clear();
         drop(state);
         self.notify(PollEvents::WRITE);
@@ -787,6 +897,9 @@ impl KernelSocket for UnixSocket {
         }
         let accepted = state.backlog.pop_front().ok_or(SysErr::Again)?;
         drop(state);
+        if let Some(listener) = self.shared_self() {
+            Self::notify_pending_connects(&listener, PollEvents::WRITE);
+        }
         let address = accepted.peer().map(|peer| peer.local_name());
         self.notify(PollEvents::WRITE);
         Ok(AcceptedSocket {
@@ -896,15 +1009,45 @@ impl KernelSocket for UnixSocket {
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
         let snapshot = self.state_snapshot();
         let mut ready = PollEvents::empty();
-        let stream_peer_eof = self.is_stream_like() && self.stream_peer_eof_snapshot(&snapshot);
+        let peer = Self::peer_from_snapshot(&snapshot);
+        let (peer_closed, peer_shut_rd, peer_shut_wr, peer_has_space) = if let Some(peer) = peer {
+            let peer_state = peer.state.lock();
+            (
+                peer_state.closed,
+                peer_state.shut_rd,
+                peer_state.shut_wr,
+                peer_state.recv_size < peer_state.rcvbuf,
+            )
+        } else {
+            (snapshot.established, false, snapshot.established, false)
+        };
 
         if events.contains(PollEvents::READ) && self.read_ready_snapshot(&snapshot) {
             ready = ready | PollEvents::READ;
         }
-        if events.contains(PollEvents::WRITE) && self.write_ready_snapshot(&snapshot) {
+        if events.contains(PollEvents::WRITE)
+            && self.write_ready_snapshot(&snapshot)
+            && (snapshot.listening
+                || self.is_packet_like()
+                || (!peer_closed && !peer_shut_rd && peer_has_space))
+        {
             ready = ready | PollEvents::WRITE;
         }
-        if snapshot.shut_wr || stream_peer_eof {
+        if snapshot.listening {
+            if snapshot.closed {
+                ready = ready | PollEvents::ERROR;
+            }
+            return Ok(ready);
+        }
+
+        if self.is_packet_like() {
+            if snapshot.shut_rd || snapshot.shut_wr || snapshot.closed {
+                ready = ready | PollEvents::ERROR;
+            }
+            return Ok(ready);
+        }
+
+        if snapshot.shut_rd || snapshot.shut_wr || snapshot.closed || peer_closed || peer_shut_wr {
             ready = ready | PollEvents::ERROR;
         }
 

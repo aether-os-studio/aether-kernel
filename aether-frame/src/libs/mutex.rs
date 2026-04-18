@@ -27,9 +27,6 @@ impl<T> Mutex<T> {
         {
             while self.locked.load(Ordering::Relaxed) {
                 spin_loop();
-                if crate::interrupt::are_enabled() {
-                    crate::arch::cpu::wait_for_interrupt();
-                }
             }
         }
 

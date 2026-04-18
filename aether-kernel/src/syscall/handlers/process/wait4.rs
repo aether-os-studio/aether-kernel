@@ -48,14 +48,24 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         options: u64,
         rusage: u64,
     ) -> SyscallDisposition {
-        self.resumable_blocking_syscall(
-            |_ctx, result| match result {
+        let _ = rusage;
+        if let Some(result) = self.process.wake_result.take() {
+            return match result {
                 BlockResult::CompletedValue { value } => SyscallDisposition::ok(value),
                 BlockResult::SignalInterrupted => SyscallDisposition::err(SysErr::Intr),
                 _ => SyscallDisposition::err(SysErr::Intr),
+            };
+        }
+
+        match self.syscall_wait4(pid, status, options, rusage) {
+            Ok(value) => SyscallDisposition::ok(value),
+            Err(SysErr::Again) => match self.wait_wait_child(pid, status, options) {
+                Ok(BlockResult::CompletedValue { value }) => SyscallDisposition::ok(value),
+                Ok(BlockResult::SignalInterrupted) => SyscallDisposition::err(SysErr::Intr),
+                Ok(_) => SyscallDisposition::err(SysErr::Intr),
+                Err(disposition) => disposition,
             },
-            |ctx| ctx.syscall_wait4(pid, status, options, rusage),
-            |ctx| ctx.block_wait_child(pid, status, options),
-        )
+            Err(error) => SyscallDisposition::err(error),
+        }
     }
 }

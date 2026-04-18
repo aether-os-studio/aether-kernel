@@ -86,6 +86,7 @@ struct NamespaceLookup {
 impl RootfsManager {
     pub fn new() -> Result<Self, RootfsError> {
         let vfs = Vfs::new();
+        crate::runtime::set_alloc_phase(crate::runtime::ALLOC_PHASE_ROOTFS_NEW);
         let boot_root_node = if let Some(initrd) = boot::initrd_bytes() {
             log::info!("rootfs: loading initramfs image ({} bytes)", initrd.len());
             load_initramfs(initrd, &vfs)?
@@ -181,18 +182,21 @@ impl RootfsManager {
             boot::info().command_line,
             filesystems.types().as_slice(),
         )?;
+        crate::runtime::set_alloc_phase(crate::runtime::ALLOC_PHASE_ROOTFS_FINALIZE_PROC);
         let _proc_root = MountedNode::new(
             proc_root_mount.root,
             proc_fs,
             alloc_mount_device(),
             proc_root_mount.statfs,
         );
+        crate::runtime::set_alloc_phase(crate::runtime::ALLOC_PHASE_ROOTFS_FINALIZE_SYS);
         let _sys_root = MountedNode::new(
             sys_root_mount.root,
             sys_fs,
             alloc_mount_device(),
             sys_root_mount.statfs,
         );
+        crate::runtime::set_alloc_phase(crate::runtime::ALLOC_PHASE_ROOTFS_RETURN);
 
         Ok(Self {
             vfs,
@@ -253,8 +257,10 @@ impl RootfsManager {
         follow_final: bool,
     ) -> SysResult<(NodeRef, FileSystemIdentity)> {
         let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
-        let namespace = fs.namespace();
-        let namespace = namespace.lock();
+        let namespace = {
+            let namespace = fs.namespace();
+            namespace.lock().clone()
+        };
         if let Some(result) = crate::procfs::lookup_virtual(namespace_path.as_str()) {
             let mount = namespace.covering_mount(namespace_path.as_str());
             return result.map(|node| (node, self.mount_identity(&mount)));
@@ -267,8 +273,10 @@ impl RootfsManager {
 
     pub fn statfs_in(&self, fs: &ProcessFsContext, path: &str) -> SysResult<LinuxStatFs> {
         let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
-        let namespace = fs.namespace();
-        let namespace = namespace.lock();
+        let namespace = {
+            let namespace = fs.namespace();
+            namespace.lock().clone()
+        };
         let lookup = self.lookup_namespace_entry(&namespace, namespace_path.as_str(), true, 0)?;
         Ok(namespace.covering_mount(lookup.path.as_str()).statfs())
     }
@@ -552,8 +560,10 @@ impl RootfsManager {
 
     pub fn chdir_in(&self, fs: &mut ProcessFsContext, path: &str) -> SysResult<u64> {
         let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
-        let namespace = fs.namespace();
-        let namespace = namespace.lock();
+        let namespace = {
+            let namespace = fs.namespace();
+            namespace.lock().clone()
+        };
         let lookup = self.lookup_namespace_entry(&namespace, namespace_path.as_str(), true, 0)?;
         if lookup.node.kind() != NodeKind::Directory {
             return Err(SysErr::NotDir);
@@ -564,13 +574,14 @@ impl RootfsManager {
 
     pub fn chroot_in(&self, fs: &mut ProcessFsContext, path: &str) -> SysResult<u64> {
         let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
-        let namespace = fs.namespace();
-        let namespace = namespace.lock();
+        let namespace = {
+            let namespace = fs.namespace();
+            namespace.lock().clone()
+        };
         let lookup = self.lookup_namespace_entry(&namespace, namespace_path.as_str(), true, 0)?;
         if lookup.node.kind() != NodeKind::Directory {
             return Err(SysErr::NotDir);
         }
-        drop(namespace);
         fs.set_root_location(FsLocation::new(lookup.path.clone(), lookup.node));
         if !is_within(fs.root_path(), fs.cwd_path()) {
             fs.set_cwd_location(FsLocation::new(lookup.path, fs.root_node()));
@@ -765,8 +776,10 @@ impl RootfsManager {
         }
 
         let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
-        let namespace = fs.namespace();
-        let namespace = namespace.lock();
+        let namespace = {
+            let namespace = fs.namespace();
+            namespace.lock().clone()
+        };
         let node = self.lookup_namespace_path(&namespace, namespace_path.as_str(), false, 0)?;
         if node.kind() != NodeKind::Symlink {
             return Ok(namespace_path);
@@ -774,7 +787,6 @@ impl RootfsManager {
 
         let target = node.symlink_target().ok_or(SysErr::Inval)?;
         let next = resolve_symlink_path(parent_path(namespace_path.as_str()), target);
-        drop(namespace);
         self.resolve_exec_path_inner(fs, next.as_str(), depth + 1)
     }
 
@@ -878,8 +890,10 @@ impl RootfsManager {
         path: &str,
         mode: u32,
     ) -> SysResult<NodeRef> {
-        let namespace = fs.namespace();
-        let namespace = namespace.lock();
+        let namespace = {
+            let namespace = fs.namespace();
+            namespace.lock().clone()
+        };
         self.create_child_namespace_locked(&namespace, path, |parent, name| {
             parent
                 .create_file(String::from(name), mode)
@@ -893,8 +907,10 @@ impl RootfsManager {
         path: &str,
         mode: u32,
     ) -> SysResult<NodeRef> {
-        let namespace = fs.namespace();
-        let namespace = namespace.lock();
+        let namespace = {
+            let namespace = fs.namespace();
+            namespace.lock().clone()
+        };
         self.create_child_namespace_locked(&namespace, path, |parent, name| {
             parent
                 .create_dir(String::from(name), mode)
@@ -909,8 +925,10 @@ impl RootfsManager {
         target: &str,
         mode: u32,
     ) -> SysResult<NodeRef> {
-        let namespace = fs.namespace();
-        let namespace = namespace.lock();
+        let namespace = {
+            let namespace = fs.namespace();
+            namespace.lock().clone()
+        };
         self.create_child_namespace_locked(&namespace, path, |parent, name| {
             parent
                 .create_symlink(String::from(name), String::from(target), mode)
@@ -924,8 +942,10 @@ impl RootfsManager {
         path: &str,
         mode: u32,
     ) -> SysResult<NodeRef> {
-        let namespace = fs.namespace();
-        let namespace = namespace.lock();
+        let namespace = {
+            let namespace = fs.namespace();
+            namespace.lock().clone()
+        };
         self.create_child_namespace_locked(&namespace, path, |parent, name| {
             parent
                 .create_socket(String::from(name), mode)

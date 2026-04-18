@@ -224,6 +224,8 @@ mod exit;
 mod exit_group;
 #[path = "process/fork.rs"]
 mod fork;
+#[path = "process/futex.rs"]
+mod futex;
 #[path = "process/getegid.rs"]
 mod getegid;
 #[path = "process/geteuid.rs"]
@@ -267,8 +269,6 @@ mod vfork;
 #[path = "process/wait4.rs"]
 mod wait4;
 
-#[path = "signal/futex.rs"]
-mod futex;
 #[path = "signal/getrandom.rs"]
 mod getrandom;
 #[path = "signal/kill.rs"]

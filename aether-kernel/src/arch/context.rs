@@ -16,27 +16,34 @@ pub trait ArchContext {
 
 impl ArchContext for UserContext {
     fn syscall_number(&self) -> u64 {
-        self.rax
+        self.general.rax
     }
 
     fn syscall_args(&self) -> [u64; 6] {
-        [self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9]
+        [
+            self.general.rdi,
+            self.general.rsi,
+            self.general.rdx,
+            self.general.r10,
+            self.general.r8,
+            self.general.r9,
+        ]
     }
 
     fn set_return_value(&mut self, value: u64) {
-        self.rax = value;
+        self.general.rax = value;
     }
 
     fn instruction_pointer(&self) -> u64 {
-        self.rip
+        self.general.rip
     }
 
     fn stack_pointer(&self) -> u64 {
-        self.rsp
+        self.general.rsp
     }
 
     fn set_stack_pointer(&mut self, value: u64) {
-        self.rsp = value;
+        self.general.rsp = value;
     }
 
     fn thread_pointer(&self) -> u64 {

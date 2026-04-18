@@ -15,6 +15,10 @@ pub enum ImageError {
 pub trait ProgramImageSource {
     fn len(&self) -> usize;
 
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     fn read_exact_at(&self, offset: usize, buffer: &mut [u8]) -> Result<(), ImageError>;
 
     fn read_alloc(&self, offset: usize, len: usize) -> Result<Vec<u8>, ImageError> {

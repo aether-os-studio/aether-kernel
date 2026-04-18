@@ -342,6 +342,12 @@ impl SocketDomainRegistry {
     }
 }
 
+impl Default for SocketDomainRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 static REGISTRY: SocketDomainRegistry = SocketDomainRegistry::new();
 
 pub fn registry() -> &'static SocketDomainRegistry {

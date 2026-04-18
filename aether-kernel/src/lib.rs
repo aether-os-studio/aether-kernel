@@ -1,8 +1,10 @@
 #![no_std]
 #![forbid(unsafe_code)]
+#![feature(alloc_error_handler)]
 
 extern crate alloc;
 
+use core::alloc::Layout;
 use core::panic::PanicInfo;
 
 use aether_frame::{boot, interrupt};
@@ -19,6 +21,7 @@ pub mod kernfs;
 pub mod log_sinks;
 pub mod net;
 pub mod process;
+pub mod processor;
 pub mod procfs;
 pub mod rootfs;
 pub mod runtime;
@@ -54,6 +57,9 @@ fn panic_runtime(error: runtime::RuntimeInitError) -> ! {
         runtime::RuntimeInitError::LogWriter(inner) => {
             panic!("kernel runtime log sink init failed: {:?}", inner)
         }
+        runtime::RuntimeInitError::Processor(inner) => {
+            panic!("kernel runtime processor init failed: {}", inner)
+        }
         runtime::RuntimeInitError::Process(inner) => {
             panic!("kernel runtime process init failed: {:?}", inner)
         }
@@ -75,6 +81,26 @@ fn secondary_cpu_main(cpu_index: usize) -> ! {
         interrupt::current_lapic_id()
     );
     runtime::KernelRuntime::run_secondary(cpu_index)
+}
+
+#[alloc_error_handler]
+fn alloc_error(layout: Layout) -> ! {
+    let initramfs = aether_initramfs::load_progress();
+    let runtime_phase = runtime::alloc_phase();
+    log::error!(
+        "allocation failed: size={} align={} initramfs_entry={} phase={} file_size={} name_hash={:#x} runtime_phase={} runtime_label={}",
+        layout.size(),
+        layout.align(),
+        initramfs.entry_index,
+        initramfs.phase,
+        initramfs.file_size,
+        initramfs.name_hash,
+        runtime_phase,
+        runtime::alloc_phase_label(runtime_phase),
+    );
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 #[panic_handler]

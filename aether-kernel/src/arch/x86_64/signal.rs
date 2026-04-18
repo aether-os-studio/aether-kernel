@@ -37,7 +37,7 @@ pub fn deliver_signal_to_user(
     let saved = *process.task.process.context();
     let saved_mask = process.signals.blocked();
 
-    let metadata = SignalFrameLayout::new(saved.rsp, action)?;
+    let metadata = SignalFrameLayout::new(saved.general.rsp, action)?;
     let siginfo_bytes = serialize_siginfo(signal);
     let ucontext_bytes = serialize_ucontext(saved, saved_mask);
 
@@ -75,11 +75,11 @@ pub fn deliver_signal_to_user(
     }
 
     let context = process.task.process.context_mut();
-    context.rip = action.handler;
-    context.rsp = metadata.frame_base;
-    context.rdi = signal.signal as u64;
-    context.rsi = metadata.siginfo_addr;
-    context.rdx = metadata.ucontext_addr;
+    context.general.rip = action.handler;
+    context.general.rsp = metadata.frame_base;
+    context.general.rdi = signal.signal as u64;
+    context.general.rsi = metadata.siginfo_addr;
+    context.general.rdx = metadata.ucontext_addr;
 
     let mut next_mask = saved_mask | action.mask;
     if (action.flags & SA_NODEFER) == 0 {
@@ -90,7 +90,7 @@ pub fn deliver_signal_to_user(
 }
 
 pub fn restore_signal_from_user(process: &mut KernelProcess) -> SysResult<u64> {
-    let rsp = process.task.process.context().rsp;
+    let rsp = process.task.process.context().general.rsp;
     let frame_base = rsp.checked_sub(8).ok_or(SysErr::Fault)?;
     let layout = SignalFrameLayout::from_frame_base(frame_base);
 
@@ -111,7 +111,7 @@ pub fn restore_signal_from_user(process: &mut KernelProcess) -> SysResult<u64> {
     raw.copy_from_slice(&mask_bytes);
     process.signals.restore_mask(u64::from_ne_bytes(raw));
     *process.task.process.context_mut() = context;
-    Ok(context.rax)
+    Ok(context.general.rax)
 }
 
 struct SignalFrameLayout {
@@ -178,24 +178,24 @@ impl SignalFrameLayout {
 
 fn serialize_context(context: UserContext) -> Vec<u8> {
     let words = [
-        context.r15,
-        context.r14,
-        context.r13,
-        context.r12,
-        context.r11,
-        context.r10,
-        context.r9,
-        context.r8,
-        context.rdi,
-        context.rsi,
-        context.rbp,
-        context.rbx,
-        context.rdx,
-        context.rcx,
-        context.rax,
-        context.rip,
-        context.rsp,
-        context.rflags,
+        context.general.r15,
+        context.general.r14,
+        context.general.r13,
+        context.general.r12,
+        context.general.r11,
+        context.general.r10,
+        context.general.r9,
+        context.general.r8,
+        context.general.rdi,
+        context.general.rsi,
+        context.general.rbp,
+        context.general.rbx,
+        context.general.rdx,
+        context.general.rcx,
+        context.general.rax,
+        context.general.rip,
+        context.general.rsp,
+        context.general.rflags,
         context.fs_base,
         context.gs_base,
     ];
@@ -220,24 +220,28 @@ fn decode_context(bytes: &[u8]) -> Option<UserContext> {
     }
 
     Some(UserContext {
-        r15: words[0],
-        r14: words[1],
-        r13: words[2],
-        r12: words[3],
-        r11: words[4],
-        r10: words[5],
-        r9: words[6],
-        r8: words[7],
-        rdi: words[8],
-        rsi: words[9],
-        rbp: words[10],
-        rbx: words[11],
-        rdx: words[12],
-        rcx: words[13],
-        rax: words[14],
-        rip: words[15],
-        rsp: words[16],
-        rflags: words[17],
+        general: aether_frame::process::GeneralRegs {
+            r15: words[0],
+            r14: words[1],
+            r13: words[2],
+            r12: words[3],
+            r11: words[4],
+            r10: words[5],
+            r9: words[6],
+            r8: words[7],
+            rdi: words[8],
+            rsi: words[9],
+            rbp: words[10],
+            rbx: words[11],
+            rdx: words[12],
+            rcx: words[13],
+            rax: words[14],
+            rip: words[15],
+            rsp: words[16],
+            rflags: words[17],
+        },
+        trap_num: 0,
+        error_code: 0,
         fs_base: words[18],
         gs_base: words[19],
     })

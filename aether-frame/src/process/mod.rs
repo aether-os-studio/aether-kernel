@@ -4,7 +4,7 @@ mod reason;
 pub use self::future::RunFuture;
 pub use self::reason::{RunReason, RunResult};
 pub use crate::arch::process::{
-    KernelContext, KernelContextEntry, Process, ProcessBuilder, UserContext,
+    GeneralRegs, KernelContext, KernelContextEntry, Process, ProcessBuilder, UserContext,
     clear_scheduler_context, initialize_kernel_context, initialize_typed_kernel_context,
     install_scheduler_context, resume_kernel_context, run_on_kernel_stack, switch_kernel_context,
     switch_to_scheduler,
@@ -20,4 +20,8 @@ pub fn on_trap(
     frame: &crate::arch::interrupt::TrapFrame,
 ) -> Option<RunReason> {
     crate::arch::process::on_trap(trap, frame)
+}
+
+pub fn resume_current_user_context() {
+    crate::arch::process::resume_current_user_context();
 }

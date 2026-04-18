@@ -135,35 +135,32 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             current_nanos.saturating_add(request_nanos)
         };
 
-        self.resumable_blocking_syscall(
-            |ctx, result| match result {
-                BlockResult::Timer {
-                    completed,
-                    remaining_nanos,
-                    rmtp,
-                    is_absolute,
-                } => {
-                    if completed {
-                        SyscallDisposition::ok(0)
-                    } else {
-                        if !is_absolute
-                            && rmtp != 0
-                            && let Err(error) = ctx.write_user_timespec(
-                                rmtp,
-                                (remaining_nanos / 1_000_000_000) as i64,
-                                (remaining_nanos % 1_000_000_000) as i64,
-                            )
-                        {
-                            return SyscallDisposition::err(error);
-                        }
-                        SyscallDisposition::err(SysErr::Intr)
+        match self.wait_timer(target_nanos, request_nanos, rmtp, flags) {
+            Ok(BlockResult::Timer {
+                completed,
+                remaining_nanos,
+                rmtp,
+                is_absolute,
+            }) => {
+                if completed {
+                    SyscallDisposition::ok(0)
+                } else {
+                    if !is_absolute
+                        && rmtp != 0
+                        && let Err(error) = self.write_user_timespec(
+                            rmtp,
+                            (remaining_nanos / 1_000_000_000) as i64,
+                            (remaining_nanos % 1_000_000_000) as i64,
+                        )
+                    {
+                        return SyscallDisposition::err(error);
                     }
+                    SyscallDisposition::err(SysErr::Intr)
                 }
-                BlockResult::SignalInterrupted => SyscallDisposition::err(SysErr::Intr),
-                _ => SyscallDisposition::err(SysErr::Intr),
-            },
-            |ctx| ctx.syscall_clock_nanosleep(clock_id, flags, rqtp, rmtp),
-            |ctx| ctx.block_timer(target_nanos, request_nanos, rmtp, flags),
-        )
+            }
+            Ok(BlockResult::SignalInterrupted) => SyscallDisposition::err(SysErr::Intr),
+            Ok(_) => SyscallDisposition::err(SysErr::Intr),
+            Err(disposition) => disposition,
+        }
     }
 }

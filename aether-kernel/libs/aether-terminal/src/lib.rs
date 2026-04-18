@@ -19,10 +19,10 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::fmt;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use aether_device::{DeviceClass, DeviceMetadata, DeviceNode, KernelDevice, default_console_alias};
-use aether_frame::libs::spin::SpinLock;
+use aether_frame::libs::spin::{LocalIrqDisabled, SpinLock};
 use aether_framebuffer::{FramebufferSurface, RgbColor};
 use aether_vfs::{
     FileNode, FileOperations, FsError, FsResult, IoctlResponse, PollEvents, SharedWaitListener,
@@ -30,6 +30,7 @@ use aether_vfs::{
 };
 use os_terminal::font::BitmapFont;
 use os_terminal::{DrawTarget, Rgb, Terminal};
+use spin::Once;
 
 const NCCS: usize = 19;
 const TIOCGWINSZ: u64 = 0x5413;
@@ -41,6 +42,8 @@ const KDGKBMODE: u64 = 0x4b44;
 const VT_GETMODE: u64 = 0x5601;
 const VT_GETSTATE: u64 = 0x5603;
 const VT_OPENQRY: u64 = 0x5600;
+const KD_TEXT: i32 = 0x00;
+const KD_GRAPHICS: i32 = 0x01;
 
 const VINTR: usize = 0;
 const VQUIT: usize = 1;
@@ -318,6 +321,8 @@ pub trait TtyBackend: Send + Sync {
 
     fn activate(&self) {}
 
+    fn deactivate(&self) {}
+
     fn poll_ready(&self, events: PollEvents) -> PollEvents {
         let mut ready = PollEvents::empty();
         if events.contains(PollEvents::WRITE) {
@@ -437,7 +442,7 @@ struct ConsoleTtyState {
 
 struct TtyEndpoint {
     backend: Arc<dyn TtyBackend>,
-    tty: SpinLock<ConsoleTtyState>,
+    tty: SpinLock<ConsoleTtyState, LocalIrqDisabled>,
     version: AtomicU64,
     waiters: WaitQueue,
 }
@@ -450,7 +455,7 @@ impl TtyEndpoint {
                 termios: LinuxTermios::linux_default(),
                 winsize,
                 process_group: 0,
-                tty_mode: 0,
+                tty_mode: KD_TEXT,
                 keyboard_mode: 0,
                 vt_mode: LinuxVtMode::default(),
                 input_buf: [0; TTY_INPUT_BUF_SIZE],
@@ -470,11 +475,24 @@ impl TtyEndpoint {
     }
 
     fn write_bytes(&self, bytes: &[u8]) {
-        self.backend.write_bytes(bytes);
+        if bytes.is_empty() {
+            return;
+        }
+
+        let tty_mode = self.tty.lock().tty_mode;
+        if tty_mode != KD_GRAPHICS {
+            self.backend.write_bytes(bytes);
+        }
     }
 
     fn activate(&self) {
-        self.backend.activate();
+        if self.tty.lock().tty_mode != KD_GRAPHICS {
+            self.backend.activate();
+        }
+    }
+
+    fn deactivate(&self) {
+        self.backend.deactivate();
     }
 
     fn bump_version(&self) {
@@ -1024,6 +1042,7 @@ impl VirtualTerminalGroup {
             };
             let mut terminal = Terminal::new(display, Box::new(BitmapFont));
             terminal.set_crnl_mapping(true);
+            plane.finish_init();
             let winsize = LinuxWinSize {
                 ws_row: terminal.rows() as u16,
                 ws_col: terminal.columns() as u16,
@@ -1037,9 +1056,7 @@ impl VirtualTerminalGroup {
             consoles.push(Arc::new(TtyEndpoint::new(backend, winsize)));
         }
 
-        let group = Arc::new(Self { consoles, active });
-        group.active_console().activate();
-        group
+        Arc::new(Self { consoles, active })
     }
 
     pub fn console_count(&self) -> usize {
@@ -1067,6 +1084,11 @@ impl VirtualTerminalGroup {
 
     fn activate_vt(&self, index: usize) {
         let clamped = index.clamp(1, self.consoles.len().max(1));
+        let previous = self.active_index();
+        if previous == clamped {
+            return;
+        }
+        self.consoles[previous - 1].deactivate();
         self.active.store(clamped, Ordering::Release);
         self.consoles[clamped - 1].activate();
     }
@@ -1186,7 +1208,18 @@ impl TtyFile {
     }
 
     pub fn set_tty_mode(&self, tty_mode: i32) {
-        self.with_state_mut(|state| state.tty_mode = tty_mode);
+        let endpoint = self.endpoint();
+        let transition = {
+            let mut guard = endpoint.tty.lock();
+            let old_mode = guard.tty_mode;
+            guard.tty_mode = tty_mode;
+            (old_mode, tty_mode)
+        };
+        match transition {
+            (KD_TEXT, new_mode) if new_mode != KD_TEXT => endpoint.deactivate(),
+            (old_mode, KD_TEXT) if old_mode != KD_TEXT => endpoint.activate(),
+            _ => {}
+        }
     }
 
     pub fn keyboard_mode(&self) -> i32 {
@@ -1233,6 +1266,7 @@ impl TtyFile {
         let endpoint = self.endpoint();
         let wake = {
             let mut state = endpoint.tty.lock();
+            let was_empty = state.input_count == 0;
             match event.code {
                 KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
                     state.key_shift = event.value != 0;
@@ -1260,7 +1294,7 @@ impl TtyFile {
                     let Some(len) = tty_translate_key(&state, event.code, &mut bytes) else {
                         return;
                     };
-                    tty_receive_bytes(&endpoint, &mut state, &bytes[..len])
+                    tty_receive_bytes(&endpoint, &mut state, &bytes[..len]) && was_empty
                 }
             }
         };
@@ -1377,25 +1411,64 @@ struct FramebufferPlane {
     index: usize,
     width: usize,
     height: usize,
-    pixels: alloc::vec::Vec<AtomicU32>,
+    initialized: AtomicBool,
+    pixels: Once<alloc::boxed::Box<[AtomicU32]>>,
 }
 
 impl FramebufferPlane {
     fn new(surface: FramebufferSurface, index: usize, active: Arc<AtomicUsize>) -> Self {
         let width = surface.width();
         let height = surface.height();
-        let black = surface.pack_color(RgbColor::BLACK);
-        let pixels = (0..width.saturating_mul(height))
-            .map(|_| AtomicU32::new(black))
-            .collect();
         Self {
             surface,
             active,
             index,
             width,
             height,
-            pixels,
+            initialized: AtomicBool::new(false),
+            pixels: Once::new(),
         }
+    }
+
+    fn finish_init(&self) {
+        self.initialized.store(true, Ordering::Release);
+    }
+
+    fn pixels(&self) -> &[AtomicU32] {
+        self.pixels.call_once(|| {
+            let black = self.surface.pack_color(RgbColor::BLACK);
+            (0..self.width.saturating_mul(self.height))
+                .map(|_| AtomicU32::new(black))
+                .collect::<alloc::vec::Vec<_>>()
+                .into_boxed_slice()
+        })
+    }
+
+    fn packed_pixel(&self, x: usize, y: usize) -> u32 {
+        let bytes_per_pixel = self.surface.bytes_per_pixel();
+        let mut bytes = [0u8; 4];
+        let offset = y
+            .saturating_mul(self.surface.stride())
+            .saturating_add(x.saturating_mul(bytes_per_pixel));
+        let _ = self
+            .surface
+            .read_bytes(offset, &mut bytes[..bytes_per_pixel]);
+        u32::from_le_bytes(bytes)
+    }
+
+    fn snapshot_surface(&self) {
+        if self.pixels.get().is_some() {
+            return;
+        }
+        let _ = self.pixels.call_once(|| {
+            let mut pixels = alloc::vec::Vec::with_capacity(self.width.saturating_mul(self.height));
+            for y in 0..self.height {
+                for x in 0..self.width {
+                    pixels.push(AtomicU32::new(self.packed_pixel(x, y)));
+                }
+            }
+            pixels.into_boxed_slice()
+        });
     }
 
     fn offset(&self, x: usize, y: usize) -> Option<usize> {
@@ -1407,16 +1480,30 @@ impl FramebufferPlane {
             return;
         };
         let packed = self.surface.pack_color(color);
-        self.pixels[offset].store(packed, Ordering::Relaxed);
-        if self.active.load(Ordering::Acquire) == self.index {
-            let _ = self.surface.write_packed_pixel(x, y, packed);
+        let active = self.active.load(Ordering::Acquire) == self.index;
+        if !self.initialized.load(Ordering::Acquire) {
+            if active {
+                let _ = self.surface.write_packed_pixel(x, y, packed);
+            }
+            return;
         }
+        if active {
+            if let Some(pixels) = self.pixels.get() {
+                pixels[offset].store(packed, Ordering::Relaxed);
+            }
+            let _ = self.surface.write_packed_pixel(x, y, packed);
+            return;
+        }
+        self.pixels()[offset].store(packed, Ordering::Relaxed);
     }
 
     fn redraw(&self) {
+        let Some(pixels) = self.pixels.get() else {
+            return;
+        };
         for y in 0..self.height {
             for x in 0..self.width {
-                let packed = self.pixels[y * self.width + x].load(Ordering::Relaxed);
+                let packed = pixels[y * self.width + x].load(Ordering::Relaxed);
                 let _ = self.surface.write_packed_pixel(x, y, packed);
             }
         }
@@ -1436,6 +1523,10 @@ impl TtyBackend for FramebufferTtyBackend {
 
     fn activate(&self) {
         self.plane.redraw();
+    }
+
+    fn deactivate(&self) {
+        self.plane.snapshot_surface();
     }
 }
 

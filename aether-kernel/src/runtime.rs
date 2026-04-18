@@ -1,32 +1,33 @@
 extern crate alloc;
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aether_device::{DeviceRegistry, KernelDevice};
 use aether_drivers::{DriverInventory, register_input_sink};
 use aether_frame::boot;
-use aether_frame::libs::spin::SpinLock;
+use aether_frame::libs::spin::{LocalIrqDisabled, SpinLock};
 use aether_frame::logger::RegisterWriterError;
 use aether_framebuffer::{FramebufferDevice, FramebufferError, FramebufferSurface, RgbColor};
 use aether_kmsg::KmsgBuffer;
 use aether_process::{BuildError, ElfProgramBuilder, UserProgramBuilder, elf_interpreter_path};
 use aether_terminal::{FramebufferConsole, register_process_group_signal_hook};
 use aether_vfs::{FileNode, FsError, NodeRef};
+use spin::Once;
 
 use crate::arch::ArchContext;
 use crate::errno::{SysErr, SysResult};
 use crate::fs::{FdTable, NodeImageSource};
 use crate::log_sinks;
 use crate::process::{
-    ChildEvent, CloneParams, DispatchWork, KernelProcess, Pid, ProcFsProcessSnapshot, ProcessBlock,
+    ChildEvent, CloneParams, DispatchWork, KernelProcess, Pid, ProcFsProcessSnapshot,
     ProcessManager, ProcessServices, ProcessState, ScheduleEvent,
 };
 use crate::rootfs::{ExecFormat, ProcessFsContext, RootfsError, RootfsManager};
-use crate::syscall::BlockType;
 use crate::syscall::SyscallArgs;
 
 #[derive(Debug)]
@@ -34,12 +35,10 @@ pub enum RuntimeInitError {
     FileSystem(FsError),
     Framebuffer(FramebufferError),
     LogWriter(RegisterWriterError),
+    Processor(&'static str),
     Process(BuildError),
     Rootfs(RootfsError),
 }
-
-static CURRENT_PIDS: SpinLock<[Option<Pid>; boot::MAX_CPUS]> =
-    SpinLock::new([None; boot::MAX_CPUS]);
 
 impl From<FsError> for RuntimeInitError {
     fn from(value: FsError) -> Self {
@@ -80,12 +79,69 @@ pub struct KernelRuntime {
     processes: SpinLock<ProcessManager>,
 }
 
-static SHARED_RUNTIME: SpinLock<Option<Arc<KernelRuntime>>> = SpinLock::new(None);
+static SHARED_RUNTIME: Once<Arc<KernelRuntime>> = Once::new();
 static TIMER_TICK_PENDING: AtomicBool = AtomicBool::new(false);
+static ALLOC_PHASE: AtomicU64 = AtomicU64::new(0);
 static NEXT_TIMER_DEADLINE_NANOS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
+static PROCESS_GROUP_SIGNAL_PENDING: AtomicBool = AtomicBool::new(false);
+static PENDING_PROCESS_GROUP_SIGNALS: SpinLock<VecDeque<(i32, i32)>, LocalIrqDisabled> =
+    SpinLock::new(VecDeque::new());
 
 const PRECISE_WAIT_THRESHOLD_NS: u64 = 10_000_000;
+
+pub(crate) const ALLOC_PHASE_IDLE: u64 = 0;
+pub(crate) const ALLOC_PHASE_ROOTFS_NEW: u64 = 1;
+pub(crate) const ALLOC_PHASE_ROOTFS_FINALIZE_PROC: u64 = 2;
+pub(crate) const ALLOC_PHASE_ROOTFS_FINALIZE_SYS: u64 = 3;
+pub(crate) const ALLOC_PHASE_ROOTFS_RETURN: u64 = 4;
+pub(crate) const ALLOC_PHASE_ROOTFS_ARC: u64 = 5;
+pub(crate) const ALLOC_PHASE_PCI_REGISTER: u64 = 6;
+pub(crate) const ALLOC_PHASE_KMSG: u64 = 7;
+pub(crate) const ALLOC_PHASE_KMSG_DEVICE: u64 = 8;
+pub(crate) const ALLOC_PHASE_BUILTIN_DEVICES: u64 = 9;
+pub(crate) const ALLOC_PHASE_FRAMEBUFFER_SURFACE: u64 = 10;
+pub(crate) const ALLOC_PHASE_FRAMEBUFFER_DEVICE: u64 = 11;
+pub(crate) const ALLOC_PHASE_FRAMEBUFFER_TERMINAL: u64 = 12;
+pub(crate) const ALLOC_PHASE_DRIVER_PROBE: u64 = 13;
+pub(crate) const ALLOC_PHASE_DEVICE_PUBLISH: u64 = 14;
+pub(crate) const ALLOC_PHASE_PROCESS_MANAGER: u64 = 15;
+pub(crate) const ALLOC_PHASE_INITIAL_FILES: u64 = 16;
+pub(crate) const ALLOC_PHASE_PREPARE_INIT: u64 = 17;
+pub(crate) const ALLOC_PHASE_BUILD_INIT: u64 = 18;
+
+pub(crate) fn set_alloc_phase(phase: u64) {
+    ALLOC_PHASE.store(phase, Ordering::Release);
+}
+
+pub(crate) fn alloc_phase() -> u64 {
+    ALLOC_PHASE.load(Ordering::Acquire)
+}
+
+pub(crate) fn alloc_phase_label(phase: u64) -> &'static str {
+    match phase {
+        ALLOC_PHASE_IDLE => "idle",
+        ALLOC_PHASE_ROOTFS_NEW => "rootfs_new",
+        ALLOC_PHASE_ROOTFS_FINALIZE_PROC => "rootfs_finalize_proc",
+        ALLOC_PHASE_ROOTFS_FINALIZE_SYS => "rootfs_finalize_sys",
+        ALLOC_PHASE_ROOTFS_RETURN => "rootfs_return",
+        ALLOC_PHASE_ROOTFS_ARC => "rootfs_arc",
+        ALLOC_PHASE_PCI_REGISTER => "pci_register",
+        ALLOC_PHASE_KMSG => "kmsg",
+        ALLOC_PHASE_KMSG_DEVICE => "kmsg_device",
+        ALLOC_PHASE_BUILTIN_DEVICES => "builtin_devices",
+        ALLOC_PHASE_FRAMEBUFFER_SURFACE => "framebuffer_surface",
+        ALLOC_PHASE_FRAMEBUFFER_DEVICE => "framebuffer_device",
+        ALLOC_PHASE_FRAMEBUFFER_TERMINAL => "framebuffer_terminal",
+        ALLOC_PHASE_DRIVER_PROBE => "driver_probe",
+        ALLOC_PHASE_DEVICE_PUBLISH => "device_publish",
+        ALLOC_PHASE_PROCESS_MANAGER => "process_manager",
+        ALLOC_PHASE_INITIAL_FILES => "initial_files",
+        ALLOC_PHASE_PREPARE_INIT => "prepare_init",
+        ALLOC_PHASE_BUILD_INIT => "build_init",
+        _ => "unknown",
+    }
+}
 
 pub(crate) fn publish_next_timer_deadline(deadline_nanos: Option<u64>) {
     NEXT_TIMER_DEADLINE_NANOS.store(deadline_nanos.unwrap_or(u64::MAX), Ordering::Release);
@@ -103,109 +159,20 @@ fn runtime_tick_handler() {
     }
 }
 
-fn block_type_to_process_block(block: BlockType) -> ProcessBlock {
-    match block {
-        BlockType::Timer {
-            target_nanos,
-            request_nanos,
-            rmtp,
-            flags,
-        } => ProcessBlock::Timer {
-            target_nanos,
-            request_nanos,
-            rmtp,
-            flags,
-        },
-        BlockType::File { fd, events } => ProcessBlock::File { fd, events },
-        BlockType::Poll { deadline_nanos } => ProcessBlock::Poll { deadline_nanos },
-        BlockType::Futex { uaddr, bitset } => ProcessBlock::Futex { uaddr, bitset },
-        BlockType::SignalSuspend => ProcessBlock::SignalSuspend,
-        BlockType::Vfork { child } => ProcessBlock::Vfork { child },
-        BlockType::WaitChild {
-            pid,
-            status_ptr,
-            options,
-        } => ProcessBlock::WaitChild {
-            pid,
-            status_ptr,
-            options,
-        },
-    }
-}
-
-fn process_kernel_syscall_entry(process: &mut KernelProcess) -> ! {
-    let runtime = KernelRuntime::shared().expect("kernel syscall continuation requires runtime");
-
-    loop {
-        let dispatch = ProcessManager::dispatch_pending_syscall_direct(
-            process,
-            RuntimeServices {
-                rootfs: &runtime.rootfs,
-                processes: &runtime.processes,
-            },
-        );
-
-        match dispatch.disposition {
-            crate::syscall::SyscallDisposition::Return(value) => {
-                if matches!(process.state, ProcessState::Running) {
-                    process.wake_result = None;
-                    if process.pending_exec.is_none() {
-                        process
-                            .task
-                            .process
-                            .context_mut()
-                            .set_return_value(match value {
-                                Ok(value) => value,
-                                Err(error) => error.errno() as u64,
-                            });
-                    }
-                    process.state = ProcessState::Runnable;
-                }
-                break;
-            }
-            crate::syscall::SyscallDisposition::Exit(status) => {
-                process.state = ProcessState::Exited(status);
-                break;
-            }
-            crate::syscall::SyscallDisposition::Block(block) => {
-                process.wake_result = None;
-                process.state = ProcessState::Blocked(block_type_to_process_block(block));
-                aether_frame::process::switch_to_scheduler(
-                    process
-                        .kernel_context
-                        .as_mut()
-                        .expect("blocked syscall missing kernel context"),
-                );
-            }
-        }
-    }
-
-    aether_frame::process::switch_to_scheduler(
-        process
-            .kernel_context
-            .as_mut()
-            .expect("completed syscall missing kernel context"),
-    );
-    unreachable!("kernel syscall context resumed after completion");
-}
-
 fn runtime_send_process_group_signal(process_group: i32, signal: i32) {
-    let Some(runtime) = KernelRuntime::shared() else {
-        return;
-    };
     if process_group <= 0 || signal <= 0 {
         return;
     }
-    let info = crate::signal::SignalInfo::kernel(signal as u8, 0);
-    let _ = runtime
-        .processes
+    PENDING_PROCESS_GROUP_SIGNALS
         .lock()
-        .send_signal_process_group(process_group as u32, info);
+        .push_back((process_group, signal));
+    PROCESS_GROUP_SIGNAL_PENDING.store(true, Ordering::Release);
+    aether_frame::preempt::request_reschedule();
 }
 
 impl KernelRuntime {
     pub fn current_pid() -> Option<Pid> {
-        CURRENT_PIDS.lock()[aether_frame::arch::cpu::current_cpu_index()]
+        crate::processor::current_pid()
     }
 
     pub fn procfs_snapshot(pid: Pid) -> Option<ProcFsProcessSnapshot> {
@@ -213,17 +180,24 @@ impl KernelRuntime {
     }
 
     pub fn bootstrap() -> Result<Self, RuntimeInitError> {
+        crate::processor::init_current_cpu().map_err(RuntimeInitError::Processor)?;
         log_sinks::init()?;
         crate::syscall::init();
         crate::net::init();
 
-        let rootfs = Arc::new(RootfsManager::new()?);
+        set_alloc_phase(ALLOC_PHASE_ROOTFS_NEW);
+        let rootfs_manager = RootfsManager::new()?;
+        set_alloc_phase(ALLOC_PHASE_ROOTFS_ARC);
+        let rootfs = Arc::new(rootfs_manager);
+        set_alloc_phase(ALLOC_PHASE_PCI_REGISTER);
         if let Err(error) = rootfs.register_pci_bus() {
             log::warn!("failed to register pci sysfs bus: {:?}", error);
         }
 
+        set_alloc_phase(ALLOC_PHASE_KMSG);
         let kmsg = Arc::new(KmsgBuffer::default());
         log_sinks::install_kmsg(kmsg.clone());
+        set_alloc_phase(ALLOC_PHASE_KMSG_DEVICE);
         rootfs.device_namespace().install(
             rootfs.vfs(),
             "kmsg",
@@ -233,17 +207,21 @@ impl KernelRuntime {
         let mut devices = DeviceRegistry::new();
         let mut console = None;
 
+        set_alloc_phase(ALLOC_PHASE_BUILTIN_DEVICES);
         for device in crate::devices::builtin_devices() {
             devices.register(device);
         }
 
         if let Some(info) = boot::info().framebuffer {
+            set_alloc_phase(ALLOC_PHASE_FRAMEBUFFER_SURFACE);
             let surface = FramebufferSurface::from_boot_info(info)?;
             surface.clear(RgbColor::BLACK);
 
+            set_alloc_phase(ALLOC_PHASE_FRAMEBUFFER_DEVICE);
             let fbdev: Arc<dyn KernelDevice> = Arc::new(FramebufferDevice::primary(surface));
             devices.register(fbdev);
 
+            set_alloc_phase(ALLOC_PHASE_FRAMEBUFFER_TERMINAL);
             let terminal = Arc::new(FramebufferConsole::new(surface));
             log_sinks::install_terminal(terminal.clone());
             let tty: Arc<dyn KernelDevice> = terminal.clone();
@@ -257,8 +235,10 @@ impl KernelRuntime {
 
         register_process_group_signal_hook(runtime_send_process_group_signal);
 
+        set_alloc_phase(ALLOC_PHASE_DRIVER_PROBE);
         let drivers = aether_drivers::probe_all(&mut devices);
 
+        set_alloc_phase(ALLOC_PHASE_DEVICE_PUBLISH);
         for device in devices.devices() {
             if let Err(error) = rootfs.register_device(device.clone()) {
                 log::warn!(
@@ -269,10 +249,13 @@ impl KernelRuntime {
             }
         }
 
+        set_alloc_phase(ALLOC_PHASE_PROCESS_MANAGER);
         let mut processes = ProcessManager::new();
         let initial_fs = rootfs.initial_fs_context();
         processes.set_initial_fs(initial_fs.clone());
+        set_alloc_phase(ALLOC_PHASE_INITIAL_FILES);
         processes.set_initial_files(build_initial_files(rootfs.as_ref())?);
+        set_alloc_phase(ALLOC_PHASE_PREPARE_INIT);
         let init_plan = rootfs.prepare_exec(
             &initial_fs,
             "/init",
@@ -283,6 +266,7 @@ impl KernelRuntime {
         match init_plan {
             Ok(plan) => match plan.format {
                 ExecFormat::Flat => {
+                    set_alloc_phase(ALLOC_PHASE_BUILD_INIT);
                     let argv_refs = plan.argv.iter().map(String::as_str).collect::<Vec<_>>();
                     let envp_refs = plan.envp.iter().map(String::as_str).collect::<Vec<_>>();
                     let source = NodeImageSource::new(plan.node.clone())
@@ -300,6 +284,7 @@ impl KernelRuntime {
                     );
                 }
                 ExecFormat::Elf => {
+                    set_alloc_phase(ALLOC_PHASE_BUILD_INIT);
                     let argv_refs = plan.argv.iter().map(String::as_str).collect::<Vec<_>>();
                     let envp_refs = plan.envp.iter().map(String::as_str).collect::<Vec<_>>();
                     let executable = NodeImageSource::new(plan.node.clone())
@@ -340,6 +325,8 @@ impl KernelRuntime {
             }
         }
 
+        set_alloc_phase(ALLOC_PHASE_IDLE);
+
         Ok(Self {
             rootfs,
             _devices: devices,
@@ -352,13 +339,13 @@ impl KernelRuntime {
 
     pub fn install(self) -> Arc<Self> {
         let runtime = Arc::new(self);
-        *SHARED_RUNTIME.lock() = Some(runtime.clone());
+        let _ = SHARED_RUNTIME.call_once(|| runtime.clone());
         aether_frame::interrupt::timer::register_tick_handler(runtime_tick_handler);
         runtime
     }
 
     pub fn shared() -> Option<Arc<Self>> {
-        SHARED_RUNTIME.lock().clone()
+        SHARED_RUNTIME.get().cloned()
     }
 
     pub fn run_secondary(cpu_index: usize) -> ! {
@@ -372,27 +359,42 @@ impl KernelRuntime {
     }
 
     pub fn run_on_cpu(&self, _cpu_index: usize) -> ! {
-        let mut scheduler_context = aether_frame::process::KernelContext::default();
-        aether_frame::process::install_scheduler_context(&mut scheduler_context);
+        crate::processor::init_current_cpu().expect("failed to initialize cpu-local processor");
         loop {
             if !aether_frame::interrupt::are_enabled() {
                 aether_frame::interrupt::enable();
             }
             aether_async::run_ready();
+            self.drain_pending_process_group_signals();
             if aether_frame::preempt::take_need_resched() {
                 continue;
             }
             let work = {
-                let mut processes = self.processes.lock();
-                processes.wake_ready_file_blocks();
-                if TIMER_TICK_PENDING.swap(false, Ordering::AcqRel) {
-                    crate::fs::wake_expired_timerfds();
-                    let current_nanos = aether_frame::interrupt::timer::nanos_since_boot();
-                    if processes.timer_deadline_due(current_nanos) {
-                        processes.wake_expired_timers(current_nanos);
+                if let Some(work) = {
+                    let mut processes = self.processes.lock();
+                    crate::processor::try_take_current_cpu_work(&mut processes)
+                } {
+                    work
+                } else {
+                    {
+                        let mut processes = self.processes.lock();
+                        processes.wake_ready_file_blocks();
+                        if TIMER_TICK_PENDING.swap(false, Ordering::AcqRel) {
+                            crate::fs::wake_expired_timerfds();
+                            let current_nanos = aether_frame::interrupt::timer::nanos_since_boot();
+                            if processes.timer_deadline_due(current_nanos) {
+                                processes.wake_expired_timers(current_nanos);
+                            }
+                        }
+                        if let Some(work) =
+                            crate::processor::try_take_current_cpu_work(&mut processes)
+                        {
+                            work
+                        } else {
+                            DispatchWork::Idle
+                        }
                     }
                 }
-                processes.take_next_process()
             };
             match work {
                 DispatchWork::Idle => {
@@ -414,11 +416,12 @@ impl KernelRuntime {
                     if let Some(deadline) = next_deadline {
                         let now = aether_frame::interrupt::timer::nanos_since_boot();
                         let remaining = deadline.saturating_sub(now);
-                        if remaining != 0 && remaining <= PRECISE_WAIT_THRESHOLD_NS {
-                            if aether_frame::arch::timer::hpet::stall_nanos(remaining).is_ok() {
-                                TIMER_TICK_PENDING.store(true, Ordering::Release);
-                                continue;
-                            }
+                        if remaining != 0
+                            && remaining <= PRECISE_WAIT_THRESHOLD_NS
+                            && aether_frame::arch::timer::hpet::stall_nanos(remaining).is_ok()
+                        {
+                            TIMER_TICK_PENDING.store(true, Ordering::Release);
+                            continue;
                         }
                     }
 
@@ -426,68 +429,62 @@ impl KernelRuntime {
                 }
                 DispatchWork::Event(event) => self.handle_event(event),
                 DispatchWork::Process(mut process) => {
-                    CURRENT_PIDS.lock()[aether_frame::arch::cpu::current_cpu_index()] =
-                        Some(process.identity.pid);
-                    let result = process.task.process.run();
-                    let event = match result.reason {
-                        aether_frame::process::RunReason::Syscall => {
-                            let syscall_number = result.context.syscall_number();
-                            let syscall_args = SyscallArgs::from_context(&result.context);
-                            {
-                                let mut processes = self.processes.lock();
-                                processes.mark_process_ran(process.identity.pid);
+                    let event =
+                        crate::processor::with_current_process(process.running_snapshot(), || {
+                            let result = process.task.process.run();
+                            match result.reason {
+                                aether_frame::process::RunReason::Syscall => {
+                                    let syscall_number = result.context.syscall_number();
+                                    let syscall_args = SyscallArgs::from_context(&result.context);
+                                    process.pending_syscall =
+                                        Some(crate::process::PendingSyscall {
+                                            number: syscall_number,
+                                            args: syscall_args,
+                                        });
+                                    process.pending_syscall_name = "";
+                                    let services = RuntimeServices {
+                                        rootfs: &self.rootfs,
+                                        processes: &self.processes,
+                                    };
+                                    let dispatch = ProcessManager::dispatch_pending_syscall(
+                                        &mut process,
+                                        services,
+                                    );
+                                    let mut processes = self.processes.lock();
+                                    processes.finish_syscall_dispatch(
+                                        process,
+                                        syscall_number,
+                                        dispatch,
+                                    )
+                                }
+                                _ => {
+                                    let services = RuntimeServices {
+                                        rootfs: &self.rootfs,
+                                        processes: &self.processes,
+                                    };
+                                    let mut processes = self.processes.lock();
+                                    processes.finish_process(process, result, services)
+                                }
                             }
-                            process.pending_syscall = Some(crate::process::PendingSyscall {
-                                number: syscall_number,
-                                args: syscall_args,
-                            });
-                            process.pending_syscall_name = "";
-                            process.kernel_cpu = Some(aether_frame::arch::cpu::current_cpu_index());
-                            if process.kernel_context.is_none() {
-                                process.kernel_context =
-                                    Some(aether_frame::process::initialize_typed_kernel_context(
-                                        process.task.process.kernel_stack_top(),
-                                        process.as_mut(),
-                                        process_kernel_syscall_entry,
-                                    ));
-                            }
-                            aether_frame::process::resume_kernel_context(
-                                &mut scheduler_context,
-                                process
-                                    .kernel_context
-                                    .as_ref()
-                                    .expect("syscall continuation missing kernel context"),
-                            );
-                            let mut processes = self.processes.lock();
-                            processes.finish_kernel_syscall_context(process)
-                        }
-                        _ => {
+                        });
+                    self.handle_event(event);
+                }
+                DispatchWork::KernelSyscall(process) => {
+                    let event =
+                        crate::processor::with_current_process(process.running_snapshot(), || {
+                            let pending = process
+                                .pending_syscall
+                                .expect("resumed syscall missing pending state");
                             let services = RuntimeServices {
                                 rootfs: &self.rootfs,
                                 processes: &self.processes,
                             };
+                            let mut process = process;
+                            let dispatch =
+                                ProcessManager::dispatch_pending_syscall(&mut process, services);
                             let mut processes = self.processes.lock();
-                            processes.finish_process(process, result, services)
-                        }
-                    };
-                    CURRENT_PIDS.lock()[aether_frame::arch::cpu::current_cpu_index()] = None;
-                    self.handle_event(event);
-                }
-                DispatchWork::KernelSyscall(process) => {
-                    CURRENT_PIDS.lock()[aether_frame::arch::cpu::current_cpu_index()] =
-                        Some(process.identity.pid);
-                    aether_frame::process::resume_kernel_context(
-                        &mut scheduler_context,
-                        process
-                            .kernel_context
-                            .as_ref()
-                            .expect("resumed syscall missing kernel context"),
-                    );
-                    let event = {
-                        let mut processes = self.processes.lock();
-                        processes.finish_kernel_syscall_context(process)
-                    };
-                    CURRENT_PIDS.lock()[aether_frame::arch::cpu::current_cpu_index()] = None;
+                            processes.finish_syscall_dispatch(process, pending.number, dispatch)
+                        });
                     self.handle_event(event);
                 }
             }
@@ -516,6 +513,30 @@ impl KernelRuntime {
                     error_code,
                 );
             }
+        }
+    }
+
+    fn drain_pending_process_group_signals(&self) {
+        if !PROCESS_GROUP_SIGNAL_PENDING.swap(false, Ordering::AcqRel) {
+            return;
+        }
+
+        let mut signals = Vec::new();
+        {
+            let mut pending = PENDING_PROCESS_GROUP_SIGNALS.lock();
+            while let Some(signal) = pending.pop_front() {
+                signals.push(signal);
+            }
+        }
+
+        if signals.is_empty() {
+            return;
+        }
+
+        let mut processes = self.processes.lock();
+        for (process_group, signal) in signals {
+            let info = crate::signal::SignalInfo::kernel(signal as u8, 0);
+            let _ = processes.send_signal_process_group(process_group as u32, info);
         }
     }
 }
@@ -763,7 +784,7 @@ impl ProcessServices for RuntimeServices<'_> {
             pending_exec: None,
             pending_syscall: None,
             pending_syscall_name: "",
-            pending_poll: None,
+            pending_file_waits: Vec::new(),
             mmap_regions: parent.mmap_regions.clone(),
             vfork_parent,
             clear_child_tid: params

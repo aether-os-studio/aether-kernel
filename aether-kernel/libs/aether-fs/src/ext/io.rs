@@ -207,7 +207,6 @@ pub(crate) async fn write_exact(
         block_offset = 0;
     }
 
-    device.flush().await?;
     Ok(())
 }
 
