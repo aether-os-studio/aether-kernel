@@ -95,7 +95,13 @@ impl PollEvents {
     pub const READ: Self = Self { bits: 1 << 0 };
     pub const WRITE: Self = Self { bits: 1 << 1 };
     pub const ERROR: Self = Self { bits: 1 << 2 };
-    pub const LOCK: Self = Self { bits: 1 << 3 };
+    pub const HUP: Self = Self { bits: 1 << 3 };
+    pub const INVALID: Self = Self { bits: 1 << 4 };
+    pub const RDHUP: Self = Self { bits: 1 << 5 };
+    pub const LOCK: Self = Self { bits: 1 << 6 };
+    pub const ALWAYS: Self = Self {
+        bits: (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5),
+    };
 
     pub const fn empty() -> Self {
         Self { bits: 0 }

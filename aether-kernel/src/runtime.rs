@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use aether_device::{DeviceRegistry, KernelDevice};
 use aether_drivers::{DriverInventory, register_input_sink};
@@ -81,7 +81,6 @@ pub struct KernelRuntime {
 
 static SHARED_RUNTIME: Once<Arc<KernelRuntime>> = Once::new();
 static TIMER_TICK_PENDING: AtomicBool = AtomicBool::new(false);
-static ALLOC_PHASE: AtomicU64 = AtomicU64::new(0);
 static NEXT_TIMER_DEADLINE_NANOS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
 static PROCESS_GROUP_SIGNAL_PENDING: AtomicBool = AtomicBool::new(false);
@@ -89,59 +88,6 @@ static PENDING_PROCESS_GROUP_SIGNALS: SpinLock<VecDeque<(i32, i32)>, LocalIrqDis
     SpinLock::new(VecDeque::new());
 
 const PRECISE_WAIT_THRESHOLD_NS: u64 = 10_000_000;
-
-pub(crate) const ALLOC_PHASE_IDLE: u64 = 0;
-pub(crate) const ALLOC_PHASE_ROOTFS_NEW: u64 = 1;
-pub(crate) const ALLOC_PHASE_ROOTFS_FINALIZE_PROC: u64 = 2;
-pub(crate) const ALLOC_PHASE_ROOTFS_FINALIZE_SYS: u64 = 3;
-pub(crate) const ALLOC_PHASE_ROOTFS_RETURN: u64 = 4;
-pub(crate) const ALLOC_PHASE_ROOTFS_ARC: u64 = 5;
-pub(crate) const ALLOC_PHASE_PCI_REGISTER: u64 = 6;
-pub(crate) const ALLOC_PHASE_KMSG: u64 = 7;
-pub(crate) const ALLOC_PHASE_KMSG_DEVICE: u64 = 8;
-pub(crate) const ALLOC_PHASE_BUILTIN_DEVICES: u64 = 9;
-pub(crate) const ALLOC_PHASE_FRAMEBUFFER_SURFACE: u64 = 10;
-pub(crate) const ALLOC_PHASE_FRAMEBUFFER_DEVICE: u64 = 11;
-pub(crate) const ALLOC_PHASE_FRAMEBUFFER_TERMINAL: u64 = 12;
-pub(crate) const ALLOC_PHASE_DRIVER_PROBE: u64 = 13;
-pub(crate) const ALLOC_PHASE_DEVICE_PUBLISH: u64 = 14;
-pub(crate) const ALLOC_PHASE_PROCESS_MANAGER: u64 = 15;
-pub(crate) const ALLOC_PHASE_INITIAL_FILES: u64 = 16;
-pub(crate) const ALLOC_PHASE_PREPARE_INIT: u64 = 17;
-pub(crate) const ALLOC_PHASE_BUILD_INIT: u64 = 18;
-
-pub(crate) fn set_alloc_phase(phase: u64) {
-    ALLOC_PHASE.store(phase, Ordering::Release);
-}
-
-pub(crate) fn alloc_phase() -> u64 {
-    ALLOC_PHASE.load(Ordering::Acquire)
-}
-
-pub(crate) fn alloc_phase_label(phase: u64) -> &'static str {
-    match phase {
-        ALLOC_PHASE_IDLE => "idle",
-        ALLOC_PHASE_ROOTFS_NEW => "rootfs_new",
-        ALLOC_PHASE_ROOTFS_FINALIZE_PROC => "rootfs_finalize_proc",
-        ALLOC_PHASE_ROOTFS_FINALIZE_SYS => "rootfs_finalize_sys",
-        ALLOC_PHASE_ROOTFS_RETURN => "rootfs_return",
-        ALLOC_PHASE_ROOTFS_ARC => "rootfs_arc",
-        ALLOC_PHASE_PCI_REGISTER => "pci_register",
-        ALLOC_PHASE_KMSG => "kmsg",
-        ALLOC_PHASE_KMSG_DEVICE => "kmsg_device",
-        ALLOC_PHASE_BUILTIN_DEVICES => "builtin_devices",
-        ALLOC_PHASE_FRAMEBUFFER_SURFACE => "framebuffer_surface",
-        ALLOC_PHASE_FRAMEBUFFER_DEVICE => "framebuffer_device",
-        ALLOC_PHASE_FRAMEBUFFER_TERMINAL => "framebuffer_terminal",
-        ALLOC_PHASE_DRIVER_PROBE => "driver_probe",
-        ALLOC_PHASE_DEVICE_PUBLISH => "device_publish",
-        ALLOC_PHASE_PROCESS_MANAGER => "process_manager",
-        ALLOC_PHASE_INITIAL_FILES => "initial_files",
-        ALLOC_PHASE_PREPARE_INIT => "prepare_init",
-        ALLOC_PHASE_BUILD_INIT => "build_init",
-        _ => "unknown",
-    }
-}
 
 pub(crate) fn publish_next_timer_deadline(deadline_nanos: Option<u64>) {
     NEXT_TIMER_DEADLINE_NANOS.store(deadline_nanos.unwrap_or(u64::MAX), Ordering::Release);
@@ -151,6 +97,10 @@ pub(crate) fn publish_next_timer_deadline(deadline_nanos: Option<u64>) {
 }
 
 fn runtime_tick_handler() {
+    if aether_frame::arch::cpu::current_cpu_index() != 0 {
+        return;
+    }
+    aether_drivers::drm::handle_vblank_tick();
     let deadline_nanos = NEXT_TIMER_DEADLINE_NANOS.load(Ordering::Acquire);
     let process_due = deadline_nanos != u64::MAX
         && aether_frame::interrupt::timer::nanos_since_boot() >= deadline_nanos;
@@ -185,19 +135,14 @@ impl KernelRuntime {
         crate::syscall::init();
         crate::net::init();
 
-        set_alloc_phase(ALLOC_PHASE_ROOTFS_NEW);
         let rootfs_manager = RootfsManager::new()?;
-        set_alloc_phase(ALLOC_PHASE_ROOTFS_ARC);
         let rootfs = Arc::new(rootfs_manager);
-        set_alloc_phase(ALLOC_PHASE_PCI_REGISTER);
         if let Err(error) = rootfs.register_pci_bus() {
             log::warn!("failed to register pci sysfs bus: {:?}", error);
         }
 
-        set_alloc_phase(ALLOC_PHASE_KMSG);
         let kmsg = Arc::new(KmsgBuffer::default());
         log_sinks::install_kmsg(kmsg.clone());
-        set_alloc_phase(ALLOC_PHASE_KMSG_DEVICE);
         rootfs.device_namespace().install(
             rootfs.vfs(),
             "kmsg",
@@ -207,21 +152,17 @@ impl KernelRuntime {
         let mut devices = DeviceRegistry::new();
         let mut console = None;
 
-        set_alloc_phase(ALLOC_PHASE_BUILTIN_DEVICES);
         for device in crate::devices::builtin_devices() {
             devices.register(device);
         }
 
         if let Some(info) = boot::info().framebuffer {
-            set_alloc_phase(ALLOC_PHASE_FRAMEBUFFER_SURFACE);
             let surface = FramebufferSurface::from_boot_info(info)?;
             surface.clear(RgbColor::BLACK);
 
-            set_alloc_phase(ALLOC_PHASE_FRAMEBUFFER_DEVICE);
             let fbdev: Arc<dyn KernelDevice> = Arc::new(FramebufferDevice::primary(surface));
             devices.register(fbdev);
 
-            set_alloc_phase(ALLOC_PHASE_FRAMEBUFFER_TERMINAL);
             let terminal = Arc::new(FramebufferConsole::new(surface));
             log_sinks::install_terminal(terminal.clone());
             let tty: Arc<dyn KernelDevice> = terminal.clone();
@@ -235,10 +176,8 @@ impl KernelRuntime {
 
         register_process_group_signal_hook(runtime_send_process_group_signal);
 
-        set_alloc_phase(ALLOC_PHASE_DRIVER_PROBE);
         let drivers = aether_drivers::probe_all(&mut devices);
 
-        set_alloc_phase(ALLOC_PHASE_DEVICE_PUBLISH);
         for device in devices.devices() {
             if let Err(error) = rootfs.register_device(device.clone()) {
                 log::warn!(
@@ -249,13 +188,10 @@ impl KernelRuntime {
             }
         }
 
-        set_alloc_phase(ALLOC_PHASE_PROCESS_MANAGER);
         let mut processes = ProcessManager::new();
         let initial_fs = rootfs.initial_fs_context();
         processes.set_initial_fs(initial_fs.clone());
-        set_alloc_phase(ALLOC_PHASE_INITIAL_FILES);
         processes.set_initial_files(build_initial_files(rootfs.as_ref())?);
-        set_alloc_phase(ALLOC_PHASE_PREPARE_INIT);
         let init_plan = rootfs.prepare_exec(
             &initial_fs,
             "/init",
@@ -266,7 +202,6 @@ impl KernelRuntime {
         match init_plan {
             Ok(plan) => match plan.format {
                 ExecFormat::Flat => {
-                    set_alloc_phase(ALLOC_PHASE_BUILD_INIT);
                     let argv_refs = plan.argv.iter().map(String::as_str).collect::<Vec<_>>();
                     let envp_refs = plan.envp.iter().map(String::as_str).collect::<Vec<_>>();
                     let source = NodeImageSource::new(plan.node.clone())
@@ -284,7 +219,6 @@ impl KernelRuntime {
                     );
                 }
                 ExecFormat::Elf => {
-                    set_alloc_phase(ALLOC_PHASE_BUILD_INIT);
                     let argv_refs = plan.argv.iter().map(String::as_str).collect::<Vec<_>>();
                     let envp_refs = plan.envp.iter().map(String::as_str).collect::<Vec<_>>();
                     let executable = NodeImageSource::new(plan.node.clone())
@@ -324,8 +258,6 @@ impl KernelRuntime {
                 );
             }
         }
-
-        set_alloc_phase(ALLOC_PHASE_IDLE);
 
         Ok(Self {
             rootfs,

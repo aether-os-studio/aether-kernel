@@ -52,6 +52,12 @@ impl EpollEvents {
         self.bits |= flag;
     }
 
+    pub const fn intersection_bits(self, mask: u32) -> Self {
+        Self {
+            bits: self.bits & mask,
+        }
+    }
+
     pub fn to_poll_events(self) -> PollEvents {
         let mut events = PollEvents::empty();
         if self.contains(Self::IN) || self.contains(Self::RDNORM) || self.contains(Self::RDBAND) {
@@ -60,8 +66,17 @@ impl EpollEvents {
         if self.contains(Self::OUT) || self.contains(Self::WRNORM) || self.contains(Self::WRBAND) {
             events = events | PollEvents::WRITE;
         }
-        if self.contains(Self::ERR) || self.contains(Self::HUP) || self.contains(Self::NVAL) {
+        if self.contains(Self::ERR) {
             events = events | PollEvents::ERROR;
+        }
+        if self.contains(Self::HUP) {
+            events = events | PollEvents::HUP;
+        }
+        if self.contains(Self::NVAL) {
+            events = events | PollEvents::INVALID;
+        }
+        if self.contains(Self::RDHUP) {
+            events = events | PollEvents::RDHUP;
         }
         events
     }
@@ -76,6 +91,15 @@ impl EpollEvents {
         }
         if events.contains(PollEvents::ERROR) {
             bits |= Self::ERR;
+        }
+        if events.contains(PollEvents::HUP) {
+            bits |= Self::HUP;
+        }
+        if events.contains(PollEvents::INVALID) {
+            bits |= Self::NVAL;
+        }
+        if events.contains(PollEvents::RDHUP) {
+            bits |= Self::RDHUP;
         }
         Self { bits }
     }
@@ -234,6 +258,9 @@ struct EpollInterest {
     node: NodeRef,
     event: EpollEvent,
     waiter_id: Option<u64>,
+    last_ready: EpollEvents,
+    last_token: u64,
+    disabled: bool,
 }
 
 pub struct EpollInstance {
@@ -242,6 +269,9 @@ pub struct EpollInstance {
 }
 
 impl EpollInstance {
+    const ALWAYS_EVENT_BITS: u32 =
+        EpollEvents::ERR | EpollEvents::HUP | EpollEvents::NVAL | EpollEvents::RDHUP;
+
     pub fn new() -> Self {
         Self {
             notifier: Arc::new(EpollNotifier {
@@ -262,15 +292,16 @@ impl EpollInstance {
         if poll_events.bits() == 0 {
             return Ok(None);
         }
+        let wait_events = poll_events | PollEvents::ALWAYS;
 
         let file = node.file().ok_or(FsError::NotFile)?;
         let listener: SharedWaitListener = Arc::new(EpollTargetListener {
             fd,
             notifier: self.notifier.clone(),
         });
-        let waiter_id = file.register_waiter(poll_events, listener)?;
+        let waiter_id = file.register_waiter(wait_events, listener)?;
 
-        if let Ok(ready) = node.poll(poll_events) {
+        if let Ok(ready) = node.poll(wait_events) {
             let ready = EpollEvents::from_poll_events(ready);
             if ready.bits() != 0 {
                 self.notifier.mark_ready(fd, ready);
@@ -288,6 +319,61 @@ impl EpollInstance {
         }
     }
 
+    fn collect_interest_ready(&self, fd: u64, interest: &mut EpollInterest) {
+        if interest.disabled {
+            return;
+        }
+
+        let poll_events = interest.event.events.to_poll_events() | PollEvents::ALWAYS;
+        let Ok(ready) = interest.node.poll(poll_events) else {
+            return;
+        };
+        let ready_events = EpollEvents::from_poll_events(ready);
+        let token = interest.node.wait_token();
+
+        if ready_events.bits() == 0 {
+            interest.last_ready = EpollEvents::empty();
+            interest.last_token = token;
+            return;
+        }
+
+        let should_emit = if interest.event.events.contains(EpollEvents::ET) {
+            let newly_ready = ready_events.bits()
+                & !interest
+                    .last_ready
+                    .intersection_bits(!Self::ALWAYS_EVENT_BITS)
+                    .bits();
+            let always_ready = ready_events
+                .intersection_bits(Self::ALWAYS_EVENT_BITS)
+                .bits();
+            newly_ready != 0 || always_ready != 0 || token != interest.last_token
+        } else {
+            true
+        };
+
+        interest.last_ready = ready_events;
+        interest.last_token = token;
+
+        if should_emit {
+            self.notifier.mark_ready(fd, ready_events);
+        }
+    }
+
+    fn collect_ready_interests(&self) {
+        let mut interests = self.interests.lock();
+        for (fd, interest) in interests.iter_mut() {
+            self.collect_interest_ready(*fd, interest);
+        }
+    }
+
+    fn ensure_pending_events(&self) -> bool {
+        if self.notifier.has_pending() {
+            return true;
+        }
+        self.collect_ready_interests();
+        self.notifier.has_pending()
+    }
+
     pub fn ctl(&self, op: EpollCtlOp, fd: u64, node: NodeRef, event: EpollEvent) -> FsResult<()> {
         let mut interests = self.interests.lock();
 
@@ -303,12 +389,16 @@ impl EpollInstance {
                         node,
                         event,
                         waiter_id,
+                        last_ready: EpollEvents::empty(),
+                        last_token: 0,
+                        disabled: false,
                     },
                 );
             }
             EpollCtlOp::Mod => {
                 let old = interests.remove(&fd).ok_or(FsError::NotFound)?;
                 Self::unregister_interest_waiter(&old);
+                let _ = self.notifier.ready.lock().remove(&fd);
                 let waiter_id = self.register_interest_waiter(fd, &node, event)?;
                 interests.insert(
                     fd,
@@ -316,6 +406,9 @@ impl EpollInstance {
                         node,
                         event,
                         waiter_id,
+                        last_ready: EpollEvents::empty(),
+                        last_token: 0,
+                        disabled: false,
                     },
                 );
             }
@@ -334,30 +427,43 @@ impl EpollInstance {
             return Err(FsError::InvalidInput);
         }
 
+        if !self.ensure_pending_events() {
+            return Ok(Vec::new());
+        }
+
         let ready = self.notifier.take_ready(max_events);
-        let interests = self.interests.lock();
+        let mut interests = self.interests.lock();
         let mut result = Vec::with_capacity(ready.len());
 
         for (fd, ready_bits) in ready {
-            let Some(interest) = interests.get(&fd) else {
+            let Some(interest) = interests.get_mut(&fd) else {
                 continue;
             };
+            if interest.disabled {
+                continue;
+            }
 
             let mut final_events = ready_bits;
             if interest.event.events.contains(EpollEvents::ONESHOT) {
                 final_events.insert(EpollEvents::ONESHOT);
+                Self::unregister_interest_waiter(interest);
+                interest.waiter_id = None;
+                interest.disabled = true;
             }
             result.push(EpollEvent::new(final_events, interest.event.data));
 
-            if !interest.event.events.contains(EpollEvents::ET)
-                && !interest.event.events.contains(EpollEvents::ONESHOT)
-            {
-                let poll_events = interest.event.events.to_poll_events();
-                if let Ok(still_ready) = interest.node.poll(poll_events) {
-                    let still_ready = EpollEvents::from_poll_events(still_ready);
-                    if still_ready.bits() != 0 {
-                        self.notifier.mark_ready(fd, still_ready);
-                    }
+            if interest.event.events.contains(EpollEvents::ONESHOT) {
+                continue;
+            }
+            if interest.event.events.contains(EpollEvents::ET) {
+                continue;
+            }
+
+            let poll_events = interest.event.events.to_poll_events() | PollEvents::ALWAYS;
+            if let Ok(still_ready) = interest.node.poll(poll_events) {
+                let still_ready = EpollEvents::from_poll_events(still_ready);
+                if still_ready.bits() != 0 {
+                    self.notifier.mark_ready(fd, still_ready);
                 }
             }
         }
@@ -366,7 +472,7 @@ impl EpollInstance {
     }
 
     pub fn has_pending_events(&self) -> bool {
-        self.notifier.has_pending()
+        self.ensure_pending_events()
     }
 
     pub fn interest_count(&self) -> usize {

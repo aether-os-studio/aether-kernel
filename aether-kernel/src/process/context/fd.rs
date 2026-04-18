@@ -24,6 +24,7 @@ const POLLOUT: i16 = 0x004;
 const POLLERR: i16 = 0x008;
 const POLLHUP: i16 = 0x010;
 const POLLNVAL: i16 = 0x020;
+const POLLRDHUP: i16 = 0x2000;
 const POLLRDNORM: i16 = 0x040;
 const POLLRDBAND: i16 = 0x080;
 const POLLWRNORM: i16 = 0x100;
@@ -915,7 +916,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             let ready = descriptor
                 .file
                 .lock()
-                .poll(requested | PollEvents::ERROR)
+                .poll(requested | PollEvents::ALWAYS)
                 .map_err(SysErr::from)?;
             poll_fd.revents = events_to_linux_poll(ready);
             if poll_fd.revents != 0 {
@@ -936,10 +937,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             if poll_fd.fd < 0 {
                 continue;
             }
-            let events = linux_poll_to_events(poll_fd.events);
-            if events.bits() == 0 {
-                continue;
-            }
+            let events = linux_poll_to_events(poll_fd.events) | PollEvents::ALWAYS;
             let fd = poll_fd.fd as u32;
             let Some(_descriptor) = self.process.files.get(fd) else {
                 continue;
@@ -1433,6 +1431,18 @@ fn linux_poll_to_events(events: i16) -> PollEvents {
     if (events & (POLLOUT | POLLWRNORM | POLLWRBAND)) != 0 {
         poll_events = poll_events | PollEvents::WRITE;
     }
+    if (events & POLLERR) != 0 {
+        poll_events = poll_events | PollEvents::ERROR;
+    }
+    if (events & POLLHUP) != 0 {
+        poll_events = poll_events | PollEvents::HUP;
+    }
+    if (events & POLLNVAL) != 0 {
+        poll_events = poll_events | PollEvents::INVALID;
+    }
+    if (events & POLLRDHUP) != 0 {
+        poll_events = poll_events | PollEvents::RDHUP;
+    }
     poll_events
 }
 
@@ -1445,7 +1455,16 @@ fn events_to_linux_poll(events: PollEvents) -> i16 {
         result |= POLLOUT;
     }
     if events.contains(PollEvents::ERROR) {
-        result |= POLLERR | POLLHUP;
+        result |= POLLERR;
+    }
+    if events.contains(PollEvents::HUP) {
+        result |= POLLHUP;
+    }
+    if events.contains(PollEvents::INVALID) {
+        result |= POLLNVAL;
+    }
+    if events.contains(PollEvents::RDHUP) {
+        result |= POLLRDHUP;
     }
     result
 }

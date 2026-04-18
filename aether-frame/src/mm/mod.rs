@@ -8,7 +8,7 @@ use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use good_memory_allocator::SpinLockedAllocator;
+use linked_list_allocator::LockedHeap;
 
 use crate::boot;
 use crate::libs::spin::SpinLock;
@@ -55,10 +55,10 @@ impl<T> GlobalSlot<T> {
 static FRAME_ALLOCATOR: GlobalSlot<SpinLock<BuddyFrameAllocator>> = GlobalSlot::uninit();
 
 #[global_allocator]
-static HEAP_ALLOCATOR: SpinLockedAllocator = SpinLockedAllocator::empty();
+static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 const KERNEL_HEAP_START: usize = 0xffff_e000_0000_0000;
-const KERNEL_HEAP_SIZE: usize = 64 * 1024 * 1024;
+const KERNEL_HEAP_SIZE: usize = 128 * 1024 * 1024;
 
 pub fn init() -> Result<(), BuddyAllocatorError> {
     let allocator = unsafe { BuddyFrameAllocator::bootstrap(&boot::info().memory_map)? };
@@ -79,7 +79,9 @@ pub fn init() -> Result<(), BuddyAllocatorError> {
             .expect("Failed to map heap");
     }
     unsafe {
-        HEAP_ALLOCATOR.init(KERNEL_HEAP_START, KERNEL_HEAP_SIZE);
+        HEAP_ALLOCATOR
+            .lock()
+            .init(KERNEL_HEAP_START as *mut u8, KERNEL_HEAP_SIZE);
     }
     Ok(())
 }

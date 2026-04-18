@@ -449,7 +449,6 @@ impl UnixSocket {
             return Err(SysErr::Again);
         }
         let count = min(space, buffer.len());
-        let was_empty = state.recv_size == 0;
         state.recv_stream.push_back(UnixStreamChunk {
             data: buffer[..count].to_vec(),
             read_offset: 0,
@@ -457,11 +456,7 @@ impl UnixSocket {
         });
         state.recv_size = state.recv_size.saturating_add(count);
         drop(state);
-        if was_empty {
-            peer.notify(PollEvents::READ);
-        } else {
-            peer.bump();
-        }
+        peer.notify(PollEvents::READ);
         Ok(count)
     }
 
@@ -483,7 +478,6 @@ impl UnixSocket {
         if next > state.rcvbuf {
             return Err(SysErr::Again);
         }
-        let was_empty = state.recv_size == 0;
         state.recv_packets.push_back(UnixPacket {
             data: buffer.to_vec(),
             source,
@@ -491,11 +485,7 @@ impl UnixSocket {
         });
         state.recv_size = next;
         drop(state);
-        if was_empty {
-            peer.notify(PollEvents::READ);
-        } else {
-            peer.bump();
-        }
+        peer.notify(PollEvents::READ);
         Ok(buffer.len())
     }
 
@@ -721,11 +711,17 @@ impl Drop for UnixSocket {
         }
 
         for connector in pending_connects {
-            connector.notify(PollEvents::WRITE | PollEvents::ERROR);
+            connector.notify(PollEvents::WRITE | PollEvents::ERROR | PollEvents::HUP);
         }
 
         if let Some(peer) = self.state.lock().peer.as_ref().and_then(Weak::upgrade) {
-            peer.notify(PollEvents::READ | PollEvents::WRITE | PollEvents::ERROR);
+            peer.notify(
+                PollEvents::READ
+                    | PollEvents::WRITE
+                    | PollEvents::ERROR
+                    | PollEvents::HUP
+                    | PollEvents::RDHUP,
+            );
         }
     }
 }
@@ -798,7 +794,7 @@ impl KernelSocket for UnixSocket {
 
         let client = client.ok_or(SysErr::ConnRefused)?;
         let server = UnixSocket::shared(self.kind, target.owner);
-        let backlog_was_empty = {
+        {
             let mut listener_state = target.state.lock();
             if !listener_state.listening {
                 return Err(SysErr::ConnRefused);
@@ -835,15 +831,9 @@ impl KernelSocket for UnixSocket {
                 client_state.established = true;
             }
 
-            let was_empty = listener_state.backlog.is_empty();
             listener_state.backlog.push_back(server);
-            was_empty
         };
-        if backlog_was_empty {
-            target.notify(PollEvents::READ);
-        } else {
-            target.bump();
-        }
+        target.notify(PollEvents::READ);
         Self::clear_pending_connect(&client);
         self.notify(PollEvents::WRITE);
         Ok(())
@@ -987,9 +977,21 @@ impl KernelSocket for UnixSocket {
             state.peer.as_ref().and_then(Weak::upgrade)
         };
 
-        self.notify(PollEvents::READ | PollEvents::WRITE | PollEvents::ERROR);
+        self.notify(
+            PollEvents::READ
+                | PollEvents::WRITE
+                | PollEvents::ERROR
+                | PollEvents::HUP
+                | PollEvents::RDHUP,
+        );
         if let Some(peer) = peer {
-            peer.notify(PollEvents::READ | PollEvents::WRITE | PollEvents::ERROR);
+            peer.notify(
+                PollEvents::READ
+                    | PollEvents::WRITE
+                    | PollEvents::ERROR
+                    | PollEvents::HUP
+                    | PollEvents::RDHUP,
+            );
         }
         Ok(())
     }
@@ -1035,23 +1037,33 @@ impl KernelSocket for UnixSocket {
         }
         if snapshot.listening {
             if snapshot.closed {
-                ready = ready | PollEvents::ERROR;
+                ready = ready | PollEvents::ERROR | PollEvents::HUP;
             }
             return Ok(ready);
         }
 
         if self.is_packet_like() {
-            if snapshot.shut_rd || snapshot.shut_wr || snapshot.closed {
-                ready = ready | PollEvents::ERROR;
+            if snapshot.closed || snapshot.shut_rd {
+                ready = ready | PollEvents::ERROR | PollEvents::HUP;
             }
             return Ok(ready);
         }
 
-        if snapshot.shut_rd || snapshot.shut_wr || snapshot.closed || peer_closed || peer_shut_wr {
-            ready = ready | PollEvents::ERROR;
+        if peer_closed {
+            ready = ready | PollEvents::HUP;
+        }
+        if peer_closed || peer_shut_wr {
+            ready = ready | PollEvents::RDHUP;
+        }
+        if snapshot.closed {
+            ready = ready | PollEvents::ERROR | PollEvents::HUP;
         }
 
         Ok(ready)
+    }
+
+    fn wait_token(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
     }
 
     fn register_waiter(

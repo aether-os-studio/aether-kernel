@@ -45,7 +45,7 @@ impl PipeState {
         drop(inner);
         self.bump();
         self.waiters
-            .notify(PollEvents::READ | PollEvents::WRITE | PollEvents::ERROR);
+            .notify(PollEvents::READ | PollEvents::WRITE | PollEvents::ERROR | PollEvents::HUP);
     }
 
     fn add_writer(&self) {
@@ -54,7 +54,7 @@ impl PipeState {
         drop(inner);
         self.bump();
         self.waiters
-            .notify(PollEvents::READ | PollEvents::WRITE | PollEvents::ERROR);
+            .notify(PollEvents::READ | PollEvents::WRITE | PollEvents::ERROR | PollEvents::HUP);
     }
 
     fn remove_reader(&self) {
@@ -63,7 +63,7 @@ impl PipeState {
         drop(inner);
         self.bump();
         self.waiters
-            .notify(PollEvents::READ | PollEvents::WRITE | PollEvents::ERROR);
+            .notify(PollEvents::READ | PollEvents::WRITE | PollEvents::ERROR | PollEvents::HUP);
     }
 
     fn remove_writer(&self) {
@@ -72,7 +72,7 @@ impl PipeState {
         drop(inner);
         self.bump();
         self.waiters
-            .notify(PollEvents::READ | PollEvents::WRITE | PollEvents::ERROR);
+            .notify(PollEvents::READ | PollEvents::WRITE | PollEvents::ERROR | PollEvents::HUP);
     }
 }
 
@@ -172,18 +172,19 @@ impl FileOperations for PipeEndpoint {
 
             let space = PIPE_CAPACITY.saturating_sub(inner.bytes.len());
             if space == 0 {
-                return Err(FsError::WouldBlock);
+                return if written == 0 {
+                    Err(FsError::WouldBlock)
+                } else {
+                    Ok(written)
+                };
             }
 
-            let was_empty = inner.bytes.is_empty();
             let chunk = (buffer.len() - written).min(space);
             inner.bytes.extend(&buffer[written..written + chunk]);
             written += chunk;
             drop(inner);
             self.state.bump();
-            if was_empty {
-                self.state.waiters.notify(PollEvents::READ);
-            }
+            self.state.waiters.notify(PollEvents::READ);
         }
         Ok(written)
     }
@@ -198,10 +199,14 @@ impl FileOperations for PipeEndpoint {
         {
             ready = ready | PollEvents::READ;
         }
+        if self.kind == PipeEndpointKind::Read && inner.writers == 0 {
+            ready = ready | PollEvents::HUP;
+        }
 
         if self.kind == PipeEndpointKind::Write
             && events.contains(PollEvents::WRITE)
-            && (inner.readers == 0 || inner.bytes.len() < PIPE_CAPACITY)
+            && inner.readers != 0
+            && inner.bytes.len() < PIPE_CAPACITY
         {
             ready = ready | PollEvents::WRITE;
         }

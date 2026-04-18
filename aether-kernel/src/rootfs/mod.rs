@@ -86,7 +86,6 @@ struct NamespaceLookup {
 impl RootfsManager {
     pub fn new() -> Result<Self, RootfsError> {
         let vfs = Vfs::new();
-        crate::runtime::set_alloc_phase(crate::runtime::ALLOC_PHASE_ROOTFS_NEW);
         let boot_root_node = if let Some(initrd) = boot::initrd_bytes() {
             log::info!("rootfs: loading initramfs image ({} bytes)", initrd.len());
             load_initramfs(initrd, &vfs)?
@@ -182,21 +181,18 @@ impl RootfsManager {
             boot::info().command_line,
             filesystems.types().as_slice(),
         )?;
-        crate::runtime::set_alloc_phase(crate::runtime::ALLOC_PHASE_ROOTFS_FINALIZE_PROC);
         let _proc_root = MountedNode::new(
             proc_root_mount.root,
             proc_fs,
             alloc_mount_device(),
             proc_root_mount.statfs,
         );
-        crate::runtime::set_alloc_phase(crate::runtime::ALLOC_PHASE_ROOTFS_FINALIZE_SYS);
         let _sys_root = MountedNode::new(
             sys_root_mount.root,
             sys_fs,
             alloc_mount_device(),
             sys_root_mount.statfs,
         );
-        crate::runtime::set_alloc_phase(crate::runtime::ALLOC_PHASE_ROOTFS_RETURN);
 
         Ok(Self {
             vfs,

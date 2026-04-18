@@ -2,7 +2,7 @@ extern crate alloc;
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -93,6 +93,11 @@ const DEFAULT_DRM_FORMATS: [u32; 4] = [
     DRM_FORMAT_XBGR8888,
     DRM_FORMAT_ABGR8888,
 ];
+const DRM_EVENT_BYTES: usize = 32;
+const MAX_READY_DRM_EVENTS: usize = 64;
+const MAX_PENDING_DRM_EVENTS: usize = 256;
+
+static DRM_DEVICES: SpinLock<Vec<Weak<DrmDevice>>> = SpinLock::new(Vec::new());
 
 pub const fn fourcc_code(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
@@ -141,17 +146,27 @@ impl DrmModeInfo {
         let bytes = rendered.as_bytes();
         let len = bytes.len().min(name.len().saturating_sub(1));
         name[..len].copy_from_slice(&bytes[..len]);
+        let hsync_start = width.saturating_add(16);
+        let hsync_end = width.saturating_add(16 + 96);
+        let htotal = width.saturating_add(16 + 96 + 48);
+        let vsync_start = height.saturating_add(10);
+        let vsync_end = height.saturating_add(12);
+        let vtotal = height.saturating_add(45);
+        let clock = htotal
+            .saturating_mul(vtotal)
+            .saturating_mul(refresh_hz)
+            .div_ceil(1000);
         Self {
-            clock: width.saturating_mul(refresh_hz),
+            clock,
             hdisplay: width as u16,
-            hsync_start: width.saturating_add(16) as u16,
-            hsync_end: width.saturating_add(16 + 96) as u16,
-            htotal: width.saturating_add(16 + 96 + 48) as u16,
+            hsync_start: hsync_start as u16,
+            hsync_end: hsync_end as u16,
+            htotal: htotal as u16,
             hskew: 0,
             vdisplay: height as u16,
-            vsync_start: height.saturating_add(10) as u16,
-            vsync_end: height.saturating_add(12) as u16,
-            vtotal: height.saturating_add(45) as u16,
+            vsync_start: vsync_start as u16,
+            vsync_end: vsync_end as u16,
+            vtotal: vtotal as u16,
             vscan: 0,
             vrefresh: refresh_hz,
             flags: 0,
@@ -308,6 +323,12 @@ struct DrmFramebufferState {
     pixel_format: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingDrmEvent {
+    type_: u32,
+    user_data: u64,
+}
+
 struct DrmState {
     next_handle: u32,
     next_fb_id: u32,
@@ -317,6 +338,10 @@ struct DrmState {
     dumb_buffers: BTreeMap<u32, Arc<DumbBuffer>>,
     framebuffers: BTreeMap<u32, DrmFramebufferState>,
     event_queue: VecDeque<u8>,
+    pending_events: VecDeque<PendingDrmEvent>,
+    vblank_sequence: u64,
+    vblank_period_ns: u64,
+    next_vblank_ns: u64,
 }
 
 pub struct DrmDevice {
@@ -334,7 +359,10 @@ pub struct DrmDevice {
 
 impl DrmDevice {
     pub fn new(index: usize, backend: Arc<dyn DrmScanoutBackend>) -> Arc<Self> {
-        Arc::new(Self {
+        let refresh_hz = backend.mode().vrefresh.max(1) as u64;
+        let vblank_period_ns = 1_000_000_000u64 / refresh_hz;
+        let next_vblank_ns = timer::nanos_since_boot().saturating_add(vblank_period_ns);
+        let device = Arc::new(Self {
             driver_info: backend.driver_info(),
             backend,
             index,
@@ -353,8 +381,14 @@ impl DrmDevice {
                 dumb_buffers: BTreeMap::new(),
                 framebuffers: BTreeMap::new(),
                 event_queue: VecDeque::new(),
+                pending_events: VecDeque::new(),
+                vblank_sequence: 0,
+                vblank_period_ns,
+                next_vblank_ns,
             }),
-        })
+        });
+        DRM_DEVICES.lock().push(Arc::downgrade(&device));
+        device
     }
 
     fn bump(&self) {
@@ -903,33 +937,90 @@ impl DrmDevice {
         }
         self.set_crtc(framebuffer_id)?;
         if (flags & DRM_MODE_PAGE_FLIP_EVENT) != 0 {
-            self.enqueue_flip_event(user_data);
+            self.defer_flip_event(user_data);
         }
         Ok(())
     }
 
-    fn enqueue_flip_event(&self, user_data: u64) {
-        let monotonic_ns = timer::nanos_since_boot();
+    fn front_event_len(queue: &VecDeque<u8>) -> Option<usize> {
+        if queue.len() < 8 {
+            return None;
+        }
+        let len0 = *queue.get(4)?;
+        let len1 = *queue.get(5)?;
+        let len2 = *queue.get(6)?;
+        let len3 = *queue.get(7)?;
+        Some(u32::from_ne_bytes([len0, len1, len2, len3]) as usize)
+    }
+
+    fn drop_oldest_ready_event_locked(state: &mut DrmState) {
+        let Some(event_len) = Self::front_event_len(&state.event_queue) else {
+            state.event_queue.clear();
+            return;
+        };
+        if event_len == 0 || state.event_queue.len() < event_len {
+            state.event_queue.clear();
+            return;
+        }
+        for _ in 0..event_len {
+            let _ = state.event_queue.pop_front();
+        }
+    }
+
+    fn queue_ready_event_locked(
+        &self,
+        state: &mut DrmState,
+        type_: u32,
+        user_data: u64,
+        monotonic_ns: u64,
+        sequence: u32,
+    ) {
         let tv_sec = (monotonic_ns / 1_000_000_000) as u32;
         let tv_usec = ((monotonic_ns % 1_000_000_000) / 1_000) as u32;
-        let mut event = [0u8; 32];
+        let mut event = [0u8; DRM_EVENT_BYTES];
         let event_len = event.len() as u32;
-        event[0..4].copy_from_slice(&DRM_EVENT_FLIP_COMPLETE.to_ne_bytes());
+        event[0..4].copy_from_slice(&type_.to_ne_bytes());
         event[4..8].copy_from_slice(&event_len.to_ne_bytes());
         event[8..16].copy_from_slice(&user_data.to_ne_bytes());
         event[16..20].copy_from_slice(&tv_sec.to_ne_bytes());
         event[20..24].copy_from_slice(&tv_usec.to_ne_bytes());
-        event[24..28].copy_from_slice(&0u32.to_ne_bytes());
+        event[24..28].copy_from_slice(&sequence.to_ne_bytes());
         event[28..32].copy_from_slice(&self.crtc_id.to_ne_bytes());
 
-        let should_notify = {
+        let max_bytes = MAX_READY_DRM_EVENTS.saturating_mul(DRM_EVENT_BYTES);
+        while state.event_queue.len().saturating_add(event.len()) > max_bytes {
+            Self::drop_oldest_ready_event_locked(state);
+        }
+        state.event_queue.extend(event);
+    }
+
+    fn defer_flip_event(&self, user_data: u64) {
+        let notify_now = {
             let mut state = self.state.lock();
-            let was_empty = state.event_queue.is_empty();
-            state.event_queue.extend(event);
-            was_empty
+            if state.vblank_period_ns == 0 {
+                state.vblank_sequence = state.vblank_sequence.saturating_add(1);
+                let sequence = state.vblank_sequence as u32;
+                self.queue_ready_event_locked(
+                    &mut state,
+                    DRM_EVENT_FLIP_COMPLETE,
+                    user_data,
+                    timer::nanos_since_boot(),
+                    sequence,
+                );
+                true
+            } else {
+                if state.pending_events.len() >= MAX_PENDING_DRM_EVENTS {
+                    let _ = state.pending_events.pop_front();
+                }
+                state.pending_events.push_back(PendingDrmEvent {
+                    type_: DRM_EVENT_FLIP_COMPLETE,
+                    user_data,
+                });
+                false
+            }
         };
         self.bump();
-        if should_notify {
+        if notify_now {
             self.waiters.notify(PollEvents::READ);
         }
     }
@@ -939,22 +1030,7 @@ impl DrmDevice {
         if state.event_queue.is_empty() {
             return Err(FsError::WouldBlock);
         }
-        let event_len = if state.event_queue.len() >= 8 {
-            let mut len_bytes = [0u8; 4];
-            len_bytes.copy_from_slice(
-                state
-                    .event_queue
-                    .iter()
-                    .skip(4)
-                    .take(4)
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-            );
-            u32::from_ne_bytes(len_bytes) as usize
-        } else {
-            0
-        };
+        let event_len = Self::front_event_len(&state.event_queue).unwrap_or(0);
         if event_len == 0 || buffer.len() < event_len {
             return Err(FsError::InvalidInput);
         }
@@ -976,6 +1052,44 @@ impl DrmDevice {
 
     fn has_events(&self) -> bool {
         !self.state.lock().event_queue.is_empty()
+    }
+
+    fn handle_vblank_tick(&self, now_ns: u64) {
+        let notify = {
+            let mut state = self.state.lock();
+            if state.vblank_period_ns == 0 {
+                return;
+            }
+            if now_ns < state.next_vblank_ns {
+                return;
+            }
+
+            let periods = now_ns.saturating_sub(state.next_vblank_ns) / state.vblank_period_ns + 1;
+            state.vblank_sequence = state.vblank_sequence.saturating_add(periods);
+            state.next_vblank_ns = state
+                .next_vblank_ns
+                .saturating_add(periods.saturating_mul(state.vblank_period_ns));
+
+            let sequence = state.vblank_sequence as u32;
+            let mut queued = false;
+            while let Some(event) = state.pending_events.pop_front() {
+                self.queue_ready_event_locked(
+                    &mut state,
+                    event.type_,
+                    event.user_data,
+                    now_ns,
+                    sequence,
+                );
+                queued = true;
+            }
+
+            queued
+        };
+
+        if notify {
+            self.bump();
+            self.waiters.notify(PollEvents::READ);
+        }
     }
 
     fn mmap_dumb(&self, offset: u64, length: u64) -> FsResult<MmapResponse> {
@@ -1087,6 +1201,15 @@ pub fn probe(registry: &mut DeviceRegistry) {
             file: primary,
         }));
     }
+}
+
+pub fn handle_vblank_tick() {
+    let now_ns = timer::nanos_since_boot();
+    DRM_DEVICES
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .for_each(|device| device.handle_vblank_tick(now_ns));
 }
 
 pub(crate) fn decode_argb(pixel_format: u32, pixel: u32) -> Option<(u8, u8, u8)> {

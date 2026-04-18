@@ -328,21 +328,17 @@ impl InputDevice {
             return;
         }
 
-        let should_notify = {
+        {
             let mut state = self.inner.state.lock();
-            let was_empty = state.queue.is_empty();
             for event in events {
                 if state.queue.len() >= INPUT_EVENT_QUEUE_CAPACITY {
                     let _ = state.queue.pop_front();
                 }
                 state.queue.push_back(*event);
             }
-            was_empty
-        };
-        self.inner.bump_version();
-        if should_notify {
-            self.inner.waiters.notify(PollEvents::READ);
         }
+        self.inner.bump_version();
+        self.inner.waiters.notify(PollEvents::READ);
         for event in events {
             notify_listeners(self, *event);
         }

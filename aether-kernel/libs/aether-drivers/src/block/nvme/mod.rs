@@ -871,7 +871,7 @@ impl NvmeTransport {
             return Err(NvmeProbeError::IdentifyNamespace);
         }
 
-        let max_blocks_per_transfer = PAGE_SIZE as usize / block_size;
+        let max_blocks_per_transfer = PAGE_SIZE as usize * NVME_TRANSFER_PAGES / block_size;
         if max_blocks_per_transfer == 0 {
             return Err(NvmeProbeError::UnsupportedPageSize);
         }
@@ -947,7 +947,7 @@ impl NvmeTransport {
             return Err(NvmeProbeError::IdentifyNamespace);
         }
 
-        let max_blocks_per_transfer = PAGE_SIZE as usize / block_size;
+        let max_blocks_per_transfer = PAGE_SIZE as usize * NVME_TRANSFER_PAGES / block_size;
         if max_blocks_per_transfer == 0 {
             return Err(NvmeProbeError::UnsupportedPageSize);
         }

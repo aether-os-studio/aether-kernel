@@ -60,10 +60,12 @@ impl FramebufferSurface {
         })
     }
 
+    #[inline(always)]
     pub fn info(&self) -> FramebufferInfo {
         self.info
     }
 
+    #[inline(always)]
     pub fn physical_base(&self) -> u64 {
         if self.info.base >= aether_frame::boot::hhdm_offset() {
             self.info.base - aether_frame::boot::hhdm_offset()
@@ -72,26 +74,32 @@ impl FramebufferSurface {
         }
     }
 
+    #[inline(always)]
     pub fn width(&self) -> usize {
         self.info.width as usize
     }
 
+    #[inline(always)]
     pub fn height(&self) -> usize {
         self.info.height as usize
     }
 
+    #[inline(always)]
     pub fn stride(&self) -> usize {
         self.info.stride as usize
     }
 
+    #[inline(always)]
     pub fn bytes_per_pixel(&self) -> usize {
         self.info.bits_per_pixel.div_ceil(8) as usize
     }
 
+    #[inline(always)]
     pub fn byte_len(&self) -> usize {
         self.info.size as usize
     }
 
+    #[inline(always)]
     pub fn write_pixel(&self, x: usize, y: usize, color: RgbColor) -> Result<(), FramebufferError> {
         if x >= self.width() || y >= self.height() {
             return Err(FramebufferError::OutOfBounds);
@@ -111,6 +119,7 @@ impl FramebufferSurface {
         Ok(())
     }
 
+    #[inline(always)]
     pub fn write_packed_pixel(
         &self,
         x: usize,
@@ -134,10 +143,12 @@ impl FramebufferSurface {
         Ok(())
     }
 
+    #[inline(always)]
     pub fn pack_color(&self, color: RgbColor) -> u32 {
         pack_color(self.info, color)
     }
 
+    #[inline(always)]
     pub fn clear(&self, color: RgbColor) {
         for y in 0..self.height() {
             for x in 0..self.width() {
@@ -146,6 +157,7 @@ impl FramebufferSurface {
         }
     }
 
+    #[inline(always)]
     pub fn write_bytes(&self, offset: usize, buffer: &[u8]) -> FsResult<usize> {
         if offset > self.byte_len() {
             return Err(FsError::InvalidInput);
@@ -158,6 +170,7 @@ impl FramebufferSurface {
         Ok(count)
     }
 
+    #[inline(always)]
     pub fn read_bytes(&self, offset: usize, buffer: &mut [u8]) -> FsResult<usize> {
         if offset > self.byte_len() {
             return Err(FsError::InvalidInput);

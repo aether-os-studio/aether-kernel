@@ -225,6 +225,10 @@ pub trait KernelSocket: Any + Send + Sync {
         Ok(PollEvents::empty())
     }
 
+    fn wait_token(&self) -> u64 {
+        0
+    }
+
     fn register_waiter(
         &self,
         _events: PollEvents,
@@ -290,6 +294,10 @@ impl FileOperations for SocketFile {
 
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
         self.socket.poll(events)
+    }
+
+    fn wait_token(&self) -> u64 {
+        self.socket.wait_token()
     }
 
     fn register_waiter(

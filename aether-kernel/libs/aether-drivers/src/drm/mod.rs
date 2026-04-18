@@ -22,5 +22,5 @@ pub use self::core::{
     DrmConnectorSnapshot, DrmCrtcSnapshot, DrmDriverInfo, DrmEncoderSnapshot, DrmFile,
     DrmFramebufferCreate, DrmFramebufferSnapshot, DrmIoctlError, DrmModeInfo,
     DrmObjectPropertiesSnapshot, DrmPlaneSnapshot, DrmPropertyEnumValue, DrmPropertyInfo,
-    DrmResourcesSnapshot, probe,
+    DrmResourcesSnapshot, handle_vblank_tick, probe,
 };

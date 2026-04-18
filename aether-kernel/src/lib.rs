@@ -85,22 +85,11 @@ fn secondary_cpu_main(cpu_index: usize) -> ! {
 
 #[alloc_error_handler]
 fn alloc_error(layout: Layout) -> ! {
-    let initramfs = aether_initramfs::load_progress();
-    let runtime_phase = runtime::alloc_phase();
-    log::error!(
-        "allocation failed: size={} align={} initramfs_entry={} phase={} file_size={} name_hash={:#x} runtime_phase={} runtime_label={}",
+    panic!(
+        "allocation failed: size={} align={}",
         layout.size(),
         layout.align(),
-        initramfs.entry_index,
-        initramfs.phase,
-        initramfs.file_size,
-        initramfs.name_hash,
-        runtime_phase,
-        runtime::alloc_phase_label(runtime_phase),
     );
-    loop {
-        core::hint::spin_loop();
-    }
 }
 
 #[panic_handler]

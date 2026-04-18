@@ -68,10 +68,10 @@ impl ProcessManager {
                 let ready = descriptor
                     .file
                     .lock()
-                    .poll(events | PollEvents::ERROR)
+                    .poll(events | PollEvents::ALWAYS)
                     .ok()?;
                 ready
-                    .intersects(events | PollEvents::ERROR)
+                    .intersects(events | PollEvents::ALWAYS)
                     .then_some(BlockResult::File { ready: true })
             }
             ProcessState::Blocked(ProcessBlock::Poll { .. }) => {
@@ -82,8 +82,8 @@ impl ProcessManager {
                     descriptor
                         .file
                         .lock()
-                        .poll(registration.events | PollEvents::ERROR)
-                        .map(|ready| ready.intersects(registration.events | PollEvents::ERROR))
+                        .poll(registration.events | PollEvents::ALWAYS)
+                        .map(|ready| ready.intersects(registration.events | PollEvents::ALWAYS))
                         .unwrap_or(false)
                 }) {
                     Some(BlockResult::Poll { timed_out: false })
@@ -208,10 +208,11 @@ impl ProcessManager {
                 continue;
             };
             let file = descriptor.file.clone();
+            let wait_events = registration.events | PollEvents::ALWAYS;
             let waiter_id = {
                 let file_guard = file.lock();
                 file_guard
-                    .register_waiter(registration.events, listener.clone())
+                    .register_waiter(wait_events, listener.clone())
                     .ok()
                     .flatten()
             };

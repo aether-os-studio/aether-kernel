@@ -1266,7 +1266,6 @@ impl TtyFile {
         let endpoint = self.endpoint();
         let wake = {
             let mut state = endpoint.tty.lock();
-            let was_empty = state.input_count == 0;
             match event.code {
                 KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
                     state.key_shift = event.value != 0;
@@ -1294,7 +1293,7 @@ impl TtyFile {
                     let Some(len) = tty_translate_key(&state, event.code, &mut bytes) else {
                         return;
                     };
-                    tty_receive_bytes(&endpoint, &mut state, &bytes[..len]) && was_empty
+                    tty_receive_bytes(&endpoint, &mut state, &bytes[..len])
                 }
             }
         };
@@ -1471,10 +1470,12 @@ impl FramebufferPlane {
         });
     }
 
+    #[inline(always)]
     fn offset(&self, x: usize, y: usize) -> Option<usize> {
         (x < self.width && y < self.height).then_some(y * self.width + x)
     }
 
+    #[inline(always)]
     fn draw_pixel(&self, x: usize, y: usize, color: RgbColor) {
         let Some(offset) = self.offset(x, y) else {
             return;
