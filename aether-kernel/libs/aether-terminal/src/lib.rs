@@ -480,6 +480,14 @@ impl TtyEndpoint {
         }
 
         let tty_mode = self.tty.lock().tty_mode;
+        self.write_bytes_in_mode(tty_mode, bytes);
+    }
+
+    fn write_bytes_in_mode(&self, tty_mode: i32, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+
         if tty_mode != KD_GRAPHICS {
             self.backend.write_bytes(bytes);
         }
@@ -526,7 +534,7 @@ fn tty_echo_bytes(endpoint: &TtyEndpoint, state: &ConsoleTtyState, bytes: &[u8])
     if bytes.is_empty() || (state.termios.c_lflag & ECHO) == 0 {
         return;
     }
-    endpoint.write_bytes(bytes);
+    endpoint.write_bytes_in_mode(state.tty_mode, bytes);
 }
 
 fn tty_echo_erase(endpoint: &TtyEndpoint, state: &ConsoleTtyState) {
