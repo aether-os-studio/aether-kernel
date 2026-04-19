@@ -5,8 +5,11 @@ pub enum FrameAllocError {
     InvalidCount,
     OutOfMemory,
     InvalidFrame,
+    InvalidCpu,
+    InvalidMemoryMap,
     RefCountOverflow,
     RefCountUnderflow,
+    MetadataExhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

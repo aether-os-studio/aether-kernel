@@ -4,57 +4,79 @@ mod frame;
 mod mapper;
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::cell::UnsafeCell;
-use core::marker::PhantomData;
 use core::mem::MaybeUninit;
+use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use linked_list_allocator::Heap;
 
 use crate::boot;
-use crate::libs::spin::{LocalIrqDisabled, SpinLock};
+use crate::libs::spin::{LocalIrqDisabled, PreemptDisabled, SpinLock, SpinLockGuard};
 
 pub use self::address::{PAGE_SHIFT, PAGE_SIZE, PhysAddr, VirtAddr};
-pub use self::buddy::{BuddyAllocatorError, BuddyFrameAllocator};
+pub use self::buddy::BuddyAllocator;
 pub use self::frame::{FrameAllocError, FrameAllocator, PhysFrame};
 pub use self::mapper::{AddressSpace, MapFlags, MapSize, MappingError, PageTableArch, UnmapResult};
 #[cfg(target_arch = "x86_64")]
 pub use crate::arch::mm::new_user_root;
 pub use crate::arch::mm::{ArchitecturePageTable, PageTableEntry};
 
-struct GlobalSlot<T> {
+pub struct FrameAllocatorSlot {
     ready: AtomicBool,
-    value: UnsafeCell<MaybeUninit<T>>,
-    _marker: PhantomData<*const ()>,
+    value: SpinLock<MaybeUninit<BuddyAllocator>>,
 }
 
-unsafe impl<T> Sync for GlobalSlot<T> {}
+pub struct FrameAllocatorGuard<'a> {
+    guard: SpinLockGuard<'a, MaybeUninit<BuddyAllocator>, PreemptDisabled>,
+}
 
-impl<T> GlobalSlot<T> {
+unsafe impl Sync for FrameAllocatorSlot {}
+
+impl FrameAllocatorSlot {
     const fn uninit() -> Self {
         Self {
             ready: AtomicBool::new(false),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
-            _marker: PhantomData,
+            value: SpinLock::new(MaybeUninit::uninit()),
         }
     }
 
-    unsafe fn write(&self, value: T) {
-        unsafe {
-            (*self.value.get()).write(value);
-        }
+    unsafe fn init_with<E>(
+        &self,
+        init: impl FnOnce(*mut BuddyAllocator) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut slot = self.value.lock();
+        init(slot.as_mut_ptr())?;
         self.ready.store(true, Ordering::Release);
+        Ok(())
     }
 
-    fn get(&self) -> Option<&T> {
-        self.ready
-            .load(Ordering::Acquire)
-            .then(|| unsafe { (*self.value.get()).assume_init_ref() })
+    pub fn lock(&self) -> FrameAllocatorGuard<'_> {
+        assert!(
+            self.ready.load(Ordering::Acquire),
+            "frame allocator must be initialized before use"
+        );
+        FrameAllocatorGuard {
+            guard: self.value.lock(),
+        }
     }
 }
 
-static FRAME_ALLOCATOR: GlobalSlot<SpinLock<BuddyFrameAllocator>> = GlobalSlot::uninit();
+impl Deref for FrameAllocatorGuard<'_> {
+    type Target = BuddyAllocator;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.guard.assume_init_ref() }
+    }
+}
+
+impl DerefMut for FrameAllocatorGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.guard.assume_init_mut() }
+    }
+}
+
+static FRAME_ALLOCATOR: FrameAllocatorSlot = FrameAllocatorSlot::uninit();
 
 pub struct LockedHeap(SpinLock<Heap, LocalIrqDisabled>);
 
@@ -89,11 +111,12 @@ static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
 const KERNEL_HEAP_START: usize = 0xffff_e000_0000_0000;
 const KERNEL_HEAP_SIZE: usize = 128 * 1024 * 1024;
 
-pub fn init() -> Result<(), BuddyAllocatorError> {
-    let allocator = unsafe { BuddyFrameAllocator::bootstrap(&boot::info().memory_map)? };
+pub fn init() -> Result<(), FrameAllocError> {
     let mut current_address_space = AddressSpace::<ArchitecturePageTable>::current();
     unsafe {
-        FRAME_ALLOCATOR.write(SpinLock::new(allocator));
+        FRAME_ALLOCATOR.init_with(|slot| {
+            BuddyAllocator::bootstrap_in_place(slot, &boot::info().memory_map, 16)
+        })?;
     }
     for addr in
         (KERNEL_HEAP_START..KERNEL_HEAP_START + KERNEL_HEAP_SIZE).step_by(PAGE_SIZE as usize)
@@ -113,8 +136,6 @@ pub fn init() -> Result<(), BuddyAllocatorError> {
     Ok(())
 }
 
-pub fn frame_allocator() -> &'static SpinLock<BuddyFrameAllocator> {
-    FRAME_ALLOCATOR
-        .get()
-        .expect("frame allocator must be initialized before use")
+pub fn frame_allocator() -> &'static FrameAllocatorSlot {
+    &FRAME_ALLOCATOR
 }
