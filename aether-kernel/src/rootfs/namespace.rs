@@ -173,6 +173,11 @@ pub type FsLocation = VfsPath;
 
 #[derive(Clone)]
 pub struct ProcessFsContext {
+    inner: Arc<SpinLock<ProcessFsState>>,
+}
+
+#[derive(Clone)]
+struct ProcessFsState {
     namespace: Arc<SpinLock<MountNamespace>>,
     root: FsLocation,
     cwd: FsLocation,
@@ -183,45 +188,58 @@ impl ProcessFsContext {
         let root_node = namespace.lock().root_node();
         let root = FsLocation::new(String::from("/"), root_node);
         Self {
-            namespace,
-            root: root.clone(),
-            cwd: root,
+            inner: Arc::new(SpinLock::new(ProcessFsState {
+                namespace,
+                root: root.clone(),
+                cwd: root,
+            })),
+        }
+    }
+
+    pub fn fork_copy(&self) -> Self {
+        let state = self.inner.lock();
+        Self {
+            inner: Arc::new(SpinLock::new(ProcessFsState {
+                namespace: state.namespace.clone(),
+                root: state.root.clone(),
+                cwd: state.cwd.clone(),
+            })),
         }
     }
 
     pub fn namespace(&self) -> Arc<SpinLock<MountNamespace>> {
-        self.namespace.clone()
+        self.inner.lock().namespace.clone()
     }
 
-    pub fn root_path(&self) -> &str {
-        self.root.path()
+    pub fn root_path(&self) -> String {
+        self.inner.lock().root.path().into()
     }
 
-    pub fn cwd_path(&self) -> &str {
-        self.cwd.path()
+    pub fn cwd_path(&self) -> String {
+        self.inner.lock().cwd.path().into()
     }
 
     pub fn root_node(&self) -> NodeRef {
-        self.root.node()
+        self.inner.lock().root.node()
     }
 
     pub fn cwd_node(&self) -> NodeRef {
-        self.cwd.node()
+        self.inner.lock().cwd.node()
     }
 
     pub fn set_root_location(&mut self, location: FsLocation) {
-        self.root = location;
+        self.inner.lock().root = location;
     }
 
     pub fn set_cwd_location(&mut self, location: FsLocation) {
-        self.cwd = location;
+        self.inner.lock().cwd = location;
     }
 
     pub fn rebind_root_path(&mut self, path: String) {
-        self.root.rebind_path(path);
+        self.inner.lock().root.rebind_path(path);
     }
 
     pub fn rebind_cwd_path(&mut self, path: String) {
-        self.cwd.rebind_path(path);
+        self.inner.lock().cwd.rebind_path(path);
     }
 }

@@ -76,7 +76,7 @@ pub mod nr {
     pub const GETEUID: u64 = 107;
     pub const GETEGID: u64 = 108;
     pub const GETPPID: u64 = 110;
-    pub const IOPL: u64 = 112;
+    pub const SETSID: u64 = 112;
     pub const SETRESUID: u64 = 117;
     pub const SETGROUPS: u64 = 116;
     pub const GETRESUID: u64 = 118;
@@ -92,6 +92,7 @@ pub mod nr {
     pub const CHROOT: u64 = 161;
     pub const MOUNT: u64 = 165;
     pub const UMOUNT2: u64 = 166;
+    pub const IOPL: u64 = 172;
     pub const GETTID: u64 = 186;
     pub const TKILL: u64 = 200;
     pub const TIME: u64 = 201;

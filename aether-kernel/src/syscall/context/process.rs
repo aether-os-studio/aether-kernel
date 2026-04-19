@@ -22,7 +22,9 @@ pub trait ProcessSyscallOps {
     fn fork(&mut self, flags: u64) -> SysResult<u64>;
     fn vfork_blocking(&mut self) -> SyscallDisposition;
     fn clone_process(&mut self, params: CloneParams) -> SysResult<u64>;
+    fn clone_process_blocking(&mut self, params: CloneParams) -> SyscallDisposition;
     fn clone3(&mut self, args: u64, size: usize) -> SysResult<u64>;
+    fn clone3_blocking(&mut self, args: u64, size: usize) -> SyscallDisposition;
     fn wait4(&mut self, pid: i32, status: u64, options: u64, rusage: u64) -> SysResult<u64>;
     fn wait4_blocking(
         &mut self,
@@ -32,6 +34,8 @@ pub trait ProcessSyscallOps {
         rusage: u64,
     ) -> SyscallDisposition;
     fn send_signal(&mut self, pid: i32, signal: u64) -> SysResult<u64>;
+    fn tkill(&mut self, pid: i32, signal: u64) -> SysResult<u64>;
+    fn tgkill(&mut self, tgid: i32, pid: i32, signal: u64) -> SysResult<u64>;
     fn set_tid_address(&mut self, address: u64) -> SysResult<u64>;
     fn execve(&mut self, path: &str, argv: Vec<String>, envp: Vec<String>) -> SysResult<u64>;
     fn prctl(&mut self, option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> SysResult<u64>;

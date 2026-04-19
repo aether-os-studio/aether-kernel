@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use core::ops::BitOr;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{Dentry, DentryRef, FsError, FsResult, NodeRef, SharedWaitListener};
+use crate::{Dentry, DentryRef, FileOperations, FsError, FsResult, NodeRef, SharedWaitListener};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileAdvice {
@@ -200,24 +200,119 @@ impl MmapResponse {
 
 pub struct VfsFile {
     dentry: DentryRef,
+    operations: Option<Arc<dyn FileOperations>>,
     flags: OpenFlags,
     position: usize,
 }
 
+struct SharedInodeFile {
+    inode: NodeRef,
+}
+
+impl FileOperations for SharedInodeFile {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn open(&self) {
+        self.inode.open();
+    }
+
+    fn release(&self) {
+        self.inode.release();
+    }
+
+    fn read(&self, offset: usize, buffer: &mut [u8]) -> FsResult<usize> {
+        self.inode.read(offset, buffer)
+    }
+
+    fn write(&self, offset: usize, buffer: &[u8]) -> FsResult<usize> {
+        self.inode.write(offset, buffer)
+    }
+
+    fn advise(&self, offset: u64, len: u64, advice: FileAdvice) -> FsResult<()> {
+        self.inode.advise(offset, len, advice)
+    }
+
+    fn size(&self) -> usize {
+        self.inode.size()
+    }
+
+    fn truncate(&self, size: usize) -> FsResult<()> {
+        self.inode.truncate(size)
+    }
+
+    fn fallocate(&self, mode: u32, offset: u64, len: u64) -> FsResult<()> {
+        self.inode.fallocate(mode, offset, len)
+    }
+
+    fn wait_token(&self) -> u64 {
+        self.inode.wait_token()
+    }
+
+    fn register_waiter(
+        &self,
+        events: PollEvents,
+        listener: SharedWaitListener,
+    ) -> FsResult<Option<u64>> {
+        self.inode.register_waiter(events, listener)
+    }
+
+    fn unregister_waiter(&self, waiter_id: u64) -> FsResult<()> {
+        self.inode.unregister_waiter(waiter_id)
+    }
+
+    fn ioctl(&self, command: u64, argument: u64) -> FsResult<IoctlResponse> {
+        self.inode.ioctl(command, argument)
+    }
+
+    fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
+        self.inode.poll(events)
+    }
+
+    fn mmap(&self, request: MmapRequest) -> FsResult<MmapResponse> {
+        self.inode.mmap(request)
+    }
+}
+
 impl VfsFile {
-    pub fn new(dentry: DentryRef, flags: OpenFlags) -> Self {
-        dentry.inode().open();
-        Self {
+    pub fn try_new(dentry: DentryRef, flags: OpenFlags) -> FsResult<Self> {
+        let inode = dentry.inode();
+        let operations = match inode.open_file(flags) {
+            Ok(operations) => {
+                operations.open();
+                Some(operations)
+            }
+            Err(FsError::NotFile) if inode.kind() == crate::NodeKind::Directory => None,
+            Err(FsError::NotFile) if inode.file().is_some() => {
+                let operations: Arc<dyn FileOperations> = Arc::new(SharedInodeFile {
+                    inode: inode.clone(),
+                });
+                operations.open();
+                Some(operations)
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
             dentry,
+            operations,
             flags,
             position: 0,
-        }
+        })
+    }
+
+    pub fn new(dentry: DentryRef, flags: OpenFlags) -> Self {
+        Self::try_new(dentry, flags).expect("vfs open must succeed")
+    }
+
+    pub fn try_from_inode(inode: NodeRef, flags: OpenFlags) -> FsResult<Self> {
+        let name = String::from(inode.name());
+        let dentry = Dentry::new(name, inode, None);
+        Self::try_new(dentry, flags)
     }
 
     pub fn from_inode(inode: NodeRef, flags: OpenFlags) -> Self {
-        let name = String::from(inode.name());
-        let dentry = Dentry::new(name, inode, None);
-        Self::new(dentry, flags)
+        Self::try_from_inode(inode, flags).expect("vfs open must succeed")
     }
 
     pub fn inode(&self) -> NodeRef {
@@ -250,7 +345,8 @@ impl VfsFile {
         if !self.flags.can_read() {
             return Err(FsError::InvalidInput);
         }
-        match self.inode().read(self.position, buffer) {
+        let operations = self.operations.as_ref().ok_or(FsError::NotFile)?;
+        match operations.read(self.position, buffer) {
             Ok(read) => {
                 self.position = self.position.saturating_add(read);
                 Ok(read)
@@ -266,7 +362,8 @@ impl VfsFile {
         if self.flags.append() {
             self.position = self.inode().size();
         }
-        match self.inode().write(self.position, buffer) {
+        let operations = self.operations.as_ref().ok_or(FsError::NotFile)?;
+        match operations.write(self.position, buffer) {
             Ok(written) => {
                 self.position = self.position.saturating_add(written);
                 Ok(written)
@@ -276,27 +373,45 @@ impl VfsFile {
     }
 
     pub fn ioctl(&self, command: u64, argument: u64) -> FsResult<IoctlResponse> {
-        self.inode().ioctl(command, argument)
+        self.operations
+            .as_ref()
+            .ok_or(FsError::NotFile)?
+            .ioctl(command, argument)
     }
 
     pub fn advise(&self, offset: u64, len: u64, advice: FileAdvice) -> FsResult<()> {
-        self.inode().advise(offset, len, advice)
+        self.operations
+            .as_ref()
+            .ok_or(FsError::NotFile)?
+            .advise(offset, len, advice)
     }
 
     pub fn fallocate(&self, mode: u32, offset: u64, len: u64) -> FsResult<()> {
-        self.inode().fallocate(mode, offset, len)
+        self.operations
+            .as_ref()
+            .ok_or(FsError::NotFile)?
+            .fallocate(mode, offset, len)
     }
 
     pub fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
-        self.inode().poll(events)
+        self.operations
+            .as_ref()
+            .map_or(Ok(PollEvents::empty()), |operations| {
+                operations.poll(events)
+            })
     }
 
     pub fn mmap(&self, request: MmapRequest) -> FsResult<MmapResponse> {
-        self.inode().mmap(request)
+        self.operations
+            .as_ref()
+            .ok_or(FsError::NotFile)?
+            .mmap(request)
     }
 
     pub fn wait_token(&self) -> u64 {
-        self.inode().wait_token()
+        self.operations
+            .as_ref()
+            .map_or(0, |operations| operations.wait_token())
     }
 
     pub fn register_waiter(
@@ -304,17 +419,31 @@ impl VfsFile {
         events: PollEvents,
         listener: SharedWaitListener,
     ) -> FsResult<Option<u64>> {
-        self.inode().register_waiter(events, listener)
+        self.operations.as_ref().map_or(Ok(None), |operations| {
+            operations.register_waiter(events, listener)
+        })
     }
 
     pub fn unregister_waiter(&self, waiter_id: u64) -> FsResult<()> {
-        self.inode().unregister_waiter(waiter_id)
+        self.operations
+            .as_ref()
+            .map_or(Ok(()), |operations| operations.unregister_waiter(waiter_id))
+    }
+
+    pub fn file_ops(&self) -> Option<&dyn FileOperations> {
+        self.operations.as_deref()
+    }
+
+    pub fn file_ops_arc(&self) -> Option<Arc<dyn FileOperations>> {
+        self.operations.clone()
     }
 }
 
 impl Drop for VfsFile {
     fn drop(&mut self) {
-        self.dentry.inode().release();
+        if let Some(operations) = &self.operations {
+            operations.release();
+        }
     }
 }
 
@@ -324,18 +453,26 @@ pub struct OpenFileDescription {
 }
 
 impl OpenFileDescription {
-    pub fn new(node: NodeRef, flags: OpenFlags) -> Self {
-        Self {
+    pub fn try_new(node: NodeRef, flags: OpenFlags) -> FsResult<Self> {
+        Ok(Self {
             id: next_open_file_description_id(),
-            file: VfsFile::from_inode(node, flags),
-        }
+            file: VfsFile::try_from_inode(node, flags)?,
+        })
+    }
+
+    pub fn new(node: NodeRef, flags: OpenFlags) -> Self {
+        Self::try_new(node, flags).expect("vfs open must succeed")
+    }
+
+    pub fn try_from_dentry(dentry: DentryRef, flags: OpenFlags) -> FsResult<Self> {
+        Ok(Self {
+            id: next_open_file_description_id(),
+            file: VfsFile::try_new(dentry, flags)?,
+        })
     }
 
     pub fn from_dentry(dentry: DentryRef, flags: OpenFlags) -> Self {
-        Self {
-            id: next_open_file_description_id(),
-            file: VfsFile::new(dentry, flags),
-        }
+        Self::try_from_dentry(dentry, flags).expect("vfs open must succeed")
     }
 
     pub fn id(&self) -> u64 {
@@ -348,6 +485,14 @@ impl OpenFileDescription {
 
     pub fn dentry(&self) -> DentryRef {
         self.file.dentry()
+    }
+
+    pub fn file_ops(&self) -> Option<&dyn FileOperations> {
+        self.file.file_ops()
+    }
+
+    pub fn file_ops_arc(&self) -> Option<Arc<dyn FileOperations>> {
+        self.file.file_ops_arc()
     }
 
     pub fn flags(&self) -> OpenFlags {

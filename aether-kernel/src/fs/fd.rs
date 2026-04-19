@@ -19,7 +19,7 @@ pub struct FileDescriptor {
 
 #[derive(Clone, Default)]
 pub struct FdTable {
-    entries: BTreeMap<u32, FileDescriptor>,
+    entries: Arc<SpinLock<BTreeMap<u32, FileDescriptor>>>,
 }
 
 impl FdTable {
@@ -33,24 +33,30 @@ impl FdTable {
         stderr: NodeRef,
         filesystem: FileSystemIdentity,
     ) -> Self {
-        let mut table = Self::empty();
-        table.entries.insert(
+        let table = Self::empty();
+        table.insert_at(
             0,
             Self::descriptor(stdin, OpenFlags::from_bits(OpenFlags::READ), filesystem),
         );
-        table.entries.insert(
+        table.insert_at(
             1,
             Self::descriptor(stdout, OpenFlags::from_bits(OpenFlags::WRITE), filesystem),
         );
-        table.entries.insert(
+        table.insert_at(
             2,
             Self::descriptor(stderr, OpenFlags::from_bits(OpenFlags::WRITE), filesystem),
         );
         table
     }
 
+    pub fn fork_copy(&self) -> Self {
+        Self {
+            entries: Arc::new(SpinLock::new(self.entries.lock().clone())),
+        }
+    }
+
     pub fn insert_node(
-        &mut self,
+        &self,
         node: NodeRef,
         flags: OpenFlags,
         filesystem: FileSystemIdentity,
@@ -68,72 +74,85 @@ impl FdTable {
         )
     }
 
-    pub fn insert(&mut self, descriptor: FileDescriptor, min_fd: u32) -> u32 {
+    pub fn insert(&self, descriptor: FileDescriptor, min_fd: u32) -> u32 {
+        let mut entries = self.entries.lock();
         let mut fd = min_fd;
-        while self.entries.contains_key(&fd) {
+        while entries.contains_key(&fd) {
             fd = fd.saturating_add(1);
         }
-        self.entries.insert(fd, descriptor);
+        entries.insert(fd, descriptor);
         fd
     }
 
-    pub fn get(&self, fd: u32) -> Option<&FileDescriptor> {
-        self.entries.get(&fd)
+    pub fn get(&self, fd: u32) -> Option<FileDescriptor> {
+        self.entries.lock().get(&fd).cloned()
     }
 
-    pub fn get_mut(&mut self, fd: u32) -> Option<&mut FileDescriptor> {
-        self.entries.get_mut(&fd)
+    pub fn with_descriptor_mut<R>(
+        &self,
+        fd: u32,
+        f: impl FnOnce(&mut FileDescriptor) -> R,
+    ) -> Option<R> {
+        let mut entries = self.entries.lock();
+        entries.get_mut(&fd).map(f)
     }
 
-    pub fn entries(&self) -> impl Iterator<Item = (&u32, &FileDescriptor)> {
-        self.entries.iter()
+    pub fn entries(&self) -> alloc::vec::Vec<(u32, FileDescriptor)> {
+        self.entries
+            .lock()
+            .iter()
+            .map(|(fd, descriptor)| (*fd, descriptor.clone()))
+            .collect()
     }
 
-    pub fn insert_at(&mut self, fd: u32, descriptor: FileDescriptor) {
-        self.entries.insert(fd, descriptor);
+    pub fn insert_at(&self, fd: u32, descriptor: FileDescriptor) {
+        self.entries.lock().insert(fd, descriptor);
     }
 
-    pub fn close(&mut self, fd: u32) -> bool {
-        self.entries.remove(&fd).is_some()
+    pub fn close(&self, fd: u32) -> bool {
+        self.entries.lock().remove(&fd).is_some()
     }
 
-    pub fn duplicate(&mut self, fd: u32, min_fd: u32, cloexec: bool) -> Option<u32> {
+    pub fn duplicate(&self, fd: u32, min_fd: u32, cloexec: bool) -> Option<u32> {
         let mut duplicate = self.get(fd)?.clone();
         duplicate.cloexec = cloexec;
         Some(self.insert(duplicate, min_fd))
     }
 
-    pub fn duplicate_to(&mut self, fd: u32, newfd: u32, cloexec: bool) -> Option<u32> {
+    pub fn duplicate_to(&self, fd: u32, newfd: u32, cloexec: bool) -> Option<u32> {
         let mut duplicate = self.get(fd)?.clone();
         duplicate.cloexec = cloexec;
-        self.entries.insert(newfd, duplicate);
+        self.entries.lock().insert(newfd, duplicate);
         Some(newfd)
     }
 
-    pub fn close_range(&mut self, first: u32, last: u32) {
+    pub fn close_range(&self, first: u32, last: u32) {
         if first > last {
             return;
         }
 
-        let mut tail = self.entries.split_off(&first);
+        let mut entries = self.entries.lock();
+        let mut tail = entries.split_off(&first);
         let mut keep = if last == u32::MAX {
             BTreeMap::new()
         } else {
             tail.split_off(&last.saturating_add(1))
         };
-        self.entries.append(&mut keep);
+        entries.append(&mut keep);
     }
 
-    pub fn close_cloexec(&mut self) {
-        self.entries.retain(|_, descriptor| !descriptor.cloexec);
+    pub fn close_cloexec(&self) {
+        self.entries
+            .lock()
+            .retain(|_, descriptor| !descriptor.cloexec);
     }
 
-    pub fn set_cloexec_range(&mut self, first: u32, last: u32) {
+    pub fn set_cloexec_range(&self, first: u32, last: u32) {
         if first > last {
             return;
         }
 
-        for (_, descriptor) in self.entries.range_mut(first..=last) {
+        for (_, descriptor) in self.entries.lock().range_mut(first..=last) {
             descriptor.cloexec = true;
         }
     }

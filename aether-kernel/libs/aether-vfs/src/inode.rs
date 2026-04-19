@@ -10,7 +10,7 @@ use aether_frame::libs::spin::SpinLock;
 use crate::file::{FlockOperation, FlockState};
 use crate::{
     DirectoryEntry, FileAdvice, FileOperations, FsError, FsResult, IoctlResponse, MmapRequest,
-    MmapResponse, NodeKind, NodeMetadata, PollEvents, SharedWaitListener, SuperBlock,
+    MmapResponse, NodeKind, NodeMetadata, OpenFlags, PollEvents, SharedWaitListener, SuperBlock,
     SuperBlockRef, WaitQueue,
 };
 
@@ -71,6 +71,10 @@ pub trait InodeOperations: Any + Send + Sync {
 
     fn file_ops(&self) -> Option<&dyn FileOperations> {
         None
+    }
+
+    fn open_file(&self, _flags: OpenFlags) -> FsResult<Arc<dyn FileOperations>> {
+        Err(FsError::NotFile)
     }
 
     fn symlink_target(&self) -> Option<&str> {
@@ -211,6 +215,10 @@ impl Inode {
         if let Some(file) = self.file() {
             file.open();
         }
+    }
+
+    pub fn open_file(&self, flags: OpenFlags) -> FsResult<Arc<dyn FileOperations>> {
+        self.operations.open_file(flags)
     }
 
     pub fn release(&self) {

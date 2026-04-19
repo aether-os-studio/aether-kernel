@@ -619,10 +619,10 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let epoll_op = aether_vfs::EpollCtlOp::from_raw(op).ok_or(SysErr::Inval)?;
 
         let epoll_descriptor = self.process.files.get(epfd as u32).ok_or(SysErr::BadFd)?;
-        let epoll_node = epoll_descriptor.file.lock().node();
-        let epoll_file = epoll_node
-            .file()
-            .and_then(|f| f.as_any().downcast_ref::<aether_vfs::EpollInstance>())
+        let epoll_guard = epoll_descriptor.file.lock();
+        let epoll_file = epoll_guard
+            .file_ops()
+            .and_then(|ops| ops.as_any().downcast_ref::<aether_vfs::EpollInstance>())
             .ok_or(SysErr::Inval)?;
 
         let target_descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
@@ -676,13 +676,15 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
 
         let result = (|| {
             let epoll_descriptor = self.process.files.get(epfd as u32).ok_or(SysErr::BadFd)?;
-            let epoll_node = epoll_descriptor.file.lock().node();
-            let epoll_file = epoll_node
-                .file()
-                .and_then(|f| f.as_any().downcast_ref::<aether_vfs::EpollInstance>())
+            let epoll_guard = epoll_descriptor.file.lock();
+            let epoll_file = epoll_guard
+                .file_ops()
+                .and_then(|ops| ops.as_any().downcast_ref::<aether_vfs::EpollInstance>())
                 .ok_or(SysErr::Inval)?;
 
             let ready_events = epoll_file.wait(maxevents)?;
+
+            drop(epoll_guard);
 
             if ready_events.is_empty() {
                 return Err(SysErr::Again);
@@ -854,10 +856,10 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         maxevents: usize,
     ) -> SysResult<Vec<aether_vfs::EpollEvent>> {
         let epoll_descriptor = self.process.files.get(epfd).ok_or(SysErr::BadFd)?;
-        let epoll_node = epoll_descriptor.file.lock().node();
-        let epoll_file = epoll_node
-            .file()
-            .and_then(|f| f.as_any().downcast_ref::<aether_vfs::EpollInstance>())
+        let epoll_guard = epoll_descriptor.file.lock();
+        let epoll_file = epoll_guard
+            .file_ops()
+            .and_then(|ops| ops.as_any().downcast_ref::<aether_vfs::EpollInstance>())
             .ok_or(SysErr::Inval)?;
         epoll_file.wait(maxevents).map_err(SysErr::from)
     }
@@ -1198,9 +1200,9 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                     for fd_bytes in payload.chunks_exact(core::mem::size_of::<i32>()) {
                         let fd = i32::from_ne_bytes(fd_bytes.try_into().map_err(|_| SysErr::Fault)?)
                             as u32;
-                        if let Some(descriptor) = self.process.files.get_mut(fd) {
+                        let _ = self.process.files.with_descriptor_mut(fd, |descriptor| {
                             descriptor.cloexec = true;
-                        }
+                        });
                     }
                 }
                 delivered += fit;
@@ -1292,12 +1294,8 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                             if fd < 0 {
                                 return Err(SysErr::BadFd);
                             }
-                            let descriptor = self
-                                .process
-                                .files
-                                .get(fd as u32)
-                                .cloned()
-                                .ok_or(SysErr::BadFd)?;
+                            let descriptor =
+                                self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
                             rights.push(descriptor);
                         }
                     }
@@ -1431,7 +1429,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         const AT_FDCWD: i64 = -100;
 
         if path.starts_with('/') || dirfd == AT_FDCWD {
-            return Ok(self.process.fs.clone());
+            return Ok(self.process.fs.fork_copy());
         }
 
         let descriptor = self.process.files.get(dirfd as u32).ok_or(SysErr::BadFd)?;
@@ -1440,7 +1438,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             return Err(SysErr::NotDir);
         }
 
-        let mut fs = self.process.fs.clone();
+        let mut fs = self.process.fs.fork_copy();
         fs.set_cwd_location(location);
         Ok(fs)
     }

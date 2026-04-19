@@ -69,14 +69,15 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
 
         let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
-        let node = descriptor.file.lock().node();
-        let timerfd = node
-            .file()
-            .and_then(|file| file.as_any().downcast_ref::<crate::fs::TimerFdFile>())
-            .ok_or(SysErr::Inval)?;
-
         let new_value = crate::fs::LinuxItimerSpec::read_from(self, new_value)?;
-        let old_value_spec = timerfd.set_time(flags, new_value)?;
+        let old_value_spec = {
+            let file = descriptor.file.lock();
+            let timerfd = file
+                .file_ops()
+                .and_then(|ops| ops.as_any().downcast_ref::<crate::fs::TimerFdFile>())
+                .ok_or(SysErr::Inval)?;
+            timerfd.set_time(flags, new_value)?
+        };
         if old_value != 0 {
             old_value_spec.write_to(self, old_value)?;
         }
@@ -92,12 +93,15 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
 
         let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
-        let node = descriptor.file.lock().node();
-        let timerfd = node
-            .file()
-            .and_then(|file| file.as_any().downcast_ref::<crate::fs::TimerFdFile>())
-            .ok_or(SysErr::Inval)?;
-        timerfd.get_time().write_to(self, curr_value)?;
+        let current = {
+            let file = descriptor.file.lock();
+            let timerfd = file
+                .file_ops()
+                .and_then(|ops| ops.as_any().downcast_ref::<crate::fs::TimerFdFile>())
+                .ok_or(SysErr::Inval)?;
+            timerfd.get_time()
+        };
+        current.write_to(self, curr_value)?;
         Ok(0)
     }
 }

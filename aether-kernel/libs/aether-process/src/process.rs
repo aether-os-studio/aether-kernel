@@ -621,7 +621,15 @@ impl UserAddressSpace {
     }
 
     pub fn handle_page_fault(&self, address: u64, error_code: u64) -> Result<bool, BuildError> {
-        self.inner.lock().handle_page_fault(address, error_code)
+        let mut inner = self.inner.lock();
+        if inner.handle_page_fault(address, error_code)? {
+            return Ok(true);
+        }
+        if inner.fault_access_allowed_now(address, error_code) {
+            inner.invalidate_page(address);
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -680,31 +688,7 @@ impl UserAddressSpaceInner {
         let mut allocator = frame_allocator().lock();
 
         for index in 0..self.mappings.len() {
-            let mapping_kind = self
-                .vma_for_address(self.mappings[index].virt.as_u64())
-                .map(|vma| vma.kind.clone());
             let mapping = &mut self.mappings[index];
-            if matches!(mapping_kind, Some(UserVmaKind::Stack)) {
-                let frame = allocator.alloc(1)?;
-                copy_frame(mapping.frame, frame);
-                child_mapper.map(
-                    mapping.virt,
-                    frame,
-                    MapSize::Size4KiB,
-                    mapping.flags,
-                    &mut *allocator,
-                )?;
-                copy.mappings.push(UserMapping {
-                    virt: mapping.virt,
-                    frame,
-                    flags: mapping.flags,
-                    cow: false,
-                    owned: true,
-                    shared: false,
-                });
-                continue;
-            }
-
             if !mapping.owned {
                 if mapping.shared {
                     allocator.retain(mapping.frame)?;
@@ -1214,6 +1198,34 @@ impl UserAddressSpaceInner {
         }
 
         self.map_lazy_page(page_base, write_fault)
+    }
+
+    fn fault_access_allowed_now(&self, address: u64, error_code: u64) -> bool {
+        const PF_WRITE: u64 = 1 << 1;
+        const PF_USER: u64 = 1 << 2;
+        const PF_INSTR: u64 = 1 << 4;
+
+        let Some(mapping) = self.mapping(address) else {
+            return false;
+        };
+
+        if (error_code & PF_WRITE) != 0 && !mapping.flags.contains(MapFlags::WRITE) {
+            return false;
+        }
+        if (error_code & PF_USER) != 0 && !mapping.flags.contains(MapFlags::USER) {
+            return false;
+        }
+        if (error_code & PF_INSTR) != 0 && !mapping.flags.contains(MapFlags::EXECUTE) {
+            return false;
+        }
+
+        true
+    }
+
+    fn invalidate_page(&self, address: u64) {
+        let page_base = align_down(address, PAGE_SIZE);
+        let mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
+        mapper.invalidate(VirtAddr::new(page_base));
     }
 
     fn ensure_access(&mut self, address: u64, write: bool) -> Result<(), BuildError> {

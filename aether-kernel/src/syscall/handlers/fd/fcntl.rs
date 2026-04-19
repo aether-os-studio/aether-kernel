@@ -89,11 +89,14 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 .get(fd as u32)
                 .map(|descriptor| if descriptor.cloexec { FD_CLOEXEC } else { 0 })
                 .ok_or(SysErr::BadFd),
-            F_SETFD => {
-                let descriptor = self.process.files.get_mut(fd as u32).ok_or(SysErr::BadFd)?;
-                descriptor.cloexec = (arg & FD_CLOEXEC) != 0;
-                Ok(0)
-            }
+            F_SETFD => self
+                .process
+                .files
+                .with_descriptor_mut(fd as u32, |descriptor| {
+                    descriptor.cloexec = (arg & FD_CLOEXEC) != 0;
+                })
+                .map(|_| 0)
+                .ok_or(SysErr::BadFd),
             F_GETFL => self
                 .process
                 .files

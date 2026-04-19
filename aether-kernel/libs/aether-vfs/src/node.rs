@@ -26,6 +26,7 @@ pub enum FsError {
     NotFile,
     AlreadyExists,
     Unsupported,
+    Io,
     PermissionDenied,
     InvalidInput,
     RootNotMounted,
@@ -514,6 +515,10 @@ impl InodeOperations for FileNode {
 
     fn file_ops(&self) -> Option<&dyn FileOperations> {
         Some(self.operations.as_ref())
+    }
+
+    fn open_file(&self, _flags: crate::OpenFlags) -> FsResult<Arc<dyn FileOperations>> {
+        Ok(self.operations.clone())
     }
 
     fn device_numbers(&self) -> Option<(u32, u32)> {

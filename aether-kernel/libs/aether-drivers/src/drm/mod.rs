@@ -22,7 +22,7 @@ pub use self::core::{
     DRM_PROPERTY_ID_CRTC_W, DRM_PROPERTY_ID_CRTC_X, DRM_PROPERTY_ID_CRTC_Y, DRM_PROPERTY_ID_FB_ID,
     DRM_PROPERTY_ID_IN_FORMATS, DRM_PROPERTY_ID_PLANE_TYPE, DRM_PROPERTY_ID_SRC_H,
     DRM_PROPERTY_ID_SRC_W, DRM_PROPERTY_ID_SRC_X, DRM_PROPERTY_ID_SRC_Y, DrmConnectorSnapshot,
-    DrmCrtcSnapshot, DrmDriverInfo, DrmEncoderSnapshot, DrmFile, DrmFramebufferCreate,
+    DrmCrtcSnapshot, DrmDevice, DrmDriverInfo, DrmEncoderSnapshot, DrmFile, DrmFramebufferCreate,
     DrmFramebufferSnapshot, DrmIoctlError, DrmModeInfo, DrmObjectPropertiesSnapshot,
     DrmPlaneSnapshot, DrmPropertyEnumValue, DrmPropertyInfo, DrmResourcesSnapshot,
     handle_vblank_tick, next_vblank_wakeup_deadline, probe, vblank_deadline_due,

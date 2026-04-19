@@ -36,10 +36,10 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
 
         let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
-        let node = descriptor.file.lock().node();
-        let inotify = node
-            .file()
-            .and_then(|file| file.as_any().downcast_ref::<crate::fs::InotifyFile>())
+        let file = descriptor.file.lock();
+        let inotify = file
+            .file_ops()
+            .and_then(|ops| ops.as_any().downcast_ref::<crate::fs::InotifyFile>())
             .ok_or(SysErr::Inval)?;
         inotify
             .add_watch(&node, mask)

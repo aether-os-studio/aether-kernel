@@ -17,21 +17,21 @@ use aether_initramfs::{InitramfsError, load_initramfs};
 use aether_tmpfs as tmpfs;
 use aether_vfs::{DirectoryNode, FsError, NodeKind, NodeRef, Vfs};
 
-use crate::errno::{SysErr, SysResult};
-use crate::fs::{FileSystemIdentity, LinuxStatFs};
-use crate::kernfs::KernelResourceRegistry;
-use crate::rootfs::filesystem::KernelFileSystem;
-
 use self::filesystem::{
-    BindFs, ExtFileSystem, FileSystemRegistry, MountRequest, MountedNode, PROC_SUPER_MAGIC,
-    RAMFS_MAGIC, SYSFS_MAGIC, StaticDirectoryFs, TMPFS_MAGIC, TmpFs,
+    BindFs, ExtFileSystem, FileSystemRegistry, MountedNode, PROC_SUPER_MAGIC, RAMFS_MAGIC,
+    SYSFS_MAGIC, StaticDirectoryFs, TMPFS_MAGIC, TmpFs,
 };
-pub use self::namespace::{FsLocation, MountNamespace, ProcessFsContext};
 use self::path::{
     display_path_from_root, is_within, leaf_name, normalize_absolute_path, parent_path,
     remap_mount_path, resolve_namespace_path, resolve_symlink_path, resolve_view_path,
     split_components,
 };
+use crate::errno::{SysErr, SysResult};
+use crate::fs::{FileSystemIdentity, LinuxStatFs};
+use crate::kernfs::KernelResourceRegistry;
+
+pub use self::filesystem::{FileSystemMount, KernelFileSystem, MountRequest};
+pub use self::namespace::{FsLocation, MountNamespace, ProcessFsContext};
 
 #[derive(Debug)]
 pub enum RootfsError {
@@ -122,6 +122,7 @@ impl RootfsManager {
         ));
         let sys_fs = Arc::new(StaticDirectoryFs::new("sysfs", SYSFS_MAGIC, sys_root_node));
         let tmp_fs = Arc::new(TmpFs);
+        let devpts_fs = crate::fs::DevPtsFs::new();
         let bind_fs = Arc::new(BindFs);
         let mut next_mount_device = 1u64;
         let mut alloc_mount_device = || {
@@ -136,6 +137,7 @@ impl RootfsManager {
         filesystems.register(proc_fs.clone());
         filesystems.register(sys_fs.clone());
         filesystems.register(tmp_fs);
+        filesystems.register(devpts_fs.clone());
         filesystems.register(Arc::new(ExtFileSystem::new("ext")));
         filesystems.register(Arc::new(ExtFileSystem::new("ext2")));
         filesystems.register(Arc::new(ExtFileSystem::new("ext3")));
@@ -199,6 +201,13 @@ impl RootfsManager {
             sys_root_mount.statfs,
         );
 
+        device_namespace
+            .install(&vfs, "pts", DirectoryNode::new("pts"))
+            .map_err(RootfsError::from)?;
+        device_namespace
+            .install(&vfs, "ptmx", devpts_fs.ptmx_node())
+            .map_err(RootfsError::from)?;
+
         Ok(Self {
             vfs,
             filesystems,
@@ -257,7 +266,7 @@ impl RootfsManager {
         path: &str,
         follow_final: bool,
     ) -> SysResult<(NodeRef, FileSystemIdentity)> {
-        let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
+        let namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), path);
         let namespace = {
             let namespace = fs.namespace();
             namespace.lock().clone()
@@ -273,7 +282,7 @@ impl RootfsManager {
     }
 
     pub fn statfs_in(&self, fs: &ProcessFsContext, path: &str) -> SysResult<LinuxStatFs> {
-        let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
+        let namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), path);
         let namespace = {
             let namespace = fs.namespace();
             namespace.lock().clone()
@@ -283,7 +292,7 @@ impl RootfsManager {
     }
 
     pub fn mkdir_in(&self, fs: &ProcessFsContext, path: &str, mode: u32) -> SysResult<u64> {
-        let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
+        let namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), path);
         let node = self.create_dir_namespace(fs, namespace_path.as_str(), mode)?;
         let namespace = fs.namespace();
         let namespace = namespace.lock();
@@ -299,7 +308,7 @@ impl RootfsManager {
         path: &str,
         mode: u32,
     ) -> SysResult<(NodeRef, FileSystemIdentity)> {
-        let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
+        let namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), path);
         let node = self.create_file_namespace(fs, namespace_path.as_str(), mode)?;
         let namespace = fs.namespace();
         let namespace = namespace.lock();
@@ -316,7 +325,7 @@ impl RootfsManager {
         path: &str,
         target: &str,
     ) -> SysResult<u64> {
-        let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
+        let namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), path);
         let node = self.create_symlink_namespace(fs, namespace_path.as_str(), target, 0o120777)?;
         let namespace = fs.namespace();
         let namespace = namespace.lock();
@@ -327,7 +336,7 @@ impl RootfsManager {
     }
 
     pub fn bind_socket_in(&self, fs: &ProcessFsContext, path: &str, mode: u32) -> SysResult<u64> {
-        let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
+        let namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), path);
         let node = self.create_socket_namespace(fs, namespace_path.as_str(), mode)?;
         let namespace = fs.namespace();
         let namespace = namespace.lock();
@@ -338,13 +347,13 @@ impl RootfsManager {
     }
 
     pub fn getcwd_in(&self, fs: &ProcessFsContext) -> String {
-        display_path_from_root(fs.root_path(), fs.cwd_path())
+        display_path_from_root(&fs.root_path(), &fs.cwd_path())
     }
 
     pub fn unlink_in(&self, fs: &ProcessFsContext, path: &str, flags: u64) -> SysResult<u64> {
         const AT_REMOVEDIR: u64 = 0x200;
 
-        let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
+        let namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), path);
         let normalized = normalize_absolute_path(namespace_path.as_str());
         if normalized == "/" {
             return Err(SysErr::Inval);
@@ -408,8 +417,8 @@ impl RootfsManager {
             return Err(SysErr::Inval);
         }
 
-        let old_namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), old_path);
-        let new_namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), new_path);
+        let old_namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), old_path);
+        let new_namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), new_path);
         let old_normalized = normalize_absolute_path(old_namespace_path.as_str());
         let new_normalized = normalize_absolute_path(new_namespace_path.as_str());
 
@@ -474,8 +483,8 @@ impl RootfsManager {
             return Err(SysErr::NoEnt);
         }
 
-        let old_namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), old_path);
-        let new_namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), new_path);
+        let old_namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), old_path);
+        let new_namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), new_path);
         let old_normalized = normalize_absolute_path(old_namespace_path.as_str());
         let new_normalized = normalize_absolute_path(new_namespace_path.as_str());
 
@@ -560,7 +569,7 @@ impl RootfsManager {
     }
 
     pub fn chdir_in(&self, fs: &mut ProcessFsContext, path: &str) -> SysResult<u64> {
-        let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
+        let namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), path);
         let namespace = {
             let namespace = fs.namespace();
             namespace.lock().clone()
@@ -574,7 +583,7 @@ impl RootfsManager {
     }
 
     pub fn chroot_in(&self, fs: &mut ProcessFsContext, path: &str) -> SysResult<u64> {
-        let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
+        let namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), path);
         let namespace = {
             let namespace = fs.namespace();
             namespace.lock().clone()
@@ -584,7 +593,7 @@ impl RootfsManager {
             return Err(SysErr::NotDir);
         }
         fs.set_root_location(FsLocation::new(lookup.path.clone(), lookup.node));
-        if !is_within(fs.root_path(), fs.cwd_path()) {
+        if !is_within(&fs.root_path(), &fs.cwd_path()) {
             fs.set_cwd_location(FsLocation::new(lookup.path, fs.root_node()));
         }
         Ok(0)
@@ -601,11 +610,11 @@ impl RootfsManager {
         const MS_BIND: u64 = 4096;
         const MS_MOVE: u64 = 8192;
 
-        let target_path = resolve_view_path(fs.root_path(), fs.cwd_path(), target);
+        let target_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), target);
 
         if (flags & MS_MOVE) != 0 {
             let source = source.ok_or(SysErr::Inval)?;
-            let source_path = resolve_view_path(fs.root_path(), fs.cwd_path(), source);
+            let source_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), source);
             let target_node = self.lookup_in(fs, target, false)?;
             let source_mount = {
                 let namespace = fs.namespace();
@@ -654,7 +663,7 @@ impl RootfsManager {
     }
 
     pub fn umount_in(&self, fs: &ProcessFsContext, target: &str, _flags: u64) -> SysResult<u64> {
-        let target_path = resolve_view_path(fs.root_path(), fs.cwd_path(), target);
+        let target_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), target);
         let namespace = fs.namespace();
         namespace.lock().unmount(target_path.as_str()).map(|_| 0)
     }
@@ -665,8 +674,8 @@ impl RootfsManager {
         new_root: &str,
         put_old: &str,
     ) -> SysResult<u64> {
-        let new_root_path = resolve_view_path(fs.root_path(), fs.cwd_path(), new_root);
-        let put_old_path = resolve_view_path(fs.root_path(), fs.cwd_path(), put_old);
+        let new_root_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), new_root);
+        let put_old_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), put_old);
         if !is_within(new_root_path.as_str(), put_old_path.as_str())
             || put_old_path == new_root_path
         {
@@ -776,7 +785,7 @@ impl RootfsManager {
             return Err(SysErr::Loop);
         }
 
-        let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
+        let namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), path);
         let namespace = {
             let namespace = fs.namespace();
             namespace.lock().clone()
@@ -802,8 +811,8 @@ impl RootfsManager {
     }
 
     fn rebind_fs_context_after_move(&self, fs: &mut ProcessFsContext, source: &str, target: &str) {
-        fs.rebind_root_path(remap_mount_path(fs.root_path(), source, target));
-        fs.rebind_cwd_path(remap_mount_path(fs.cwd_path(), source, target));
+        fs.rebind_root_path(remap_mount_path(&fs.root_path(), source, target));
+        fs.rebind_cwd_path(remap_mount_path(&fs.cwd_path(), source, target));
     }
 
     fn lookup_namespace_path(
@@ -1118,7 +1127,7 @@ impl RootfsManager {
     }
 
     fn lookup_mount_source(&self, fs: &ProcessFsContext, path: &str) -> SysResult<MountedNode> {
-        let namespace_path = resolve_view_path(fs.root_path(), fs.cwd_path(), path);
+        let namespace_path = resolve_view_path(&fs.root_path(), &fs.cwd_path(), path);
         let namespace = fs.namespace();
         if let Some(mounted) = namespace.lock().lookup_mount(namespace_path.as_str()) {
             return Ok(mounted);

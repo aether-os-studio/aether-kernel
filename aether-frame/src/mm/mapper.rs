@@ -135,6 +135,14 @@ impl<A: PageTableArch> AddressSpace<A> {
         self.root
     }
 
+    pub fn invalidate(&self, virt: VirtAddr) {
+        A::invalidate(virt);
+    }
+
+    pub fn invalidate_all(&self) {
+        A::invalidate_all();
+    }
+
     pub fn new_root<F: FrameAllocator>(allocator: &mut F) -> Result<Self, MappingError> {
         let root = allocator.alloc(1)?;
         unsafe { zero_page(root) };

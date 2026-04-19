@@ -262,6 +262,8 @@ mod setgroups;
 mod setresgid;
 #[path = "process/setresuid.rs"]
 mod setresuid;
+#[path = "process/setsid.rs"]
+mod setsid;
 #[path = "process/setuid.rs"]
 mod setuid;
 #[path = "process/vfork.rs"]
@@ -372,6 +374,7 @@ pub fn init() {
             getegid::GeteGidSyscall,
             getgid::GetGidSyscall,
             getpgid::GetPgidSyscall,
+            setsid::SetSidSyscall,
             getresgid::GetResGidSyscall,
             getresuid::GetResUidSyscall,
             getrandom::GetrandomSyscall,

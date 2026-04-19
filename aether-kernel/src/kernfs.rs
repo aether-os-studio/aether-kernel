@@ -687,7 +687,10 @@ fn class_name(class: DeviceClass) -> &'static str {
 fn render_filesystems(filesystems: &[&str]) -> String {
     let mut buffer = String::new();
     for fstype in filesystems {
-        let nodev = matches!(*fstype, "devtmpfs" | "proc" | "rootfs" | "sysfs" | "tmpfs");
+        let nodev = matches!(
+            *fstype,
+            "devpts" | "devtmpfs" | "proc" | "rootfs" | "sysfs" | "tmpfs"
+        );
         if nodev {
             buffer.push_str("nodev\t");
         } else {

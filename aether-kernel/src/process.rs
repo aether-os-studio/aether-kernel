@@ -39,6 +39,7 @@ pub(crate) use self::util::wait_status;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessIdentity {
     pub pid: Pid,
+    pub thread_group: Pid,
     pub parent: Option<Pid>,
     pub process_group: Pid,
     pub session: Pid,
@@ -115,6 +116,7 @@ pub enum ProcessBlock {
 
 pub struct KernelProcess {
     pub identity: ProcessIdentity,
+    pub exit_signal: u8,
     pub task: BuiltProcess,
     pub credentials: Credentials,
     pub prctl: PrctlState,
@@ -163,10 +165,16 @@ pub struct MmapRegion {
 }
 
 impl KernelProcess {
+    pub const fn is_thread(&self) -> bool {
+        self.identity.thread_group != self.identity.pid
+    }
+
     pub(crate) fn running_snapshot(&self) -> RunningProcessSnapshot {
         RunningProcessSnapshot {
             pid: self.identity.pid,
+            thread_group: self.identity.thread_group,
             parent: self.identity.parent,
+            process_group: self.identity.process_group,
             name: *self.prctl.name_bytes(),
             credentials: self.credentials.clone(),
             umask: self.umask,
@@ -478,7 +486,9 @@ struct ZombieProcess {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunningProcessSnapshot {
     pub pid: Pid,
+    pub thread_group: Pid,
     pub parent: Option<Pid>,
+    pub process_group: Pid,
     pub name: [u8; 16],
     pub credentials: Credentials,
     pub umask: u16,
@@ -554,8 +564,22 @@ pub trait ProcessServices {
         options: u64,
     ) -> Option<ChildEvent>;
     fn has_child(&mut self, parent_pid: Pid, requested: i32) -> bool;
+    fn thread_group_of(&mut self, pid: Pid) -> Option<Pid>;
+    fn has_thread_group(&mut self, tgid: Pid) -> bool;
+    fn has_process_group(&mut self, process_group: Pid) -> bool;
     fn wake_vfork_parent(&mut self, parent_pid: Pid, child_pid: Pid);
     fn send_kernel_signal(&mut self, pid: Pid, signal: crate::signal::SignalInfo) -> bool;
+    fn send_process_signal(&mut self, pid: Pid, signal: crate::signal::SignalInfo) -> bool;
+    fn send_process_group_signal(
+        &mut self,
+        process_group: Pid,
+        signal: crate::signal::SignalInfo,
+    ) -> usize;
+    fn send_signal_all(
+        &mut self,
+        signal: crate::signal::SignalInfo,
+        exclude_tgid: Option<Pid>,
+    ) -> usize;
     fn arm_futex_wait(&mut self, pid: Pid, key: FutexKey, bitset: u32);
     fn disarm_futex_wait(&mut self, pid: Pid);
     fn wake_futex(&mut self, key: FutexKey, bitset: u32, count: usize) -> usize;
@@ -582,6 +606,9 @@ pub struct ProcessManager {
     next_pid: Pid,
     processes: BTreeMap<Pid, ProcessBox>,
     zombies: BTreeMap<Pid, ZombieProcess>,
+    thread_groups: BTreeMap<Pid, BTreeSet<Pid>>,
+    group_exit_status: BTreeMap<Pid, i32>,
+    queued_signals: BTreeMap<Pid, VecDeque<crate::signal::SignalInfo>>,
     parent_children: BTreeMap<Pid, BTreeSet<Pid>>,
     child_events: BTreeMap<Pid, VecDeque<ChildEvent>>,
     blocked_files: BTreeSet<Pid>,

@@ -26,7 +26,7 @@ pub(crate) struct ProcessSyscallContext<'a, S> {
 
 impl<S> ProcessSyscallContext<'_, S> {
     pub(crate) fn syscall_pid(&self) -> u32 {
-        self.process.identity.pid
+        self.process.identity.thread_group
     }
 
     pub(crate) fn masked_mode(&self, mode: u64, file_type: u32) -> u32 {
@@ -708,6 +708,9 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     fn getpgid(&self) -> SysResult<u64> {
         Self::syscall_getpgid(self)
     }
+    fn setsid(&mut self) -> SysResult<u64> {
+        Self::syscall_setsid(self)
+    }
     fn getresuid(&mut self, ruid: u64, euid: u64, suid: u64) -> SysResult<u64> {
         Self::syscall_getresuid(self, ruid, euid, suid)
     }
@@ -821,8 +824,17 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     fn clone_process(&mut self, params: crate::process::CloneParams) -> SysResult<u64> {
         Self::syscall_clone_process(self, params)
     }
+    fn clone_process_blocking(
+        &mut self,
+        params: crate::process::CloneParams,
+    ) -> crate::syscall::SyscallDisposition {
+        Self::syscall_clone_process_blocking(self, params)
+    }
     fn clone3(&mut self, args: u64, size: usize) -> SysResult<u64> {
         Self::syscall_clone3(self, args, size)
+    }
+    fn clone3_blocking(&mut self, args: u64, size: usize) -> crate::syscall::SyscallDisposition {
+        Self::syscall_clone3_blocking(self, args, size)
     }
     fn wait4(&mut self, pid: i32, status: u64, options: u64, rusage: u64) -> SysResult<u64> {
         Self::syscall_wait4(self, pid, status, options, rusage)
@@ -838,6 +850,12 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     }
     fn send_signal(&mut self, pid: i32, signal: u64) -> SysResult<u64> {
         Self::syscall_send_signal(self, pid, signal)
+    }
+    fn tkill(&mut self, pid: i32, signal: u64) -> SysResult<u64> {
+        Self::syscall_tkill(self, pid, signal)
+    }
+    fn tgkill(&mut self, tgid: i32, pid: i32, signal: u64) -> SysResult<u64> {
+        Self::syscall_tgkill(self, tgid, pid, signal)
     }
     fn read_user_c_string(&self, address: u64, limit: usize) -> SysResult<String> {
         Self::syscall_read_user_c_string(self, address, limit)

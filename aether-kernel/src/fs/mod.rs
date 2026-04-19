@@ -3,6 +3,7 @@ mod eventfd;
 mod fd;
 mod image;
 mod inotify;
+mod pty;
 mod timerfd;
 
 pub use self::abi::{
@@ -16,6 +17,7 @@ pub use self::inotify::{
     IN_DONT_FOLLOW, IN_ONLYDIR, INOTIFY_ADD_WATCH_VALID_MASK, INOTIFY_INIT1_VALID_FLAGS,
     InotifyFile, create_inotify_instance, notify_attrib, notify_create, notify_delete, notify_move,
 };
+pub use self::pty::{DevPtsFs, DevPtsSlaveFile, PtmxMasterFile};
 pub use self::timerfd::{
     LinuxItimerSpec, TFD_CLOEXEC, TFD_CREATE_FLAGS, TFD_NONBLOCK, TFD_SETTIME_FLAGS, TimerFdFile,
     deadline_due as timerfd_deadline_due, next_wakeup_deadline as next_timerfd_wakeup_deadline,

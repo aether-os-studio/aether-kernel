@@ -1,10 +1,11 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
+use crate::fs::{DevPtsSlaveFile, PtmxMasterFile};
 use crate::process::{ProcessServices, ProcessSyscallContext};
 use crate::syscall::KernelSyscallContext;
 use crate::syscall::SyscallDisposition;
-use aether_drivers::drm::ioctl as drm_abi;
-use aether_drivers::{DrmFile, EvdevFile, drm::DrmModeInfo};
+use aether_drivers::drm::{DrmDevice, DrmModeInfo, ioctl as drm_abi};
+use aether_drivers::{DrmFile, EvdevFile};
 use aether_terminal::{ConsoleCore, LinuxTermios, LinuxTermios2, LinuxVtMode, LinuxWinSize};
 use aether_vfs::{FsError, IoctlResponse};
 
@@ -18,6 +19,9 @@ const TIOCSPGRP: u64 = 0x5410;
 const TIOCSWINSZ: u64 = 0x5414;
 const TIOCSCTTY: u64 = 0x540e;
 const TIOCNOTTY: u64 = 0x5422;
+const TIOCGPTN: u64 = 0x8004_5430;
+const TIOCSPTLCK: u64 = 0x4004_5431;
+const TIOCGPTLCK: u64 = 0x8004_5439;
 const TCFLSH: u64 = 0x540b;
 const TIOCNXCL: u64 = 0x540d;
 const KDSETMODE: u64 = 0x4b3a;
@@ -44,26 +48,40 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
         let file_ref = descriptor.file.clone();
         let file = file_ref.lock();
+        if let Some(ptmx) = file
+            .file_ops()
+            .and_then(|ops| ops.as_any().downcast_ref::<PtmxMasterFile>())
+            && let Some(result) = self.syscall_ptmx_ioctl(ptmx, command, argument)?
+        {
+            drop(file);
+            return self.finish_ioctl_result(argument, result);
+        }
         if let Some(console) = file
-            .node()
-            .file()
+            .file_ops()
             .and_then(|ops| ops.as_any().downcast_ref::<ConsoleCore>())
             && let Some(result) = self.syscall_tty_ioctl(console, command, argument)?
         {
             drop(file);
             return self.finish_ioctl_result(argument, result);
         }
-        if let Some(drm) = file
-            .node()
-            .file()
-            .and_then(|ops| ops.as_any().downcast_ref::<DrmFile>())
+        if let Some(slave) = file
+            .file_ops()
+            .and_then(|ops| ops.as_any().downcast_ref::<DevPtsSlaveFile>())
+            && let Some(result) = self.syscall_tty_ioctl(slave.tty(), command, argument)?
         {
             drop(file);
-            return self.syscall_drm_ioctl(drm, command, argument);
+            return self.finish_ioctl_result(argument, result);
+        }
+        if let Some(device) = file.file_ops_arc().and_then(|ops| {
+            ops.as_any()
+                .downcast_ref::<DrmFile>()
+                .map(|drm| drm.device().clone())
+        }) {
+            drop(file);
+            return self.syscall_drm_ioctl(device.as_ref(), command, argument);
         }
         if let Some(evdev) = file
-            .node()
-            .file()
+            .file_ops()
             .and_then(|ops| ops.as_any().downcast_ref::<EvdevFile>())
             && let Some(result) = self.syscall_evdev_ioctl(evdev, command, argument)?
         {
@@ -175,6 +193,35 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(result)
     }
 
+    fn syscall_ptmx_ioctl(
+        &mut self,
+        master: &PtmxMasterFile,
+        command: u64,
+        argument: u64,
+    ) -> SysResult<Option<IoctlResponse>> {
+        let result = match command {
+            TIOCGPTN => Some(IoctlResponse::Data(
+                master.pty_number().to_ne_bytes().to_vec(),
+            )),
+            TIOCSPTLCK => {
+                let bytes =
+                    self.syscall_read_user_exact_buffer(argument, core::mem::size_of::<i32>())?;
+                let locked =
+                    i32::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| SysErr::Fault)?)
+                        != 0;
+                master.set_locked(locked);
+                Some(IoctlResponse::success())
+            }
+            TIOCGPTLCK => Some(IoctlResponse::Data(
+                (if master.locked() { 1i32 } else { 0i32 })
+                    .to_ne_bytes()
+                    .to_vec(),
+            )),
+            _ => self.syscall_tty_ioctl(master.slave(), command, argument)?,
+        };
+        Ok(result)
+    }
+
     fn syscall_evdev_ioctl(
         &mut self,
         evdev: &EvdevFile,
@@ -197,7 +244,12 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(result)
     }
 
-    fn syscall_drm_ioctl(&mut self, drm: &DrmFile, command: u64, argument: u64) -> SysResult<u64> {
+    fn syscall_drm_ioctl(
+        &mut self,
+        device: &DrmDevice,
+        command: u64,
+        argument: u64,
+    ) -> SysResult<u64> {
         let dir = drm_abi::ioctl_dir(command);
         let size = drm_abi::ioctl_size(command);
         let mut bytes = if size == 0 {
@@ -209,7 +261,6 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         } else {
             alloc::vec![0u8; size]
         };
-        let device = drm.device();
 
         match command {
             drm_abi::DRM_IOCTL_VERSION => {

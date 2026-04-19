@@ -45,15 +45,20 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
 
         if fd >= 0 {
-            let descriptor = self.process.files.get_mut(fd as u32).ok_or(SysErr::BadFd)?;
-            let node = descriptor.file.lock().node();
-            let signalfd = node
-                .file()
-                .and_then(|file| file.as_any().downcast_ref::<crate::signal::SignalFdFile>())
-                .ok_or(SysErr::Inval)?;
-            signalfd.set_mask(mask);
-            descriptor.file.lock().set_flags(open_flags);
-            descriptor.cloexec = (flags & SFD_CLOEXEC) != 0;
+            self.process
+                .files
+                .with_descriptor_mut(fd as u32, |descriptor| {
+                    let mut file = descriptor.file.lock();
+                    let signalfd = file
+                        .file_ops()
+                        .and_then(|ops| ops.as_any().downcast_ref::<crate::signal::SignalFdFile>())
+                        .ok_or(SysErr::Inval)?;
+                    signalfd.set_mask(mask);
+                    file.set_flags(open_flags);
+                    descriptor.cloexec = (flags & SFD_CLOEXEC) != 0;
+                    Ok::<(), SysErr>(())
+                })
+                .ok_or(SysErr::BadFd)??;
             return Ok(fd as u64);
         }
 

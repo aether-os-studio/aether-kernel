@@ -106,14 +106,9 @@ impl CloneParams {
     }
 
     pub(crate) fn validate(self) -> SysResult<()> {
-        let unsupported_flags = CLONE_FS
-            | CLONE_FILES
-            | CLONE_SIGHAND
-            | CLONE_PIDFD
+        let unsupported_flags = CLONE_PIDFD
             | CLONE_PTRACE
-            | CLONE_THREAD
             | CLONE_NEWNS
-            | CLONE_SYSVSEM
             | CLONE_DETACHED
             | CLONE_UNTRACED
             | CLONE_NEWCGROUP
@@ -131,7 +126,18 @@ impl CloneParams {
             // shared fs/fd tables, thread groups, namespaces, pidfd, cgroup placement, ptrace.
             return Err(SysErr::Inval);
         }
+        if (self.flags & CLONE_THREAD) != 0
+            && ((self.flags & CLONE_SIGHAND) == 0 || (self.flags & CLONE_VM) == 0)
+        {
+            return Err(SysErr::Inval);
+        }
+        if (self.flags & CLONE_SIGHAND) != 0 && (self.flags & CLONE_VM) == 0 {
+            return Err(SysErr::Inval);
+        }
         if (self.flags & CLONE_VFORK) != 0 && (self.flags & CLONE_VM) == 0 {
+            return Err(SysErr::Inval);
+        }
+        if (self.flags & CLONE_THREAD) != 0 && self.exit_signal != 0 {
             return Err(SysErr::Inval);
         }
         if (self.flags & CLONE_PARENT_SETTID) != 0 && self.parent_tid.is_none() {
@@ -165,6 +171,26 @@ impl CloneParams {
 
     pub(crate) const fn set_tls(self) -> bool {
         (self.flags & CLONE_SETTLS) != 0
+    }
+
+    pub(crate) const fn share_fs(self) -> bool {
+        (self.flags & CLONE_FS) != 0
+    }
+
+    pub(crate) const fn share_files(self) -> bool {
+        (self.flags & CLONE_FILES) != 0
+    }
+
+    pub(crate) const fn share_sighand(self) -> bool {
+        (self.flags & CLONE_SIGHAND) != 0
+    }
+
+    pub(crate) const fn thread(self) -> bool {
+        (self.flags & CLONE_THREAD) != 0
+    }
+
+    pub(crate) const fn share_sysvsem(self) -> bool {
+        (self.flags & CLONE_SYSVSEM) != 0
     }
 
     pub(crate) const fn set_parent_tid(self) -> bool {

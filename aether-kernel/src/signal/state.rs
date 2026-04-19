@@ -16,12 +16,12 @@ use super::core::{SignalDelivery, delivery_for, sanitize_mask};
 struct SignalStateInner {
     blocked: SigSet,
     pending: [Option<SignalInfo>; SIGNAL_MAX + 1],
-    actions: [SignalAction; SIGNAL_MAX + 1],
     suspend_mask: Option<SigSet>,
 }
 
 #[derive(Clone)]
 pub struct SignalState {
+    actions: Arc<SpinLock<[SignalAction; SIGNAL_MAX + 1]>>,
     inner: Arc<SpinLock<SignalStateInner>>,
     waiters: Arc<WaitQueue>,
     version: Arc<AtomicU64>,
@@ -41,20 +41,51 @@ impl SignalState {
             signal += 1;
         }
 
-        Self::from_inner(SignalStateInner {
-            blocked: 0,
-            pending: [None; SIGNAL_MAX + 1],
-            actions,
-            suspend_mask: None,
-        })
+        Self::from_parts(
+            Arc::new(SpinLock::new(actions)),
+            SignalStateInner {
+                blocked: 0,
+                pending: [None; SIGNAL_MAX + 1],
+                suspend_mask: None,
+            },
+        )
     }
 
-    fn from_inner(inner: SignalStateInner) -> Self {
+    fn from_parts(
+        actions: Arc<SpinLock<[SignalAction; SIGNAL_MAX + 1]>>,
+        inner: SignalStateInner,
+    ) -> Self {
         Self {
+            actions,
             inner: Arc::new(SpinLock::new(inner)),
             waiters: Arc::new(WaitQueue::new()),
             version: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    pub fn clone_for_thread(&self) -> Self {
+        let inner = self.inner.lock();
+        Self::from_parts(
+            self.actions.clone(),
+            SignalStateInner {
+                blocked: inner.blocked,
+                pending: [None; SIGNAL_MAX + 1],
+                suspend_mask: None,
+            },
+        )
+    }
+
+    pub fn fork_copy(&self) -> Self {
+        let inner = self.inner.lock();
+        let actions = *self.actions.lock();
+        Self::from_parts(
+            Arc::new(SpinLock::new(actions)),
+            SignalStateInner {
+                blocked: inner.blocked,
+                pending: [None; SIGNAL_MAX + 1],
+                suspend_mask: None,
+            },
+        )
     }
 
     fn bump(&self) {
@@ -77,26 +108,19 @@ impl SignalState {
         self.inner.lock().blocked = sanitize_mask(mask);
     }
 
-    pub fn fork_copy(&self) -> Self {
-        let inner = self.inner.lock();
-        Self::from_inner(SignalStateInner {
-            blocked: inner.blocked,
-            pending: [None; SIGNAL_MAX + 1],
-            actions: inner.actions,
-            suspend_mask: None,
-        })
-    }
-
     pub fn prepare_for_exec(&mut self) {
-        let mut inner = self.inner.lock();
+        let mut actions = self.actions.lock();
         let mut signal = 1usize;
         while signal <= SIGNAL_MAX {
-            let action = inner.actions[signal];
+            let action = actions[signal];
             if action.handler != super::abi::SIG_DFL && action.handler != super::abi::SIG_IGN {
-                inner.actions[signal] = SignalAction::default_for(signal as u8);
+                actions[signal] = SignalAction::default_for(signal as u8);
             }
             signal += 1;
         }
+        drop(actions);
+
+        let mut inner = self.inner.lock();
         inner.suspend_mask = None;
     }
 
@@ -111,7 +135,7 @@ impl SignalState {
     }
 
     pub fn action(&self, signal: u8) -> Option<SignalAction> {
-        self.inner.lock().actions.get(signal as usize).copied()
+        self.actions.lock().get(signal as usize).copied()
     }
 
     pub fn set_action(&mut self, signal: u8, action: SignalAction) -> bool {
@@ -119,7 +143,7 @@ impl SignalState {
         if index == 0 || index > SIGNAL_MAX || signal == SIGKILL || signal == SIGSTOP {
             return false;
         }
-        self.inner.lock().actions[index] = action;
+        self.actions.lock()[index] = action;
         true
     }
 
@@ -156,11 +180,12 @@ impl SignalState {
     }
 
     pub fn has_deliverable(&self, handlers_supported: bool) -> bool {
+        let actions = self.actions.lock();
         let inner = self.inner.lock();
         let mut signal = 1usize;
         while signal <= SIGNAL_MAX {
             if let Some(info) = inner.pending[signal] {
-                let action = inner.actions[signal];
+                let action = actions[signal];
                 if !matches!(
                     delivery_for(inner.blocked, action, info, handlers_supported),
                     SignalDelivery::None
@@ -174,11 +199,12 @@ impl SignalState {
     }
 
     pub fn take_next_delivery(&mut self, handlers_supported: bool) -> SignalDelivery {
+        let actions = self.actions.lock();
         let mut inner = self.inner.lock();
         let mut signal = 1usize;
         while signal <= SIGNAL_MAX {
             if let Some(info) = inner.pending[signal] {
-                let action = inner.actions[signal];
+                let action = actions[signal];
                 match delivery_for(inner.blocked, action, info, handlers_supported) {
                     SignalDelivery::None => {}
                     delivery => {

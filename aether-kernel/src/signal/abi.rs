@@ -43,36 +43,47 @@ pub const SIG_SETMASK: u64 = 2;
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
 
+pub const SA_NOCLDSTOP: u64 = 0x0000_0001;
+pub const SA_NOCLDWAIT: u64 = 0x0000_0002;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignalInfo {
     pub signal: u8,
     pub code: i32,
     pub status: i32,
+    pub pid: i32,
+    pub uid: u32,
 }
 
 impl SignalInfo {
     #[allow(dead_code)]
-    pub const fn child_exit(status: i32) -> Self {
+    pub const fn child_exit(pid: u32, status: i32) -> Self {
         Self {
             signal: SIGCHLD,
             code: 1,
             status,
+            pid: pid as i32,
+            uid: 0,
         }
     }
 
-    pub const fn child_stop(signal: u8) -> Self {
+    pub const fn child_stop(pid: u32, signal: u8) -> Self {
         Self {
             signal: SIGCHLD,
             code: 5,
             status: signal as i32,
+            pid: pid as i32,
+            uid: 0,
         }
     }
 
-    pub const fn child_continue() -> Self {
+    pub const fn child_continue(pid: u32) -> Self {
         Self {
             signal: SIGCHLD,
             code: 6,
             status: 0,
+            pid: pid as i32,
+            uid: 0,
         }
     }
 
@@ -81,6 +92,8 @@ impl SignalInfo {
             signal,
             code,
             status: 0,
+            pid: 0,
+            uid: 0,
         }
     }
 }
@@ -95,8 +108,9 @@ pub struct SignalAction {
 
 impl SignalAction {
     pub const fn default_for(signal: u8) -> Self {
+        let _ = signal;
         Self {
-            handler: if signal == SIGCHLD { SIG_IGN } else { SIG_DFL },
+            handler: SIG_DFL,
             flags: 0,
             restorer: 0,
             mask: 0,

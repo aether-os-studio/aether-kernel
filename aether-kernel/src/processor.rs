@@ -251,3 +251,51 @@ pub(crate) fn running_procfs_snapshot(pid: Pid) -> Option<ProcFsProcessSnapshot>
     }
     None
 }
+
+pub(crate) fn running_cpu_of(pid: Pid) -> Option<usize> {
+    for cpu_index in 0..boot::MAX_CPUS {
+        let Some(current_pid) = PROCESSORS
+            .with(cpu_index, |processor| processor.current_pid)
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        if current_pid == pid {
+            return Some(cpu_index);
+        }
+    }
+    None
+}
+
+pub(crate) fn running_thread_group_of(pid: Pid) -> Option<Pid> {
+    for cpu_index in 0..boot::MAX_CPUS {
+        let Some(snapshot) = PROCESSORS
+            .with(cpu_index, |processor| processor.current_process.clone())
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        if snapshot.pid == pid {
+            return Some(snapshot.thread_group);
+        }
+    }
+    None
+}
+
+pub(crate) fn running_process_group_of(pid: Pid) -> Option<Pid> {
+    for cpu_index in 0..boot::MAX_CPUS {
+        let Some(snapshot) = PROCESSORS
+            .with(cpu_index, |processor| processor.current_process.clone())
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        if snapshot.pid == pid {
+            return Some(snapshot.process_group);
+        }
+    }
+    None
+}

@@ -105,8 +105,8 @@ fn serialize_signalfd_siginfo(info: SignalInfo) -> [u8; SIGNALFD_SIGINFO_SIZE] {
     bytes[0..4].copy_from_slice(&(info.signal as u32).to_ne_bytes());
     bytes[4..8].copy_from_slice(&0i32.to_ne_bytes());
     bytes[8..12].copy_from_slice(&info.code.to_ne_bytes());
-    bytes[12..16].copy_from_slice(&0u32.to_ne_bytes());
-    bytes[16..20].copy_from_slice(&0u32.to_ne_bytes());
+    bytes[12..16].copy_from_slice(&info.pid.to_ne_bytes());
+    bytes[16..20].copy_from_slice(&info.uid.to_ne_bytes());
     bytes[40..44].copy_from_slice(&info.status.to_ne_bytes());
     bytes
 }

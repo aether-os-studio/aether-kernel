@@ -1179,6 +1179,33 @@ impl TtyFile {
         self.endpoint().write_bytes(bytes);
     }
 
+    pub fn receive_bytes(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+
+        let endpoint = self.endpoint();
+        let wake = {
+            let mut state = endpoint.tty.lock();
+            tty_receive_bytes(&endpoint, &mut state, bytes)
+        };
+
+        if wake {
+            endpoint.bump_version();
+            endpoint.waiters.notify(PollEvents::READ);
+        }
+    }
+
+    pub fn notify_events(&self, events: PollEvents) {
+        if events == PollEvents::empty() {
+            return;
+        }
+
+        let endpoint = self.endpoint();
+        endpoint.bump_version();
+        endpoint.waiters.notify(events);
+    }
+
     pub fn termios(&self) -> LinuxTermios {
         self.with_state(|state| state.termios)
     }

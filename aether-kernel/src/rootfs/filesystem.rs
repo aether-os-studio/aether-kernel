@@ -8,7 +8,7 @@ use aether_fs::ext::{self, EXT_SUPER_MAGIC};
 use aether_tmpfs as tmpfs;
 use aether_vfs::{
     DirectoryEntry, FileOperations, FsResult, Inode, InodeOperations, NodeKind, NodeMetadata,
-    NodeRef,
+    NodeRef, OpenFlags,
 };
 
 use crate::errno::{SysErr, SysResult};
@@ -167,6 +167,10 @@ impl InodeOperations for MountedVfsNode {
 
     fn file_ops(&self) -> Option<&dyn FileOperations> {
         self.node.file()
+    }
+
+    fn open_file(&self, flags: OpenFlags) -> FsResult<Arc<dyn FileOperations>> {
+        self.node.open_file(flags)
     }
 
     fn symlink_target(&self) -> Option<&str> {

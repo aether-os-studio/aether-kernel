@@ -215,7 +215,7 @@ impl KernelRuntime {
 
         let mut processes = ProcessManager::new();
         let initial_fs = rootfs.initial_fs_context();
-        processes.set_initial_fs(initial_fs.clone());
+        processes.set_initial_fs(initial_fs.fork_copy());
         processes.set_initial_files(build_initial_files(rootfs.as_ref())?);
         let init_plan = rootfs.prepare_exec(
             &initial_fs,
@@ -677,11 +677,12 @@ impl ProcessServices for RuntimeServices<'_> {
 
     fn clone_process(&mut self, parent: &mut KernelProcess, params: CloneParams) -> SysResult<Pid> {
         params.validate()?;
+        let _ = params.share_sysvsem();
         let pid = self.processes.lock().allocate_pid();
-        let child_parent = if params.inherit_parent() {
+        let child_parent = if params.thread() || params.inherit_parent() {
             parent.identity.parent
         } else {
-            Some(parent.identity.pid)
+            Some(parent.identity.thread_group)
         };
 
         let mut child_task = if params.shares_vm() {
@@ -701,6 +702,44 @@ impl ProcessServices for RuntimeServices<'_> {
         {
             child_task.process.context_mut().set_thread_pointer(tls);
         }
+        if params.set_child_tid()
+            && let Some(child_tid) = params.child_tid
+        {
+            let raw = pid.to_ne_bytes();
+            let written = child_task
+                .address_space
+                .write(child_tid, &raw)
+                .map_err(SysErr::from)?;
+            if written != raw.len() {
+                return Err(SysErr::Fault);
+            }
+        }
+
+        let mut child_prctl = parent.prctl;
+        child_prctl.parent_death_signal = 0;
+        child_prctl.child_subreaper = false;
+
+        let vfork_parent = params.is_vfork().then_some(parent.identity.pid);
+        let child_signals = if params.share_sighand() {
+            parent.signals.clone_for_thread()
+        } else {
+            parent.signals.fork_copy()
+        };
+        let child_files = if params.share_files() {
+            parent.files.clone()
+        } else {
+            ProcessManager::clone_fd_table_for_fork(&parent.files, &child_signals)
+        };
+        let child_fs = if params.share_fs() {
+            parent.fs.clone()
+        } else {
+            parent.fs.fork_copy()
+        };
+        let assigned_cpu = if params.shares_vm() {
+            parent.assigned_cpu
+        } else {
+            crate::processor::select_cpu_for_child(parent.assigned_cpu)
+        };
         if params.set_parent_tid()
             && let Some(parent_tid) = params.parent_tid
         {
@@ -715,21 +754,22 @@ impl ProcessServices for RuntimeServices<'_> {
             }
         }
 
-        let mut child_prctl = parent.prctl;
-        child_prctl.parent_death_signal = 0;
-        child_prctl.child_subreaper = false;
-
-        let vfork_parent = params.is_vfork().then_some(parent.identity.pid);
-        let child_signals = parent.signals.fork_copy();
-        let child_files = ProcessManager::clone_fd_table_for_fork(&parent.files, &child_signals);
-        let assigned_cpu = crate::processor::select_cpu_for_child(parent.assigned_cpu);
-
         let child = KernelProcess {
             identity: crate::process::ProcessIdentity {
                 pid,
+                thread_group: if params.thread() {
+                    parent.identity.thread_group
+                } else {
+                    pid
+                },
                 parent: child_parent,
                 process_group: parent.identity.process_group,
                 session: parent.identity.session,
+            },
+            exit_signal: if params.thread() {
+                0
+            } else {
+                params.exit_signal as u8
             },
             task: child_task,
             credentials: parent.credentials.clone(),
@@ -743,7 +783,7 @@ impl ProcessServices for RuntimeServices<'_> {
             pending_file_waits: Vec::new(),
             mmap_regions: parent.mmap_regions.clone(),
             vfork_parent,
-            set_child_tid: params.set_child_tid().then_some(params.child_tid).flatten(),
+            set_child_tid: None,
             robust_list_head: None,
             robust_list_len: 0,
             clear_child_tid: params
@@ -751,7 +791,7 @@ impl ProcessServices for RuntimeServices<'_> {
                 .then_some(params.child_tid)
                 .flatten(),
             files: child_files,
-            fs: parent.fs.clone(),
+            fs: child_fs,
             umask: parent.umask,
             signals: child_signals,
             wake_result: None,
@@ -776,6 +816,18 @@ impl ProcessServices for RuntimeServices<'_> {
         self.processes.lock().has_child(parent_pid, requested)
     }
 
+    fn thread_group_of(&mut self, pid: Pid) -> Option<Pid> {
+        self.processes.lock().thread_group_of(pid)
+    }
+
+    fn has_thread_group(&mut self, tgid: Pid) -> bool {
+        self.processes.lock().has_thread_group(tgid)
+    }
+
+    fn has_process_group(&mut self, process_group: Pid) -> bool {
+        self.processes.lock().has_process_group(process_group)
+    }
+
     fn wake_vfork_parent(&mut self, parent_pid: Pid, child_pid: Pid) {
         self.processes
             .lock()
@@ -784,6 +836,30 @@ impl ProcessServices for RuntimeServices<'_> {
 
     fn send_kernel_signal(&mut self, pid: Pid, signal: crate::signal::SignalInfo) -> bool {
         self.processes.lock().send_signal(pid, signal)
+    }
+
+    fn send_process_signal(&mut self, pid: Pid, signal: crate::signal::SignalInfo) -> bool {
+        self.processes.lock().send_signal_thread_group(pid, signal)
+    }
+
+    fn send_process_group_signal(
+        &mut self,
+        process_group: Pid,
+        signal: crate::signal::SignalInfo,
+    ) -> usize {
+        self.processes
+            .lock()
+            .send_signal_process_group(process_group, signal)
+    }
+
+    fn send_signal_all(
+        &mut self,
+        signal: crate::signal::SignalInfo,
+        exclude_tgid: Option<Pid>,
+    ) -> usize {
+        self.processes
+            .lock()
+            .send_signal_all_thread_groups(signal, exclude_tgid)
     }
 
     fn arm_futex_wait(&mut self, pid: Pid, key: crate::process::FutexKey, bitset: u32) {
