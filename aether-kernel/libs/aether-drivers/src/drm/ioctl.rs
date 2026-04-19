@@ -53,6 +53,7 @@ pub const DRM_IOCTL_GET_CAP: u64 = iowr(DRM_IOCTL_BASE, 0x0c, DrmGetCap::SIZE);
 pub const DRM_IOCTL_SET_CLIENT_CAP: u64 = iow(DRM_IOCTL_BASE, 0x0d, DrmSetClientCap::SIZE);
 pub const DRM_IOCTL_SET_MASTER: u64 = io(DRM_IOCTL_BASE, 0x1e);
 pub const DRM_IOCTL_DROP_MASTER: u64 = io(DRM_IOCTL_BASE, 0x1f);
+pub const DRM_IOCTL_WAIT_VBLANK: u64 = iowr(DRM_IOCTL_BASE, 0x3a, DrmWaitVBlank::SIZE);
 pub const DRM_IOCTL_MODE_GETRESOURCES: u64 = iowr(DRM_IOCTL_BASE, 0xa0, DrmModeCardRes::SIZE);
 pub const DRM_IOCTL_MODE_GETCRTC: u64 = iowr(DRM_IOCTL_BASE, 0xa1, DrmModeCrtc::SIZE);
 pub const DRM_IOCTL_MODE_GETENCODER: u64 = iowr(DRM_IOCTL_BASE, 0xa6, DrmModeGetEncoder::SIZE);
@@ -60,6 +61,7 @@ pub const DRM_IOCTL_MODE_GETCONNECTOR: u64 = iowr(DRM_IOCTL_BASE, 0xa7, DrmModeG
 pub const DRM_IOCTL_MODE_GETPROPERTY: u64 = iowr(DRM_IOCTL_BASE, 0xaa, DrmModeGetProperty::SIZE);
 pub const DRM_IOCTL_MODE_SETPROPERTY: u64 =
     iowr(DRM_IOCTL_BASE, 0xab, DrmModeConnectorSetProperty::SIZE);
+pub const DRM_IOCTL_MODE_GETPROPBLOB: u64 = iowr(DRM_IOCTL_BASE, 0xac, DrmModeGetBlob::SIZE);
 pub const DRM_IOCTL_MODE_GETFB: u64 = iowr(DRM_IOCTL_BASE, 0xad, DrmModeFbCmd::SIZE);
 pub const DRM_IOCTL_MODE_RMFB: u64 = iowr(DRM_IOCTL_BASE, 0xaf, 4);
 pub const DRM_IOCTL_MODE_SETCRTC: u64 = iowr(DRM_IOCTL_BASE, 0xa2, DrmModeCrtc::SIZE);
@@ -76,6 +78,10 @@ pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u64 =
     iowr(DRM_IOCTL_BASE, 0xb9, DrmModeObjGetProperties::SIZE);
 pub const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u64 =
     iowr(DRM_IOCTL_BASE, 0xba, DrmModeObjSetProperty::SIZE);
+pub const DRM_IOCTL_MODE_ATOMIC: u64 = iowr(DRM_IOCTL_BASE, 0xbc, DrmModeAtomic::SIZE);
+pub const DRM_IOCTL_MODE_CREATEPROPBLOB: u64 = iowr(DRM_IOCTL_BASE, 0xbd, DrmModeCreateBlob::SIZE);
+pub const DRM_IOCTL_MODE_DESTROYPROPBLOB: u64 =
+    iowr(DRM_IOCTL_BASE, 0xbe, DrmModeDestroyBlob::SIZE);
 pub const DRM_IOCTL_MODE_CLOSEFB: u64 = iowr(DRM_IOCTL_BASE, 0xd0, DrmModeCloseFb::SIZE);
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -92,6 +98,12 @@ fn read_i32(bytes: &[u8], offset: usize) -> Option<i32> {
 
 fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_ne_bytes(
+        bytes.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
+fn read_i64(bytes: &[u8], offset: usize) -> Option<i64> {
+    Some(i64::from_ne_bytes(
         bytes.get(offset..offset + 8)?.try_into().ok()?,
     ))
 }
@@ -118,6 +130,67 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64) -> bool {
     };
     target.copy_from_slice(&value.to_ne_bytes());
     true
+}
+
+fn write_i64(bytes: &mut [u8], offset: usize, value: i64) -> bool {
+    let Some(target) = bytes.get_mut(offset..offset + 8) else {
+        return false;
+    };
+    target.copy_from_slice(&value.to_ne_bytes());
+    true
+}
+
+pub const DRM_VBLANK_ABSOLUTE: u32 = 0x0;
+pub const DRM_VBLANK_RELATIVE: u32 = 0x1;
+pub const DRM_VBLANK_HIGH_CRTC_MASK: u32 = 0x0000_003e;
+pub const DRM_VBLANK_HIGH_CRTC_SHIFT: u32 = 1;
+pub const DRM_VBLANK_EVENT: u32 = 0x0400_0000;
+pub const DRM_VBLANK_FLIP: u32 = 0x0800_0000;
+pub const DRM_VBLANK_NEXTONMISS: u32 = 0x1000_0000;
+pub const DRM_VBLANK_SECONDARY: u32 = 0x2000_0000;
+pub const DRM_VBLANK_SIGNAL: u32 = 0x4000_0000;
+pub const DRM_VBLANK_TYPES_MASK: u32 = DRM_VBLANK_ABSOLUTE | DRM_VBLANK_RELATIVE;
+pub const DRM_VBLANK_FLAGS_MASK: u32 =
+    DRM_VBLANK_EVENT | DRM_VBLANK_SIGNAL | DRM_VBLANK_SECONDARY | DRM_VBLANK_NEXTONMISS;
+pub const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
+pub const DRM_MODE_PAGE_FLIP_ASYNC: u32 = 0x02;
+pub const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
+pub const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
+pub const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x0400;
+pub const DRM_MODE_ATOMIC_FLAGS: u32 = DRM_MODE_PAGE_FLIP_EVENT
+    | DRM_MODE_PAGE_FLIP_ASYNC
+    | DRM_MODE_ATOMIC_TEST_ONLY
+    | DRM_MODE_ATOMIC_NONBLOCK
+    | DRM_MODE_ATOMIC_ALLOW_MODESET;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmWaitVBlank {
+    pub type_: u32,
+    pub sequence: u32,
+    pub signal: u64,
+    pub tval_sec: i64,
+    pub tval_usec: i64,
+}
+
+impl DrmWaitVBlank {
+    pub const SIZE: usize = 24;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            type_: read_u32(bytes, 0)?,
+            sequence: read_u32(bytes, 4)?,
+            signal: read_u64(bytes, 8)?,
+            tval_sec: read_i64(bytes, 8)?,
+            tval_usec: read_i64(bytes, 16)?,
+        })
+    }
+
+    pub fn write_to_bytes(self, bytes: &mut [u8]) -> bool {
+        write_u32(bytes, 0, self.type_)
+            && write_u32(bytes, 4, self.sequence)
+            && write_i64(bytes, 8, self.tval_sec)
+            && write_i64(bytes, 16, self.tval_usec)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,6 +605,100 @@ impl DrmModeObjSetProperty {
             prop_id: read_u32(bytes, 8)?,
             obj_id: read_u32(bytes, 12)?,
             obj_type: read_u32(bytes, 16)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmModeGetBlob {
+    pub blob_id: u32,
+    pub length: u32,
+    pub data: u64,
+}
+
+impl DrmModeGetBlob {
+    pub const SIZE: usize = 16;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            blob_id: read_u32(bytes, 0)?,
+            length: read_u32(bytes, 4)?,
+            data: read_u64(bytes, 8)?,
+        })
+    }
+
+    pub fn write_to_bytes(self, bytes: &mut [u8]) -> bool {
+        write_u32(bytes, 0, self.blob_id)
+            && write_u32(bytes, 4, self.length)
+            && write_u64(bytes, 8, self.data)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmModeAtomic {
+    pub flags: u32,
+    pub count_objs: u32,
+    pub objs_ptr: u64,
+    pub count_props_ptr: u64,
+    pub props_ptr: u64,
+    pub prop_values_ptr: u64,
+    pub reserved: u64,
+    pub user_data: u64,
+}
+
+impl DrmModeAtomic {
+    pub const SIZE: usize = 56;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            flags: read_u32(bytes, 0)?,
+            count_objs: read_u32(bytes, 4)?,
+            objs_ptr: read_u64(bytes, 8)?,
+            count_props_ptr: read_u64(bytes, 16)?,
+            props_ptr: read_u64(bytes, 24)?,
+            prop_values_ptr: read_u64(bytes, 32)?,
+            reserved: read_u64(bytes, 40)?,
+            user_data: read_u64(bytes, 48)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmModeCreateBlob {
+    pub data: u64,
+    pub length: u32,
+    pub blob_id: u32,
+}
+
+impl DrmModeCreateBlob {
+    pub const SIZE: usize = 16;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            data: read_u64(bytes, 0)?,
+            length: read_u32(bytes, 8)?,
+            blob_id: read_u32(bytes, 12)?,
+        })
+    }
+
+    pub fn write_to_bytes(self, bytes: &mut [u8]) -> bool {
+        write_u64(bytes, 0, self.data)
+            && write_u32(bytes, 8, self.length)
+            && write_u32(bytes, 12, self.blob_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmModeDestroyBlob {
+    pub blob_id: u32,
+}
+
+impl DrmModeDestroyBlob {
+    pub const SIZE: usize = 4;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            blob_id: read_u32(bytes, 0)?,
         })
     }
 }

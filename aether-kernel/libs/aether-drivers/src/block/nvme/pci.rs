@@ -4,7 +4,6 @@ use alloc::vec::Vec;
 
 use acpi::PciAddress;
 use aether_frame::bus::pci::{PciBarKind, devices};
-use aether_frame::interrupt::device::{DeviceInterruptMode, configure_pci_message_interrupt};
 use aether_frame::io::PciConfigSpace;
 
 #[derive(Debug, Clone, Copy)]
@@ -52,19 +51,6 @@ pub fn enable_bus_mastering(address: PciAddress) -> Result<(), &'static str> {
         command | PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER,
     )?;
     Ok(())
-}
-
-pub fn enable_message_interrupt(
-    address: PciAddress,
-    vector: u8,
-) -> Result<DeviceInterruptMode, &'static str> {
-    let config = PciConfigSpace::map(address)?;
-    configure_pci_message_interrupt(&config, vector).map_err(|error| match error {
-        aether_frame::interrupt::device::DeviceInterruptError::VectorExhausted => {
-            "device interrupt vectors exhausted"
-        }
-        aether_frame::interrupt::device::DeviceInterruptError::Route(message) => message,
-    })
 }
 
 fn read_u16(region: &PciConfigSpace, offset: usize) -> Option<u16> {

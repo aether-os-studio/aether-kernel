@@ -1,4 +1,4 @@
-use aether_frame::interrupt::timer;
+use aether_frame::time;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
@@ -60,17 +60,16 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
 
         let request = LinuxTimespec::read_from(self, rqtp)?.validate()?;
-        let current_nanos = timer::nanos_since_boot();
+        let current_nanos = time::monotonic_nanos();
         let request_nanos = request.total_nanos()?;
 
         let target_nanos = if (flags & TIMER_ABSTIME) != 0 {
             if clock_id == CLOCK_REALTIME {
-                let boot_time = aether_frame::boot::info().boot_time.unwrap_or(0);
-                let current_unix_nanos = boot_time as u64 * 1_000_000_000 + current_nanos;
+                let current_unix_nanos = time::realtime_now().total_nanos().unwrap_or(0);
                 if request_nanos <= current_unix_nanos {
                     return Ok(0);
                 }
-                request_nanos.saturating_sub(boot_time as u64 * 1_000_000_000)
+                current_nanos.saturating_add(request_nanos.saturating_sub(current_unix_nanos))
             } else {
                 if request_nanos <= current_nanos {
                     return Ok(0);
@@ -108,7 +107,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             Ok(request) => request,
             Err(error) => return SyscallDisposition::err(error),
         };
-        let current_nanos = timer::nanos_since_boot();
+        let current_nanos = time::monotonic_nanos();
         let request_nanos = match request.total_nanos() {
             Ok(value) => value,
             Err(error) => return SyscallDisposition::err(error),
@@ -116,12 +115,11 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
 
         let target_nanos = if (flags & TIMER_ABSTIME) != 0 {
             if clock_id == CLOCK_REALTIME {
-                let boot_time = aether_frame::boot::info().boot_time.unwrap_or(0);
-                let current_unix_nanos = boot_time as u64 * 1_000_000_000 + current_nanos;
+                let current_unix_nanos = time::realtime_now().total_nanos().unwrap_or(0);
                 if request_nanos <= current_unix_nanos {
                     return SyscallDisposition::ok(0);
                 }
-                request_nanos.saturating_sub(boot_time as u64 * 1_000_000_000)
+                current_nanos.saturating_add(request_nanos.saturating_sub(current_unix_nanos))
             } else {
                 if request_nanos <= current_nanos {
                     return SyscallDisposition::ok(0);

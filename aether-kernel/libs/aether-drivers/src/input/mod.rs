@@ -12,8 +12,8 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use aether_device::{DeviceClass, DeviceMetadata, DeviceNode, KernelDevice, SysfsEntry};
-use aether_frame::interrupt::timer;
 use aether_frame::libs::spin::{LocalIrqDisabled, SpinLock};
+use aether_frame::time;
 use aether_vfs::{
     FileNode, FileOperations, FsError, FsResult, IoctlResponse, NodeRef, PollEvents,
     SharedWaitListener, WaitQueue,
@@ -99,10 +99,10 @@ pub struct LinuxInputEvent {
 
 impl LinuxInputEvent {
     pub fn now(type_: u16, code: u16, value: i32, clock_id: i32) -> Self {
-        let nanos = timer::nanos_since_boot();
+        let nanos = time::monotonic_nanos();
         let (sec, subsec_nanos) = if clock_id == linux_clock_realtime() {
-            let (sec, nanos) = timer::unix_time_nanos();
-            (sec, nanos)
+            let (sec, nanos) = time::realtime_nanos();
+            (sec, nanos as u64)
         } else {
             ((nanos / 1_000_000_000) as i64, nanos % 1_000_000_000)
         };

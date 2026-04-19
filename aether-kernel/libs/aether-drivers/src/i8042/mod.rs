@@ -428,8 +428,8 @@ fn wait_write() -> bool {
 }
 
 fn wait_write_timeout(timeout_ns: u64) -> bool {
-    let deadline = aether_frame::interrupt::timer::nanos_since_boot().saturating_add(timeout_ns);
-    while aether_frame::interrupt::timer::nanos_since_boot() < deadline {
+    let deadline = aether_frame::time::monotonic_nanos().saturating_add(timeout_ns);
+    while aether_frame::time::monotonic_nanos() < deadline {
         if (read_status() & 0x02) == 0 {
             return true;
         }
@@ -443,8 +443,8 @@ fn wait_read() -> bool {
 }
 
 fn wait_read_timeout(timeout_ns: u64) -> bool {
-    let deadline = aether_frame::interrupt::timer::nanos_since_boot().saturating_add(timeout_ns);
-    while aether_frame::interrupt::timer::nanos_since_boot() < deadline {
+    let deadline = aether_frame::time::monotonic_nanos().saturating_add(timeout_ns);
+    while aether_frame::time::monotonic_nanos() < deadline {
         if (read_status() & 0x01) != 0 {
             return true;
         }

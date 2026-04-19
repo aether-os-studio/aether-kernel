@@ -12,6 +12,7 @@ use aether_drivers::{DriverInventory, register_input_sink};
 use aether_frame::boot;
 use aether_frame::libs::spin::{LocalIrqDisabled, SpinLock};
 use aether_frame::logger::RegisterWriterError;
+use aether_frame::time;
 use aether_framebuffer::{FramebufferDevice, FramebufferError, FramebufferSurface, RgbColor};
 use aether_kmsg::KmsgBuffer;
 use aether_process::{BuildError, ElfProgramBuilder, UserProgramBuilder, elf_interpreter_path};
@@ -81,6 +82,7 @@ pub struct KernelRuntime {
 
 static SHARED_RUNTIME: Once<Arc<KernelRuntime>> = Once::new();
 static TIMER_TICK_PENDING: AtomicBool = AtomicBool::new(false);
+static DRM_VBLANK_PENDING: AtomicBool = AtomicBool::new(false);
 static NEXT_TIMER_DEADLINE_NANOS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
 static PROCESS_GROUP_SIGNAL_PENDING: AtomicBool = AtomicBool::new(false);
@@ -88,21 +90,20 @@ static PENDING_PROCESS_GROUP_SIGNALS: SpinLock<VecDeque<(i32, i32)>, LocalIrqDis
     SpinLock::new(VecDeque::new());
 
 const PRECISE_WAIT_THRESHOLD_NS: u64 = 10_000_000;
+const IDLE_POLL_INTERVAL_NS: u64 = 1_000_000;
 
 pub(crate) fn publish_next_timer_deadline(deadline_nanos: Option<u64>) {
     NEXT_TIMER_DEADLINE_NANOS.store(deadline_nanos.unwrap_or(u64::MAX), Ordering::Release);
-    if deadline_nanos.is_none() {
-        TIMER_TICK_PENDING.store(false, Ordering::Release);
-    }
 }
 
 fn runtime_tick_handler() {
-    if aether_frame::arch::cpu::current_cpu_index() == 0 {
-        aether_drivers::drm::handle_vblank_tick();
+    if aether_frame::arch::cpu::current_cpu_index() == 0
+        && aether_drivers::drm::vblank_deadline_due()
+    {
+        DRM_VBLANK_PENDING.store(true, Ordering::Release);
     }
     let deadline_nanos = NEXT_TIMER_DEADLINE_NANOS.load(Ordering::Acquire);
-    let process_due = deadline_nanos != u64::MAX
-        && aether_frame::interrupt::timer::nanos_since_boot() >= deadline_nanos;
+    let process_due = deadline_nanos != u64::MAX && time::monotonic_nanos() >= deadline_nanos;
     if process_due || crate::fs::timerfd_deadline_due() {
         TIMER_TICK_PENDING.store(true, Ordering::Release);
     }
@@ -120,6 +121,31 @@ fn runtime_send_process_group_signal(process_group: i32, signal: i32) {
 }
 
 impl KernelRuntime {
+    fn drain_pending_runtime_events(&self) {
+        let current_nanos = time::monotonic_nanos();
+        if aether_frame::arch::cpu::current_cpu_index() == 0
+            && (DRM_VBLANK_PENDING.swap(false, Ordering::AcqRel)
+                || aether_drivers::drm::next_vblank_wakeup_deadline().is_some())
+        {
+            aether_drivers::drm::handle_vblank_tick();
+        }
+
+        let timer_tick_pending = TIMER_TICK_PENDING.swap(false, Ordering::AcqRel);
+        let mut processes = self.processes.lock();
+
+        if timer_tick_pending
+            || crate::fs::next_timerfd_wakeup_deadline().is_some()
+            || processes.next_timer_deadline_nanos().is_some()
+        {
+            crate::fs::wake_expired_timerfds();
+            if processes.timer_deadline_due(current_nanos) {
+                processes.wake_expired_timers(current_nanos);
+            }
+        }
+
+        processes.wake_ready_file_blocks();
+    }
+
     pub fn current_pid() -> Option<Pid> {
         crate::processor::current_pid()
     }
@@ -297,6 +323,7 @@ impl KernelRuntime {
             }
             aether_async::run_ready();
             self.drain_pending_process_group_signals();
+            self.drain_pending_runtime_events();
             if aether_frame::preempt::take_need_resched() {
                 continue;
             }
@@ -309,14 +336,6 @@ impl KernelRuntime {
                 } else {
                     {
                         let mut processes = self.processes.lock();
-                        processes.wake_ready_file_blocks();
-                        if TIMER_TICK_PENDING.swap(false, Ordering::AcqRel) {
-                            crate::fs::wake_expired_timerfds();
-                            let current_nanos = aether_frame::interrupt::timer::nanos_since_boot();
-                            if processes.timer_deadline_due(current_nanos) {
-                                processes.wake_expired_timers(current_nanos);
-                            }
-                        }
                         if let Some(work) =
                             crate::processor::try_take_current_cpu_work(&mut processes)
                         {
@@ -337,25 +356,42 @@ impl KernelRuntime {
                         let processes = self.processes.lock();
                         let process_deadline = processes.next_timer_deadline_nanos();
                         let timerfd_deadline = crate::fs::next_timerfd_wakeup_deadline();
-                        match (process_deadline, timerfd_deadline) {
-                            (Some(left), Some(right)) => Some(left.min(right)),
-                            (Some(value), None) | (None, Some(value)) => Some(value),
-                            (None, None) => None,
-                        }
+                        let drm_deadline = aether_drivers::drm::next_vblank_wakeup_deadline();
+                        [process_deadline, timerfd_deadline, drm_deadline]
+                            .into_iter()
+                            .flatten()
+                            .min()
                     };
 
                     if let Some(deadline) = next_deadline {
-                        let now = aether_frame::interrupt::timer::nanos_since_boot();
+                        let now = time::monotonic_nanos();
                         let remaining = deadline.saturating_sub(now);
                         if remaining != 0
                             && remaining <= PRECISE_WAIT_THRESHOLD_NS
-                            && aether_frame::arch::timer::hpet::stall_nanos(remaining).is_ok()
+                            && time::spin_delay_nanos(remaining).is_ok()
                         {
-                            TIMER_TICK_PENDING.store(true, Ordering::Release);
+                            if aether_drivers::drm::vblank_deadline_due() {
+                                DRM_VBLANK_PENDING.store(true, Ordering::Release);
+                            }
+                            let current_nanos = time::monotonic_nanos();
+                            let process_timer_due = {
+                                let processes = self.processes.lock();
+                                processes.timer_deadline_due(current_nanos)
+                            };
+                            if crate::fs::timerfd_deadline_due() || process_timer_due {
+                                TIMER_TICK_PENDING.store(true, Ordering::Release);
+                            }
                             continue;
                         }
                     }
 
+                    let wait_ns = next_deadline
+                        .map(|deadline| deadline.saturating_sub(time::monotonic_nanos()))
+                        .map(|remaining| remaining.min(IDLE_POLL_INTERVAL_NS))
+                        .unwrap_or(IDLE_POLL_INTERVAL_NS);
+                    if wait_ns != 0 && time::spin_delay_nanos(wait_ns).is_ok() {
+                        continue;
+                    }
                     aether_frame::arch::cpu::wait_for_interrupt();
                 }
                 DispatchWork::Event(event) => self.handle_event(event),

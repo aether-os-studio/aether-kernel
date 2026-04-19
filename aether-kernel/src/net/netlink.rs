@@ -35,8 +35,11 @@ const NETLINK_DROP_MEMBERSHIP: i32 = 2;
 const NETLINK_SOCKADDR_LEN: usize = 12;
 const DEFAULT_SOCKET_BUFFER: usize = 256 * 1024;
 const MIN_SOCKET_BUFFER: usize = 4096;
+const MAX_HISTORICAL_MESSAGES: usize = 1024;
 
 static SOCKETS: SpinLock<Vec<Weak<NetlinkSocket>>> = SpinLock::new(Vec::new());
+static HISTORICAL_MESSAGES: SpinLock<VecDeque<HistoricalNetlinkMessage>> =
+    SpinLock::new(VecDeque::new());
 static UEVENT_SEQNUM: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
@@ -131,6 +134,14 @@ struct NetlinkMessage {
     sender_groups: u32,
 }
 
+#[derive(Clone)]
+struct HistoricalNetlinkMessage {
+    protocol: i32,
+    data: Vec<u8>,
+    sender_portid: u32,
+    sender_groups: u32,
+}
+
 struct NetlinkState {
     portid: u32,
     groups: u32,
@@ -146,6 +157,7 @@ struct NetlinkSocket {
     protocol: i32,
     kind: u32,
     owner_pid: u32,
+    version: AtomicU64,
     state: SpinLock<NetlinkState>,
     waiters: WaitQueue,
 }
@@ -156,6 +168,7 @@ impl NetlinkSocket {
             protocol,
             kind,
             owner_pid,
+            version: AtomicU64::new(1),
             state: SpinLock::new(NetlinkState {
                 portid: 0,
                 groups: 0,
@@ -170,6 +183,10 @@ impl NetlinkSocket {
         });
         SOCKETS.lock().push(Arc::downgrade(&socket));
         socket
+    }
+
+    fn bump(&self) {
+        let _ = self.version.fetch_add(1, Ordering::AcqRel);
     }
 
     fn ensure_portid(&self) -> u32 {
@@ -202,6 +219,7 @@ impl NetlinkSocket {
             state.recv_bytes = next;
             state.recv_queue.push_back(message);
         }
+        self.bump();
         self.waiters.notify(PollEvents::READ);
         Ok(())
     }
@@ -241,17 +259,53 @@ impl NetlinkSocket {
         }
 
         let bit = 1u32 << (group - 1);
-        let mut state = self.state.lock();
+        let replay_groups = {
+            let mut state = self.state.lock();
+            let previous_groups = state.groups;
+            match optname {
+                NETLINK_ADD_MEMBERSHIP => {
+                    state.groups |= bit;
+                    state.groups & !previous_groups
+                }
+                NETLINK_DROP_MEMBERSHIP => {
+                    state.groups &= !bit;
+                    0
+                }
+                _ => return Err(SysErr::NoProtoOpt),
+            }
+        };
         match optname {
             NETLINK_ADD_MEMBERSHIP => {
-                state.groups |= bit;
+                self.deliver_historical_messages(replay_groups);
                 Ok(())
             }
-            NETLINK_DROP_MEMBERSHIP => {
-                state.groups &= !bit;
-                Ok(())
-            }
+            NETLINK_DROP_MEMBERSHIP => Ok(()),
             _ => Err(SysErr::NoProtoOpt),
+        }
+    }
+
+    fn deliver_historical_messages(&self, group_mask: u32) {
+        if group_mask == 0 {
+            return;
+        }
+
+        let messages = {
+            let messages = HISTORICAL_MESSAGES.lock();
+            messages
+                .iter()
+                .filter(|message| {
+                    message.protocol == self.protocol && (message.sender_groups & group_mask) != 0
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        for message in messages {
+            let _ = self.enqueue(NetlinkMessage {
+                data: message.data,
+                sender_portid: message.sender_portid,
+                sender_groups: message.sender_groups,
+            });
         }
     }
 }
@@ -364,6 +418,8 @@ impl KernelSocket for NetlinkSocket {
         let mut state = self.state.lock();
         state.portid = portid;
         state.groups = address.groups;
+        drop(state);
+        self.deliver_historical_messages(address.groups);
         Ok(())
     }
 
@@ -403,6 +459,10 @@ impl KernelSocket for NetlinkSocket {
             ready = ready | PollEvents::WRITE;
         }
         Ok(ready)
+    }
+
+    fn wait_token(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
     }
 
     fn register_waiter(
@@ -492,6 +552,19 @@ fn lookup_portid(protocol: i32, portid: u32, skip: &NetlinkSocket) -> Option<Arc
 fn broadcast_message(protocol: i32, sender_portid: u32, group_mask: u32, payload: &[u8]) {
     if group_mask == 0 {
         return;
+    }
+
+    {
+        let mut messages = HISTORICAL_MESSAGES.lock();
+        if messages.len() >= MAX_HISTORICAL_MESSAGES {
+            let _ = messages.pop_front();
+        }
+        messages.push_back(HistoricalNetlinkMessage {
+            protocol,
+            data: payload.to_vec(),
+            sender_portid,
+            sender_groups: group_mask,
+        });
     }
 
     for socket in live_sockets() {

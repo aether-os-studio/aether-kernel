@@ -130,6 +130,7 @@ pub fn notify_move(
 pub struct InotifyFile {
     instance_id: u64,
     next_watch_descriptor: AtomicI32,
+    version: AtomicU64,
     watches: SpinLock<BTreeMap<i32, InotifyWatch>>,
     events: SpinLock<VecDeque<Vec<u8>>>,
     waiters: WaitQueue,
@@ -211,10 +212,15 @@ impl InotifyFile {
         Self {
             instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::AcqRel),
             next_watch_descriptor: AtomicI32::new(1),
+            version: AtomicU64::new(1),
             watches: SpinLock::new(BTreeMap::new()),
             events: SpinLock::new(VecDeque::new()),
             waiters: WaitQueue::new(),
         }
+    }
+
+    fn bump(&self) {
+        let _ = self.version.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn add_watch(&self, node: &NodeRef, mask: u32) -> FsResult<i32> {
@@ -283,6 +289,7 @@ impl InotifyFile {
             events.push_back(event);
             was_empty
         };
+        self.bump();
         if should_notify {
             self.waiters.notify(PollEvents::READ);
         }
@@ -334,6 +341,10 @@ impl FileOperations for InotifyFile {
             PollEvents::empty()
         };
         Ok(ready)
+    }
+
+    fn wait_token(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
     }
 
     fn register_waiter(

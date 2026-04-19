@@ -1,4 +1,4 @@
-use aether_frame::interrupt::timer;
+use aether_frame::time;
 
 use crate::arch::syscall::nr;
 use crate::errno::SysResult;
@@ -11,7 +11,7 @@ crate::declare_syscall!(pub struct TimeSyscall => nr::TIME, "time", |ctx, args| 
 
 impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
     pub(crate) fn syscall_time(&mut self, tloc: u64) -> SysResult<u64> {
-        let (secs, _) = timer::unix_time_nanos();
+        let secs = time::realtime_seconds();
         if tloc != 0 {
             self.write_user_buffer(tloc, &secs.to_ne_bytes())?;
         }

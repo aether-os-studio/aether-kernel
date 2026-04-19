@@ -152,6 +152,15 @@ struct UnixAncillary {
     credentials: Option<SocketCredentials>,
 }
 
+impl UnixAncillary {
+    fn append(&mut self, mut other: Self) {
+        self.rights.append(&mut other.rights);
+        if self.credentials.is_none() {
+            self.credentials = other.credentials;
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct UnixAddress {
     key: Vec<u8>,
@@ -384,6 +393,13 @@ impl UnixSocket {
             .retain(|weak| !Self::same_socket(client, weak));
     }
 
+    fn inherit_listener_state(accepted: &mut UnixSocketState, listener: &UnixSocketState) {
+        accepted.bound_address = listener.bound_address.clone();
+        accepted.passcred = listener.passcred;
+        accepted.sndbuf = listener.sndbuf;
+        accepted.rcvbuf = listener.rcvbuf;
+    }
+
     fn stream_peer_eof_snapshot(&self, snapshot: &UnixStateSnapshot) -> bool {
         if !snapshot.established {
             return false;
@@ -572,6 +588,12 @@ impl UnixSocket {
                 }
                 if include_control && received_ancillary.is_none() {
                     received_ancillary = chunk.ancillary.clone();
+                } else if include_control && let Some(ancillary) = chunk.ancillary.clone() {
+                    if let Some(collected) = received_ancillary.as_mut() {
+                        collected.append(ancillary);
+                    } else {
+                        received_ancillary = Some(ancillary);
+                    }
                 }
                 let count = min(buffer.len() - written, available.len());
                 buffer[written..written + count].copy_from_slice(&available[..count]);
@@ -598,10 +620,12 @@ impl UnixSocket {
                     remove_front = true;
                 } else {
                     if include_control {
-                        if received_ancillary.is_none() {
-                            received_ancillary = chunk.ancillary.take();
-                        } else {
-                            chunk.ancillary = None;
+                        if let Some(ancillary) = chunk.ancillary.take() {
+                            if let Some(collected) = received_ancillary.as_mut() {
+                                collected.append(ancillary);
+                            } else {
+                                received_ancillary = Some(ancillary);
+                            }
                         }
                     } else {
                         chunk.ancillary = None;
@@ -822,7 +846,7 @@ impl KernelSocket for UnixSocket {
                 }
                 let mut server_state = server.state.lock();
                 client_state.pending_connect = None;
-                server_state.bound_address = listener_state.bound_address.clone();
+                Self::inherit_listener_state(&mut server_state, &listener_state);
                 server_state.peer = Some(Arc::downgrade(&client));
                 server_state.peer_credentials = Some(self.owner);
                 server_state.established = true;

@@ -2,6 +2,7 @@
 
 use alloc::sync::Arc;
 
+use aether_frame::time;
 use aether_vfs::FileAdvice;
 
 use super::*;
@@ -192,8 +193,9 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             poll_fds,
             PollWaitOptions {
                 deadline_nanos: (timeout > 0).then(|| {
-                    aether_frame::interrupt::timer::nanos_since_boot()
-                        .saturating_add(timeout as u64 * 1_000_000)
+                    time::MonotonicInstant::now()
+                        .saturating_add_nanos(timeout as u64 * 1_000_000)
+                        .as_nanos()
                 }),
                 timeout_nanos: (timeout >= 0).then(|| (timeout as u64).saturating_mul(1_000_000)),
                 ..PollWaitOptions::default()
@@ -267,7 +269,9 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let timeout_nanos = request.total_nanos()?;
         Ok(PollWaitOptions {
             deadline_nanos: Some(
-                aether_frame::interrupt::timer::nanos_since_boot().saturating_add(timeout_nanos),
+                time::MonotonicInstant::now()
+                    .saturating_add_nanos(timeout_nanos)
+                    .as_nanos(),
             ),
             timeout_nanos: Some(timeout_nanos),
             timeout_address: Some(timeout),
@@ -730,7 +734,11 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let deadline_nanos = if timeout_nanos == 0 {
             None
         } else {
-            Some(aether_frame::interrupt::timer::nanos_since_boot().saturating_add(timeout_nanos))
+            Some(
+                time::MonotonicInstant::now()
+                    .saturating_add_nanos(timeout_nanos)
+                    .as_nanos(),
+            )
         };
 
         Ok(PollWaitOptions {
@@ -961,7 +969,8 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             let remaining_nanos = options
                 .deadline_nanos
                 .map(|deadline| {
-                    deadline.saturating_sub(aether_frame::interrupt::timer::nanos_since_boot())
+                    time::MonotonicInstant::from_nanos(deadline)
+                        .saturating_nanos_since(time::MonotonicInstant::now())
                 })
                 .or(options.timeout_nanos)
                 .unwrap_or(0);
@@ -1107,6 +1116,16 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let mut msg_flags = 0u32;
         let mut control = Vec::new();
 
+        if address == 0 || address_len == 0 {
+            if !received.control.is_empty()
+                || !received.rights.is_empty()
+                || received.credentials.is_some()
+            {
+                msg_flags |= MSG_CTRUNC;
+            }
+            return Ok((0, msg_flags));
+        }
+
         if !received.control.is_empty() {
             control.extend_from_slice(received.control.as_slice());
         }
@@ -1169,13 +1188,6 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             } else {
                 msg_flags |= MSG_CTRUNC;
             }
-        }
-
-        if address == 0 || address_len == 0 {
-            if !control.is_empty() {
-                msg_flags |= MSG_CTRUNC;
-            }
-            return Ok((0, msg_flags));
         }
 
         let count = core::cmp::min(address_len, control.len());

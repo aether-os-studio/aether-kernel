@@ -6,6 +6,7 @@ use core::sync::atomic::Ordering;
 
 use aether_frame::libs::spin::{LocalIrqDisabled, SpinLock};
 use aether_frame::process::{RunReason, RunResult};
+use aether_frame::time;
 use aether_process::{BuildError, BuiltProcess};
 use aether_vfs::{OpenFileDescription, PollEvents, SharedWaitListener, WaitListener};
 
@@ -1010,7 +1011,7 @@ impl ProcessManager {
             }) = process.state
             {
                 let _ = request_nanos;
-                let current_nanos = aether_frame::interrupt::timer::nanos_since_boot();
+                let current_nanos = time::monotonic_nanos();
                 process.wake_result = Some(if current_nanos < target_nanos {
                     BlockResult::Timer {
                         completed: false,

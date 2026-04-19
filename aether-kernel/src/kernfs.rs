@@ -8,7 +8,7 @@ use aether_device::{
     DeviceClass, DeviceNamespace, DeviceNode, KernelDevice, SysfsEntry, SysfsEntryKind,
 };
 use aether_frame::bus::pci::PciDeviceInfo;
-use aether_frame::interrupt::timer;
+use aether_frame::time;
 use aether_fs::pseudo::{BytesGenerator, generated_bytes_file, generated_text_file};
 use aether_tmpfs as tmpfs;
 use aether_vfs::{FileNode, FileOperations, FsError, FsResult, NodeKind, NodeRef, Vfs};
@@ -700,7 +700,7 @@ fn render_filesystems(filesystems: &[&str]) -> String {
 }
 
 fn render_uptime() -> String {
-    let nanos = timer::nanos_since_boot();
+    let nanos = time::monotonic_nanos();
     let secs = nanos / 1_000_000_000;
     let centis = (nanos % 1_000_000_000) / 10_000_000;
     alloc::format!("{secs}.{centis:02} 0.00\n")

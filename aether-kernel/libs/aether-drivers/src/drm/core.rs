@@ -3,13 +3,14 @@ extern crate alloc;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use aether_device::{DeviceClass, DeviceMetadata, DeviceNode, DeviceRegistry, KernelDevice};
-use aether_frame::interrupt::timer;
 use aether_frame::libs::spin::SpinLock;
+use aether_frame::time;
 use aether_framebuffer::{FramebufferSurface, RgbColor};
 use aether_vfs::{
     FileNode, FileOperations, FsError, FsResult, MmapCachePolicy, MmapRequest, MmapResponse,
@@ -32,7 +33,9 @@ pub const DRM_MODE_OBJECT_ANY: u32 = 0;
 pub const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
 pub const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
 pub const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
+pub const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
 pub const DRM_MODE_PROP_OBJECT: u32 = 1 << 6;
+pub const DRM_MODE_PROP_SIGNED_RANGE: u32 = 2 << 6;
 pub const DRM_MODE_PROP_ATOMIC: u32 = 0x8000_0000;
 
 pub const DRM_MODE_DPMS_ON: u64 = 0;
@@ -49,8 +52,17 @@ pub const DRM_PROPERTY_ID_CRTC_X: u32 = 5;
 pub const DRM_PROPERTY_ID_CRTC_Y: u32 = 6;
 pub const DRM_PROPERTY_ID_PLANE_TYPE: u32 = 7;
 pub const DRM_PROPERTY_ID_CRTC_ID: u32 = 9;
+pub const DRM_PROPERTY_ID_SRC_W: u32 = 10;
+pub const DRM_PROPERTY_ID_SRC_X: u32 = 11;
+pub const DRM_PROPERTY_ID_SRC_Y: u32 = 12;
+pub const DRM_PROPERTY_ID_CRTC_W: u32 = 13;
+pub const DRM_PROPERTY_ID_CRTC_H: u32 = 14;
+pub const DRM_PROPERTY_ID_IN_FORMATS: u32 = 15;
+pub const DRM_PROPERTY_ID_SRC_H: u32 = 16;
 pub const DRM_CRTC_ACTIVE_PROP_ID: u32 = 0x100;
+pub const DRM_CRTC_MODE_ID_PROP_ID: u32 = 0x101;
 pub const DRM_CONNECTOR_DPMS_PROP_ID: u32 = 0x200;
+pub const DRM_CONNECTOR_EDID_PROP_ID: u32 = 0x201;
 pub const DRM_CONNECTOR_CRTC_ID_PROP_ID: u32 = 0x202;
 pub const DRM_FB_WIDTH_PROP_ID: u32 = 0x300;
 pub const DRM_FB_HEIGHT_PROP_ID: u32 = 0x301;
@@ -74,6 +86,7 @@ pub const DRM_CLIENT_CAP_ASPECT_RATIO: u64 = 4;
 pub const DRM_CLIENT_CAP_WRITEBACK_CONNECTORS: u64 = 5;
 
 pub const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
+pub const DRM_EVENT_VBLANK: u32 = 0x01;
 pub const DRM_MODE_FB_DIRTY_ANNOTATE_COPY: u32 = 0x01;
 pub const DRM_MODE_FB_DIRTY_ANNOTATE_FILL: u32 = 0x02;
 pub const DRM_MODE_FB_DIRTY_FLAGS: u32 =
@@ -98,6 +111,14 @@ const MAX_READY_DRM_EVENTS: usize = 64;
 const MAX_PENDING_DRM_EVENTS: usize = 256;
 
 static DRM_DEVICES: SpinLock<Vec<Weak<DrmDevice>>> = SpinLock::new(Vec::new());
+static NEXT_VBLANK_DEADLINE_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+static USER_PROPERTY_BLOBS: SpinLock<BTreeMap<u32, Vec<u8>>> = SpinLock::new(BTreeMap::new());
+static NEXT_USER_PROPERTY_BLOB_ID: AtomicU32 = AtomicU32::new(0x3000_0000);
+
+const DRM_BLOB_MODE_BASE: u32 = 0x1000_0000;
+const DRM_BLOB_EDID_BASE: u32 = 0x1100_0000;
+const DRM_BLOB_IN_FORMATS_BASE: u32 = 0x1200_0000;
+const FORMAT_BLOB_CURRENT: u32 = 1;
 
 pub const fn fourcc_code(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
@@ -327,6 +348,7 @@ struct DrmFramebufferState {
 struct PendingDrmEvent {
     type_: u32,
     user_data: u64,
+    target_sequence: u64,
 }
 
 struct DrmState {
@@ -337,7 +359,7 @@ struct DrmState {
     universal_planes: bool,
     dumb_buffers: BTreeMap<u32, Arc<DumbBuffer>>,
     framebuffers: BTreeMap<u32, DrmFramebufferState>,
-    event_queue: VecDeque<u8>,
+    event_queue: VecDeque<[u8; DRM_EVENT_BYTES]>,
     pending_events: VecDeque<PendingDrmEvent>,
     vblank_sequence: u64,
     vblank_period_ns: u64,
@@ -358,10 +380,191 @@ pub struct DrmDevice {
 }
 
 impl DrmDevice {
+    fn crtc_mode_blob_id(&self) -> u32 {
+        DRM_BLOB_MODE_BASE | self.crtc_id
+    }
+
+    fn connector_edid_blob_id(&self) -> u32 {
+        DRM_BLOB_EDID_BASE | self.connector_id
+    }
+
+    fn plane_in_formats_blob_id(&self) -> u32 {
+        DRM_BLOB_IN_FORMATS_BASE | self.plane_id
+    }
+
+    fn build_connector_edid(&self) -> Vec<u8> {
+        let mode = self.backend.mode();
+        let (mm_width, mm_height) = self.backend.mm_size();
+        let width_cm = (mm_width / 10).clamp(1, u32::from(u8::MAX)) as u8;
+        let height_cm = (mm_height / 10).clamp(1, u32::from(u8::MAX)) as u8;
+        let width = mode.hdisplay as u32;
+        let height = mode.vdisplay as u32;
+        let refresh = mode.vrefresh.max(1);
+
+        let mut edid = [0u8; 128];
+        edid[0..8].copy_from_slice(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]);
+        edid[8..10].copy_from_slice(&0x4d54u16.to_be_bytes());
+        edid[10..12].copy_from_slice(&0x0001u16.to_le_bytes());
+        edid[12..16].copy_from_slice(&1u32.to_le_bytes());
+        edid[16] = 1;
+        edid[17] = 4;
+        edid[18] = 1;
+        edid[19] = 4;
+        edid[20] = 0x80;
+        edid[21] = width_cm;
+        edid[22] = height_cm;
+        edid[23] = 0x78;
+        edid[24..35].fill(0);
+        edid[35] = 0x01;
+        edid[36] = 0x01;
+        edid[37] = 0x01;
+        edid[38] = 0x01;
+        edid[39] = 0x01;
+        edid[40] = 0x01;
+        edid[41] = 0x01;
+        edid[42] = 0x01;
+        edid[43] = 0x01;
+        edid[44] = 0x01;
+        edid[45] = 0x01;
+        edid[46] = 0x01;
+        edid[47] = 0x01;
+        edid[48] = 0x01;
+        edid[49] = 0x01;
+        edid[50] = 0x01;
+
+        let hsync_start = width.saturating_add(16);
+        let hsync_end = width.saturating_add(16 + 96);
+        let htotal = width.saturating_add(16 + 96 + 48);
+        let vsync_start = height.saturating_add(10);
+        let vsync_end = height.saturating_add(12);
+        let vtotal = height.saturating_add(45);
+        let hblank = htotal.saturating_sub(width);
+        let vblank = vtotal.saturating_sub(height);
+        let hsync_offset = hsync_start.saturating_sub(width);
+        let hsync_pulse = hsync_end.saturating_sub(hsync_start);
+        let vsync_offset = vsync_start.saturating_sub(height);
+        let vsync_pulse = vsync_end.saturating_sub(vsync_start);
+        let pixel_clock = htotal
+            .saturating_mul(vtotal)
+            .saturating_mul(refresh)
+            .div_ceil(10_000);
+        let dtd = &mut edid[54..72];
+        dtd[0..2].copy_from_slice(&(pixel_clock as u16).to_le_bytes());
+        dtd[2] = (width & 0xff) as u8;
+        dtd[3] = (hblank & 0xff) as u8;
+        dtd[4] = (((width >> 8) & 0x0f) << 4 | ((hblank >> 8) & 0x0f)) as u8;
+        dtd[5] = (height & 0xff) as u8;
+        dtd[6] = (vblank & 0xff) as u8;
+        dtd[7] = (((height >> 8) & 0x0f) << 4 | ((vblank >> 8) & 0x0f)) as u8;
+        dtd[8] = (hsync_offset & 0xff) as u8;
+        dtd[9] = (hsync_pulse & 0xff) as u8;
+        dtd[10] = (((vsync_offset & 0x0f) << 4) | (vsync_pulse & 0x0f)) as u8;
+        dtd[11] = ((((hsync_offset >> 8) & 0x03) << 6)
+            | (((hsync_pulse >> 8) & 0x03) << 4)
+            | (((vsync_offset >> 4) & 0x03) << 2)
+            | ((vsync_pulse >> 4) & 0x03)) as u8;
+        dtd[12] = width_cm.saturating_mul(10);
+        dtd[13] = height_cm.saturating_mul(10);
+        dtd[14] = 0;
+        dtd[15] = 0;
+        dtd[16] = 0;
+        dtd[17] = 0x1a;
+
+        edid[72..90].copy_from_slice(&[
+            0x00, 0x00, 0x00, 0xfc, 0x00, b'A', b'e', b't', b'h', b'e', b'r', b'-', b'F', b'B',
+            0x0a, 0x20, 0x20, 0x20,
+        ]);
+        edid[90..108].copy_from_slice(&[
+            0x00, 0x00, 0x00, 0xff, 0x00, b'A', b'E', b'T', b'H', b'E', b'R', b'0', b'0', b'0',
+            b'1', 0x0a, 0x20, 0x20,
+        ]);
+        edid[108..126].copy_from_slice(&[
+            0x00, 0x00, 0x00, 0xfd, 0x00, 0x1e, 0x78, 0x1e, 0xff, 0x00, 0x0a, 0x20, 0x20, 0x20,
+            0x20, 0x20, 0x20, 0x20,
+        ]);
+        let checksum = edid[..127]
+            .iter()
+            .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        edid[127] = checksum.wrapping_neg();
+        edid.to_vec()
+    }
+
+    fn build_in_formats_blob(&self) -> Vec<u8> {
+        let formats = self.backend.supported_formats();
+        let formats_len = core::mem::size_of_val(formats);
+        let modifiers_offset = 24 + formats_len;
+        let mut bytes = vec![0u8; modifiers_offset + 24];
+        bytes[0..4].copy_from_slice(&FORMAT_BLOB_CURRENT.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&(formats.len() as u32).to_ne_bytes());
+        bytes[12..16].copy_from_slice(&24u32.to_ne_bytes());
+        bytes[16..20].copy_from_slice(&1u32.to_ne_bytes());
+        bytes[20..24].copy_from_slice(&(modifiers_offset as u32).to_ne_bytes());
+        for (index, format) in formats.iter().copied().enumerate() {
+            let offset = 24 + index * 4;
+            bytes[offset..offset + 4].copy_from_slice(&format.to_ne_bytes());
+        }
+        let mask = if formats.len() >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << formats.len()) - 1
+        };
+        bytes[modifiers_offset..modifiers_offset + 8].copy_from_slice(&mask.to_ne_bytes());
+        bytes[modifiers_offset + 8..modifiers_offset + 12].copy_from_slice(&0u32.to_ne_bytes());
+        bytes[modifiers_offset + 12..modifiers_offset + 16].copy_from_slice(&0u32.to_ne_bytes());
+        bytes[modifiers_offset + 16..modifiers_offset + 24].copy_from_slice(&0u64.to_ne_bytes());
+        bytes
+    }
+
+    pub fn get_property_blob(&self, blob_id: u32) -> Option<Vec<u8>> {
+        if blob_id == self.crtc_mode_blob_id() {
+            let mut bytes = [0u8; DrmModeInfo::SIZE];
+            self.backend
+                .mode()
+                .write_to_bytes(&mut bytes)
+                .then_some(bytes.to_vec())
+        } else if blob_id == self.connector_edid_blob_id() {
+            Some(self.build_connector_edid())
+        } else if blob_id == self.plane_in_formats_blob_id() {
+            Some(self.build_in_formats_blob())
+        } else {
+            USER_PROPERTY_BLOBS.lock().get(&blob_id).cloned()
+        }
+    }
+
+    pub fn create_property_blob(&self, bytes: &[u8]) -> Result<u32, DrmIoctlError> {
+        let blob_id = NEXT_USER_PROPERTY_BLOB_ID.fetch_add(1, Ordering::AcqRel);
+        USER_PROPERTY_BLOBS.lock().insert(blob_id, bytes.to_vec());
+        Ok(blob_id)
+    }
+
+    pub fn destroy_property_blob(&self, blob_id: u32) -> Result<(), DrmIoctlError> {
+        if blob_id == self.crtc_mode_blob_id()
+            || blob_id == self.connector_edid_blob_id()
+            || blob_id == self.plane_in_formats_blob_id()
+        {
+            return Err(DrmIoctlError::Permission);
+        }
+        USER_PROPERTY_BLOBS
+            .lock()
+            .remove(&blob_id)
+            .map(|_| ())
+            .ok_or(DrmIoctlError::NotFound)
+    }
+
+    fn mode_from_blob(&self, blob_id: u32) -> Result<DrmModeInfo, DrmIoctlError> {
+        if blob_id == self.crtc_mode_blob_id() {
+            return Ok(self.backend.mode());
+        }
+        let bytes = self
+            .get_property_blob(blob_id)
+            .ok_or(DrmIoctlError::NotFound)?;
+        DrmModeInfo::from_bytes(&bytes).ok_or(DrmIoctlError::Invalid)
+    }
+
     pub fn new(index: usize, backend: Arc<dyn DrmScanoutBackend>) -> Arc<Self> {
         let refresh_hz = backend.mode().vrefresh.max(1) as u64;
         let vblank_period_ns = 1_000_000_000u64 / refresh_hz;
-        let next_vblank_ns = timer::nanos_since_boot().saturating_add(vblank_period_ns);
+        let next_vblank_ns = time::monotonic_nanos().saturating_add(vblank_period_ns);
         let device = Arc::new(Self {
             driver_info: backend.driver_info(),
             backend,
@@ -388,6 +591,7 @@ impl DrmDevice {
             }),
         });
         DRM_DEVICES.lock().push(Arc::downgrade(&device));
+        refresh_next_vblank_deadline();
         device
     }
 
@@ -439,11 +643,10 @@ impl DrmDevice {
                 Ok(())
             }
             DRM_CLIENT_CAP_ATOMIC => {
-                if value == 0 {
+                if value <= 1 {
                     return Ok(());
                 }
-                // TODO: expose atomic once per-file drm client state exists.
-                Err(DrmIoctlError::NotSupported)
+                Err(DrmIoctlError::Invalid)
             }
             _ => Err(DrmIoctlError::Invalid),
         }
@@ -594,8 +797,8 @@ impl DrmDevice {
                     return Err(DrmIoctlError::NotFound);
                 }
                 Ok(DrmObjectPropertiesSnapshot {
-                    ids: alloc::vec![DRM_CRTC_ACTIVE_PROP_ID],
-                    values: alloc::vec![1],
+                    ids: alloc::vec![DRM_CRTC_ACTIVE_PROP_ID, DRM_CRTC_MODE_ID_PROP_ID],
+                    values: alloc::vec![1, u64::from(self.crtc_mode_blob_id())],
                 })
             }
             DRM_MODE_OBJECT_CONNECTOR => {
@@ -603,26 +806,58 @@ impl DrmDevice {
                     return Err(DrmIoctlError::NotFound);
                 }
                 Ok(DrmObjectPropertiesSnapshot {
-                    ids: alloc::vec![DRM_CONNECTOR_DPMS_PROP_ID, DRM_CONNECTOR_CRTC_ID_PROP_ID],
-                    values: alloc::vec![DRM_MODE_DPMS_ON, u64::from(self.crtc_id)],
+                    ids: alloc::vec![
+                        DRM_CONNECTOR_DPMS_PROP_ID,
+                        DRM_CONNECTOR_EDID_PROP_ID,
+                        DRM_CONNECTOR_CRTC_ID_PROP_ID,
+                    ],
+                    values: alloc::vec![
+                        DRM_MODE_DPMS_ON,
+                        u64::from(self.connector_edid_blob_id()),
+                        u64::from(self.crtc_id),
+                    ],
                 })
             }
             DRM_MODE_OBJECT_PLANE => {
                 let snapshot = self.get_plane(object_id).ok_or(DrmIoctlError::NotFound)?;
+                let (src_w, src_h) = self
+                    .get_framebuffer(snapshot.framebuffer_id)
+                    .map(|fb| ((u64::from(fb.width)) << 16, (u64::from(fb.height)) << 16))
+                    .unwrap_or_else(|| {
+                        let mode = self.backend.mode();
+                        (
+                            (u64::from(mode.hdisplay)) << 16,
+                            (u64::from(mode.vdisplay)) << 16,
+                        )
+                    });
                 Ok(DrmObjectPropertiesSnapshot {
                     ids: alloc::vec![
                         DRM_PROPERTY_ID_PLANE_TYPE,
+                        DRM_PROPERTY_ID_IN_FORMATS,
                         DRM_PROPERTY_ID_FB_ID,
                         DRM_PROPERTY_ID_CRTC_ID,
+                        DRM_PROPERTY_ID_SRC_X,
+                        DRM_PROPERTY_ID_SRC_Y,
+                        DRM_PROPERTY_ID_SRC_W,
+                        DRM_PROPERTY_ID_SRC_H,
                         DRM_PROPERTY_ID_CRTC_X,
                         DRM_PROPERTY_ID_CRTC_Y,
+                        DRM_PROPERTY_ID_CRTC_W,
+                        DRM_PROPERTY_ID_CRTC_H,
                     ],
                     values: alloc::vec![
                         DRM_PLANE_TYPE_PRIMARY,
+                        u64::from(self.plane_in_formats_blob_id()),
                         u64::from(snapshot.framebuffer_id),
                         u64::from(snapshot.crtc_id),
                         0,
                         0,
+                        src_w,
+                        src_h,
+                        0,
+                        0,
+                        u64::from(self.backend.mode().hdisplay),
+                        u64::from(self.backend.mode().vdisplay),
                     ],
                 })
             }
@@ -667,16 +902,72 @@ impl DrmDevice {
             }),
             DRM_PROPERTY_ID_CRTC_X => Ok(DrmPropertyInfo {
                 prop_id,
-                flags: DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+                flags: DRM_MODE_PROP_SIGNED_RANGE | DRM_MODE_PROP_ATOMIC,
                 name: String::from("CRTC_X"),
-                values: alloc::vec![0, u64::from(self.backend.mode().hdisplay)],
+                values: alloc::vec![u64::MAX.wrapping_sub(i32::MAX as u64 - 1), i32::MAX as u64],
                 enums: Vec::new(),
             }),
             DRM_PROPERTY_ID_CRTC_Y => Ok(DrmPropertyInfo {
                 prop_id,
-                flags: DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+                flags: DRM_MODE_PROP_SIGNED_RANGE | DRM_MODE_PROP_ATOMIC,
                 name: String::from("CRTC_Y"),
-                values: alloc::vec![0, u64::from(self.backend.mode().vdisplay)],
+                values: alloc::vec![u64::MAX.wrapping_sub(i32::MAX as u64 - 1), i32::MAX as u64],
+                enums: Vec::new(),
+            }),
+            DRM_PROPERTY_ID_SRC_X => Ok(DrmPropertyInfo {
+                prop_id,
+                flags: DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+                name: String::from("SRC_X"),
+                values: alloc::vec![0, u64::from(u32::MAX)],
+                enums: Vec::new(),
+            }),
+            DRM_PROPERTY_ID_SRC_Y => Ok(DrmPropertyInfo {
+                prop_id,
+                flags: DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+                name: String::from("SRC_Y"),
+                values: alloc::vec![0, u64::from(u32::MAX)],
+                enums: Vec::new(),
+            }),
+            DRM_PROPERTY_ID_SRC_W => Ok(DrmPropertyInfo {
+                prop_id,
+                flags: DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+                name: String::from("SRC_W"),
+                values: alloc::vec![0, u64::from(u32::MAX)],
+                enums: Vec::new(),
+            }),
+            DRM_PROPERTY_ID_SRC_H => Ok(DrmPropertyInfo {
+                prop_id,
+                flags: DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+                name: String::from("SRC_H"),
+                values: alloc::vec![0, u64::from(u32::MAX)],
+                enums: Vec::new(),
+            }),
+            DRM_PROPERTY_ID_CRTC_W => Ok(DrmPropertyInfo {
+                prop_id,
+                flags: DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+                name: String::from("CRTC_W"),
+                values: alloc::vec![0, 8192],
+                enums: Vec::new(),
+            }),
+            DRM_PROPERTY_ID_CRTC_H => Ok(DrmPropertyInfo {
+                prop_id,
+                flags: DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
+                name: String::from("CRTC_H"),
+                values: alloc::vec![0, 8192],
+                enums: Vec::new(),
+            }),
+            DRM_PROPERTY_ID_IN_FORMATS => Ok(DrmPropertyInfo {
+                prop_id,
+                flags: DRM_MODE_PROP_BLOB | DRM_MODE_PROP_IMMUTABLE,
+                name: String::from("IN_FORMATS"),
+                values: Vec::new(),
+                enums: Vec::new(),
+            }),
+            DRM_CRTC_MODE_ID_PROP_ID => Ok(DrmPropertyInfo {
+                prop_id,
+                flags: DRM_MODE_PROP_BLOB | DRM_MODE_PROP_ATOMIC,
+                name: String::from("MODE_ID"),
+                values: Vec::new(),
                 enums: Vec::new(),
             }),
             DRM_PROPERTY_ID_PLANE_TYPE => Ok(DrmPropertyInfo {
@@ -730,6 +1021,13 @@ impl DrmDevice {
                     },
                 ],
             }),
+            DRM_CONNECTOR_EDID_PROP_ID => Ok(DrmPropertyInfo {
+                prop_id,
+                flags: DRM_MODE_PROP_BLOB | DRM_MODE_PROP_IMMUTABLE,
+                name: String::from("EDID"),
+                values: Vec::new(),
+                enums: Vec::new(),
+            }),
             DRM_FB_WIDTH_PROP_ID => Ok(DrmPropertyInfo {
                 prop_id,
                 flags: DRM_MODE_PROP_RANGE | DRM_MODE_PROP_ATOMIC,
@@ -760,6 +1058,128 @@ impl DrmDevice {
             }),
             _ => Err(DrmIoctlError::NotFound),
         }
+    }
+
+    pub fn atomic_commit(
+        &self,
+        flags: u32,
+        obj_ids: &[u32],
+        obj_prop_counts: &[u32],
+        prop_ids: &[u32],
+        prop_values: &[u64],
+        user_data: u64,
+    ) -> Result<(), DrmIoctlError> {
+        if (flags & !super::ioctl::DRM_MODE_ATOMIC_FLAGS) != 0 {
+            return Err(DrmIoctlError::Invalid);
+        }
+        if obj_ids.len() != obj_prop_counts.len() || prop_ids.len() != prop_values.len() {
+            return Err(DrmIoctlError::Invalid);
+        }
+
+        let mut prop_index = 0usize;
+        let mut committed_fb_id = None;
+        let mut active = true;
+
+        for (&obj_id, &count) in obj_ids.iter().zip(obj_prop_counts.iter()) {
+            let count = count as usize;
+            if prop_index.saturating_add(count) > prop_ids.len() {
+                return Err(DrmIoctlError::Invalid);
+            }
+
+            if obj_id == self.plane_id {
+                for (&prop_id, &value) in prop_ids[prop_index..prop_index + count]
+                    .iter()
+                    .zip(&prop_values[prop_index..prop_index + count])
+                {
+                    match prop_id {
+                        DRM_PROPERTY_ID_PLANE_TYPE => {
+                            if value != DRM_PLANE_TYPE_PRIMARY {
+                                return Err(DrmIoctlError::Invalid);
+                            }
+                        }
+                        DRM_PROPERTY_ID_FB_ID => {
+                            if value != 0 && self.get_framebuffer(value as u32).is_none() {
+                                return Err(DrmIoctlError::NotFound);
+                            }
+                            committed_fb_id = (value != 0).then_some(value as u32);
+                        }
+                        DRM_PROPERTY_ID_CRTC_ID => {
+                            if value != 0 && value != u64::from(self.crtc_id) {
+                                return Err(DrmIoctlError::NotFound);
+                            }
+                        }
+                        DRM_PROPERTY_ID_SRC_X
+                        | DRM_PROPERTY_ID_SRC_Y
+                        | DRM_PROPERTY_ID_SRC_W
+                        | DRM_PROPERTY_ID_SRC_H
+                        | DRM_PROPERTY_ID_CRTC_X
+                        | DRM_PROPERTY_ID_CRTC_Y
+                        | DRM_PROPERTY_ID_CRTC_W
+                        | DRM_PROPERTY_ID_CRTC_H
+                        | DRM_PROPERTY_ID_IN_FORMATS => {}
+                        _ => {}
+                    }
+                }
+            } else if obj_id == self.crtc_id {
+                for (&prop_id, &value) in prop_ids[prop_index..prop_index + count]
+                    .iter()
+                    .zip(&prop_values[prop_index..prop_index + count])
+                {
+                    match prop_id {
+                        DRM_CRTC_ACTIVE_PROP_ID => active = value != 0,
+                        DRM_CRTC_MODE_ID_PROP_ID => {
+                            if value != 0 {
+                                let mode = self.mode_from_blob(value as u32)?;
+                                if mode.hdisplay == 0 || mode.vdisplay == 0 {
+                                    return Err(DrmIoctlError::Invalid);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if obj_id == self.connector_id {
+                for (&prop_id, &value) in prop_ids[prop_index..prop_index + count]
+                    .iter()
+                    .zip(&prop_values[prop_index..prop_index + count])
+                {
+                    match prop_id {
+                        DRM_CONNECTOR_DPMS_PROP_ID => {
+                            if value > DRM_MODE_DPMS_OFF {
+                                return Err(DrmIoctlError::Invalid);
+                            }
+                        }
+                        DRM_CONNECTOR_CRTC_ID_PROP_ID => {
+                            if value != 0 && value != u64::from(self.crtc_id) {
+                                return Err(DrmIoctlError::NotFound);
+                            }
+                        }
+                        DRM_CONNECTOR_EDID_PROP_ID => {}
+                        _ => {}
+                    }
+                }
+            } else if self.get_framebuffer(obj_id).is_some() {
+            } else {
+                return Err(DrmIoctlError::NotFound);
+            }
+
+            prop_index += count;
+        }
+
+        if prop_index != prop_ids.len() {
+            return Err(DrmIoctlError::Invalid);
+        }
+        if (flags & super::ioctl::DRM_MODE_ATOMIC_TEST_ONLY) != 0 {
+            return Ok(());
+        }
+        let Some(framebuffer_id) = committed_fb_id.filter(|_| active) else {
+            return Ok(());
+        };
+        self.set_crtc(framebuffer_id)?;
+        if (flags & DRM_MODE_PAGE_FLIP_EVENT) != 0 {
+            self.defer_flip_event(user_data);
+        }
+        Ok(())
     }
 
     pub fn create_dumb(
@@ -942,29 +1362,115 @@ impl DrmDevice {
         Ok(())
     }
 
-    fn front_event_len(queue: &VecDeque<u8>) -> Option<usize> {
-        if queue.len() < 8 {
-            return None;
+    pub fn wait_vblank(
+        &self,
+        request: super::ioctl::DrmWaitVBlank,
+    ) -> Result<super::ioctl::DrmWaitVBlank, DrmIoctlError> {
+        let supported = super::ioctl::DRM_VBLANK_TYPES_MASK
+            | super::ioctl::DRM_VBLANK_FLAGS_MASK
+            | super::ioctl::DRM_VBLANK_HIGH_CRTC_MASK;
+        if (request.type_ & !supported) != 0 {
+            return Err(DrmIoctlError::Invalid);
         }
-        let len0 = *queue.get(4)?;
-        let len1 = *queue.get(5)?;
-        let len2 = *queue.get(6)?;
-        let len3 = *queue.get(7)?;
-        Some(u32::from_ne_bytes([len0, len1, len2, len3]) as usize)
+        if (request.type_ & super::ioctl::DRM_VBLANK_SIGNAL) != 0 {
+            return Err(DrmIoctlError::Invalid);
+        }
+        if (request.type_ & super::ioctl::DRM_VBLANK_TYPES_MASK) > super::ioctl::DRM_VBLANK_RELATIVE
+        {
+            return Err(DrmIoctlError::Invalid);
+        }
+        let high_crtc = (request.type_ & super::ioctl::DRM_VBLANK_HIGH_CRTC_MASK)
+            >> super::ioctl::DRM_VBLANK_HIGH_CRTC_SHIFT;
+        if high_crtc != 0
+            || (request.type_ & super::ioctl::DRM_VBLANK_SECONDARY) != 0
+            || (request.type_ & super::ioctl::DRM_VBLANK_FLIP) != 0
+        {
+            return Err(DrmIoctlError::NotSupported);
+        }
+
+        let mut target_set = false;
+        let mut target_seq = 0u64;
+
+        loop {
+            let now_ns = time::monotonic_nanos();
+            let (sequence, next_vblank_ns) = {
+                let mut state = self.state.lock();
+                Self::advance_vblank_state_locked(&mut state, now_ns);
+                (state.vblank_sequence, state.next_vblank_ns)
+            };
+
+            if !target_set {
+                target_seq = if (request.type_ & super::ioctl::DRM_VBLANK_RELATIVE) != 0 {
+                    sequence.saturating_add(request.sequence as u64)
+                } else {
+                    request.sequence as u64
+                };
+                if (request.type_ & super::ioctl::DRM_VBLANK_NEXTONMISS) != 0
+                    && sequence >= target_seq
+                {
+                    target_seq = sequence.saturating_add(1);
+                }
+                target_set = true;
+            }
+
+            if (request.type_ & super::ioctl::DRM_VBLANK_EVENT) != 0 {
+                let notify_now = {
+                    let mut state = self.state.lock();
+                    Self::advance_vblank_state_locked(&mut state, now_ns);
+                    if state.vblank_sequence >= target_seq || state.vblank_period_ns == 0 {
+                        let sequence = state.vblank_sequence as u32;
+                        self.queue_ready_event_locked(
+                            &mut state,
+                            DRM_EVENT_VBLANK,
+                            request.signal,
+                            now_ns,
+                            sequence,
+                        );
+                        true
+                    } else {
+                        if state.pending_events.len() >= MAX_PENDING_DRM_EVENTS {
+                            let _ = state.pending_events.pop_front();
+                        }
+                        state.pending_events.push_back(PendingDrmEvent {
+                            type_: DRM_EVENT_VBLANK,
+                            user_data: request.signal,
+                            target_sequence: target_seq,
+                        });
+                        false
+                    }
+                };
+                self.bump();
+                refresh_next_vblank_deadline();
+                if notify_now {
+                    self.waiters.notify(PollEvents::READ);
+                }
+                return Ok(request);
+            }
+
+            if sequence >= target_seq {
+                return Ok(super::ioctl::DrmWaitVBlank {
+                    type_: request.type_,
+                    sequence: sequence as u32,
+                    signal: 0,
+                    tval_sec: (now_ns / 1_000_000_000) as i64,
+                    tval_usec: ((now_ns % 1_000_000_000) / 1_000) as i64,
+                });
+            }
+
+            let wait_ns = if next_vblank_ns > now_ns {
+                (next_vblank_ns - now_ns).min(10_000_000)
+            } else {
+                1_000_000
+            };
+            if wait_ns == 0 {
+                continue;
+            }
+            let _ = time::spin_delay_nanos(wait_ns);
+        }
     }
 
     fn drop_oldest_ready_event_locked(state: &mut DrmState) {
-        let Some(event_len) = Self::front_event_len(&state.event_queue) else {
-            state.event_queue.clear();
-            return;
-        };
-        if event_len == 0 || state.event_queue.len() < event_len {
-            state.event_queue.clear();
-            return;
-        }
-        for _ in 0..event_len {
-            let _ = state.event_queue.pop_front();
-        }
+        let _ = state.event_queue.pop_front();
     }
 
     fn queue_ready_event_locked(
@@ -987,14 +1493,14 @@ impl DrmDevice {
         event[24..28].copy_from_slice(&sequence.to_ne_bytes());
         event[28..32].copy_from_slice(&self.crtc_id.to_ne_bytes());
 
-        let max_bytes = MAX_READY_DRM_EVENTS.saturating_mul(DRM_EVENT_BYTES);
-        while state.event_queue.len().saturating_add(event.len()) > max_bytes {
+        while state.event_queue.len() >= MAX_READY_DRM_EVENTS {
             Self::drop_oldest_ready_event_locked(state);
         }
-        state.event_queue.extend(event);
+        state.event_queue.push_back(event);
     }
 
     fn defer_flip_event(&self, user_data: u64) {
+        let now_ns = time::monotonic_nanos();
         let notify_now = {
             let mut state = self.state.lock();
             if state.vblank_period_ns == 0 {
@@ -1004,22 +1510,26 @@ impl DrmDevice {
                     &mut state,
                     DRM_EVENT_FLIP_COMPLETE,
                     user_data,
-                    timer::nanos_since_boot(),
+                    now_ns,
                     sequence,
                 );
                 true
             } else {
+                Self::advance_vblank_state_locked(&mut state, now_ns);
+                let target_sequence = state.vblank_sequence.saturating_add(1);
                 if state.pending_events.len() >= MAX_PENDING_DRM_EVENTS {
                     let _ = state.pending_events.pop_front();
                 }
                 state.pending_events.push_back(PendingDrmEvent {
                     type_: DRM_EVENT_FLIP_COMPLETE,
                     user_data,
+                    target_sequence,
                 });
                 false
             }
         };
         self.bump();
+        refresh_next_vblank_deadline();
         if notify_now {
             self.waiters.notify(PollEvents::READ);
         }
@@ -1030,22 +1540,16 @@ impl DrmDevice {
         if state.event_queue.is_empty() {
             return Err(FsError::WouldBlock);
         }
-        let event_len = Self::front_event_len(&state.event_queue).unwrap_or(0);
-        if event_len == 0 || buffer.len() < event_len {
+        if buffer.len() < DRM_EVENT_BYTES {
             return Err(FsError::InvalidInput);
         }
         let mut written = 0usize;
-        while written + event_len <= buffer.len() && state.event_queue.len() >= event_len {
-            for byte in &mut buffer[written..written + event_len] {
-                *byte = state
-                    .event_queue
-                    .pop_front()
-                    .expect("event queue length checked");
-            }
-            written += event_len;
-            if state.event_queue.len() < 8 {
+        while written + DRM_EVENT_BYTES <= buffer.len() {
+            let Some(event) = state.event_queue.pop_front() else {
                 break;
-            }
+            };
+            buffer[written..written + DRM_EVENT_BYTES].copy_from_slice(&event);
+            written += DRM_EVENT_BYTES;
         }
         Ok(written)
     }
@@ -1060,36 +1564,62 @@ impl DrmDevice {
             if state.vblank_period_ns == 0 {
                 return;
             }
-            if now_ns < state.next_vblank_ns {
+
+            let previous_sequence = state.vblank_sequence;
+            Self::advance_vblank_state_locked(&mut state, now_ns);
+            if state.vblank_sequence == previous_sequence {
+                return;
+            }
+            if state.pending_events.is_empty() {
                 return;
             }
 
-            let periods = now_ns.saturating_sub(state.next_vblank_ns) / state.vblank_period_ns + 1;
-            state.vblank_sequence = state.vblank_sequence.saturating_add(periods);
-            state.next_vblank_ns = state
-                .next_vblank_ns
-                .saturating_add(periods.saturating_mul(state.vblank_period_ns));
-
-            let sequence = state.vblank_sequence as u32;
             let mut queued = false;
+            let current_sequence = state.vblank_sequence;
+            let mut deferred = VecDeque::new();
             while let Some(event) = state.pending_events.pop_front() {
-                self.queue_ready_event_locked(
-                    &mut state,
-                    event.type_,
-                    event.user_data,
-                    now_ns,
-                    sequence,
-                );
-                queued = true;
+                if event.target_sequence <= current_sequence {
+                    self.queue_ready_event_locked(
+                        &mut state,
+                        event.type_,
+                        event.user_data,
+                        now_ns,
+                        current_sequence as u32,
+                    );
+                    queued = true;
+                } else {
+                    deferred.push_back(event);
+                }
             }
+            state.pending_events = deferred;
 
             queued
         };
 
+        refresh_next_vblank_deadline();
         if notify {
             self.bump();
             self.waiters.notify(PollEvents::READ);
         }
+    }
+
+    fn advance_vblank_state_locked(state: &mut DrmState, now_ns: u64) {
+        if state.vblank_period_ns == 0 {
+            return;
+        }
+        if state.next_vblank_ns == 0 {
+            state.next_vblank_ns = now_ns.saturating_add(state.vblank_period_ns);
+            return;
+        }
+        if now_ns < state.next_vblank_ns {
+            return;
+        }
+
+        let periods = now_ns.saturating_sub(state.next_vblank_ns) / state.vblank_period_ns + 1;
+        state.vblank_sequence = state.vblank_sequence.saturating_add(periods);
+        state.next_vblank_ns = state
+            .next_vblank_ns
+            .saturating_add(periods.saturating_mul(state.vblank_period_ns));
     }
 
     fn mmap_dumb(&self, offset: u64, length: u64) -> FsResult<MmapResponse> {
@@ -1204,12 +1734,45 @@ pub fn probe(registry: &mut DeviceRegistry) {
 }
 
 pub fn handle_vblank_tick() {
-    let now_ns = timer::nanos_since_boot();
-    DRM_DEVICES
+    let now_ns = time::monotonic_nanos();
+    let devices: Vec<_> = DRM_DEVICES
         .lock()
         .iter()
         .filter_map(Weak::upgrade)
-        .for_each(|device| device.handle_vblank_tick(now_ns));
+        .collect();
+    for device in devices {
+        device.handle_vblank_tick(now_ns);
+    }
+}
+
+pub fn vblank_deadline_due() -> bool {
+    let deadline = NEXT_VBLANK_DEADLINE_NS.load(Ordering::Acquire);
+    deadline != u64::MAX && time::monotonic_nanos() >= deadline
+}
+
+pub fn next_vblank_wakeup_deadline() -> Option<u64> {
+    let deadline = NEXT_VBLANK_DEADLINE_NS.load(Ordering::Acquire);
+    (deadline != u64::MAX).then_some(deadline)
+}
+
+fn refresh_next_vblank_deadline() {
+    let mut next_deadline = u64::MAX;
+    let mut devices = DRM_DEVICES.lock();
+    devices.retain(|weak| {
+        let Some(device) = weak.upgrade() else {
+            return false;
+        };
+        let deadline = {
+            let state = device.state.lock();
+            (state.vblank_period_ns != 0 && !state.pending_events.is_empty())
+                .then_some(state.next_vblank_ns)
+        };
+        if let Some(deadline) = deadline {
+            next_deadline = next_deadline.min(deadline);
+        }
+        true
+    });
+    NEXT_VBLANK_DEADLINE_NS.store(next_deadline, Ordering::Release);
 }
 
 pub(crate) fn decode_argb(pixel_format: u32, pixel: u32) -> Option<(u8, u8, u8)> {

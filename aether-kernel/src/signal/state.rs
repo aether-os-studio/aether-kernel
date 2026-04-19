@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use aether_frame::libs::spin::SpinLock;
 use aether_vfs::{PollEvents, SharedWaitListener, WaitQueue};
@@ -23,6 +24,7 @@ struct SignalStateInner {
 pub struct SignalState {
     inner: Arc<SpinLock<SignalStateInner>>,
     waiters: Arc<WaitQueue>,
+    version: Arc<AtomicU64>,
 }
 
 impl SignalState {
@@ -51,7 +53,16 @@ impl SignalState {
         Self {
             inner: Arc::new(SpinLock::new(inner)),
             waiters: Arc::new(WaitQueue::new()),
+            version: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    fn bump(&self) {
+        let _ = self.version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
     }
 
     pub fn blocked(&self) -> SigSet {
@@ -130,6 +141,7 @@ impl SignalState {
 
         inner.pending[index] = Some(info);
         drop(inner);
+        self.bump();
         self.waiters.notify(PollEvents::READ);
     }
 
@@ -211,6 +223,8 @@ impl SignalState {
                 let bit = sigbit(info.signal);
                 if bit != 0 && (masked & bit) != 0 {
                     inner.pending[signal] = None;
+                    drop(inner);
+                    self.bump();
                     return Some(info);
                 }
             }

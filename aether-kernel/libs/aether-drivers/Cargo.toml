@@ -12,3 +12,4 @@ aether-frame = { path = "../../../aether-frame" }
 aether-framebuffer = { path = "../aether-framebuffer" }
 aether-vfs = { path = "../aether-vfs" }
 log = "0.4.29"
+nvme-rs = { package = "nvme", git = "https://github.com/plos-clan/nvme-rs", rev = "28b859a6a1372ff8552435380c509c89efc422c6" }

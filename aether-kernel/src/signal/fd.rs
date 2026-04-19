@@ -79,6 +79,10 @@ impl FileOperations for SignalFdFile {
         Ok(ready)
     }
 
+    fn wait_token(&self) -> u64 {
+        self.state.version()
+    }
+
     fn register_waiter(
         &self,
         events: PollEvents,

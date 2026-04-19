@@ -5,8 +5,8 @@ use alloc::sync::{Arc, Weak};
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use aether_frame::interrupt::timer;
 use aether_frame::libs::spin::SpinLock;
+use aether_frame::time;
 use aether_vfs::{FileOperations, FsError, FsResult, PollEvents, SharedWaitListener, WaitQueue};
 
 use crate::errno::{SysErr, SysResult};
@@ -46,12 +46,12 @@ impl TimerFdClock {
     fn current_time_ns(self) -> u64 {
         match self {
             Self::Realtime | Self::RealtimeAlarm => {
-                let (secs, nanos) = timer::unix_time_nanos();
+                let (secs, nanos) = time::realtime_nanos();
                 (secs as u64)
                     .saturating_mul(1_000_000_000)
-                    .saturating_add(nanos)
+                    .saturating_add(nanos as u64)
             }
-            Self::Monotonic | Self::Boottime | Self::BoottimeAlarm => timer::nanos_since_boot(),
+            Self::Monotonic | Self::Boottime | Self::BoottimeAlarm => time::monotonic_nanos(),
         }
     }
 }
@@ -420,16 +420,16 @@ impl FileOperations for TimerFdFile {
 }
 
 pub fn deadline_due() -> bool {
-    let now_monotonic = timer::nanos_since_boot();
+    let now_monotonic = time::monotonic_nanos();
     let monotonic_due = NEXT_MONOTONIC_DEADLINE_NS.load(Ordering::Acquire) <= now_monotonic;
     if monotonic_due {
         return true;
     }
 
-    let (secs, nanos) = timer::unix_time_nanos();
+    let (secs, nanos) = time::realtime_nanos();
     let now_realtime = (secs as u64)
         .saturating_mul(1_000_000_000)
-        .saturating_add(nanos);
+        .saturating_add(nanos as u64);
     NEXT_REALTIME_DEADLINE_NS.load(Ordering::Acquire) <= now_realtime
 }
 
@@ -441,11 +441,11 @@ pub fn next_wakeup_deadline() -> Option<u64> {
     let realtime_deadline = if realtime == u64::MAX {
         None
     } else {
-        let now_monotonic = timer::nanos_since_boot();
-        let (secs, nanos) = timer::unix_time_nanos();
+        let now_monotonic = time::monotonic_nanos();
+        let (secs, nanos) = time::realtime_nanos();
         let now_realtime = (secs as u64)
             .saturating_mul(1_000_000_000)
-            .saturating_add(nanos);
+            .saturating_add(nanos as u64);
         Some(if realtime <= now_realtime {
             now_monotonic
         } else {
@@ -461,13 +461,13 @@ pub fn next_wakeup_deadline() -> Option<u64> {
 }
 
 pub fn wake_expired_timers() {
-    wake_expired_class(DeadlineClass::Monotonic, timer::nanos_since_boot());
-    let (secs, nanos) = timer::unix_time_nanos();
+    wake_expired_class(DeadlineClass::Monotonic, time::monotonic_nanos());
+    let (secs, nanos) = time::realtime_nanos();
     wake_expired_class(
         DeadlineClass::Realtime,
         (secs as u64)
             .saturating_mul(1_000_000_000)
-            .saturating_add(nanos),
+            .saturating_add(nanos as u64),
     );
 }
 

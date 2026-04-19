@@ -1,4 +1,4 @@
-use aether_frame::interrupt::timer;
+use aether_frame::time;
 
 use crate::arch::syscall::nr;
 use crate::errno::SysResult;
@@ -21,9 +21,9 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
 
         if tv != 0 {
-            let (secs, nanos) = timer::unix_time_nanos();
+            let (secs, nanos) = time::realtime_nanos();
             let tv_sec_bytes = secs.to_ne_bytes();
-            let tv_usec_bytes = (nanos / 1000).to_ne_bytes();
+            let tv_usec_bytes = ((nanos as u64) / 1000).to_ne_bytes();
             let mut tv_bytes = [0u8; 16];
             tv_bytes[..8].copy_from_slice(&tv_sec_bytes);
             tv_bytes[8..].copy_from_slice(&tv_usec_bytes);

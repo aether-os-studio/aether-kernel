@@ -1,4 +1,4 @@
-use aether_frame::interrupt::timer;
+use aether_frame::time;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
@@ -18,11 +18,11 @@ crate::declare_syscall!(
 
 impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
     fn read_clock_timespec(&self, clock_id: u64) -> SysResult<(i64, i64)> {
-        let monotonic_nanos = timer::nanos_since_boot();
+        let monotonic_nanos = time::monotonic_nanos();
         let monotonic_secs = (monotonic_nanos / 1_000_000_000) as i64;
         let monotonic_subsec = (monotonic_nanos % 1_000_000_000) as i64;
 
-        let (realtime_secs, realtime_subsec) = timer::unix_time_nanos();
+        let (realtime_secs, realtime_subsec) = time::realtime_nanos();
 
         match clock_id {
             CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM => {

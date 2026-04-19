@@ -341,17 +341,20 @@ impl EpollInstance {
         }
 
         let should_emit = if interest.event.events.contains(EpollEvents::ET) {
-            let newly_ready = ready_events.bits()
-                & !interest
-                    .last_ready
-                    .intersection_bits(!Self::ALWAYS_EVENT_BITS)
-                    .bits();
+            let previous_ready = interest
+                .last_ready
+                .intersection_bits(!Self::ALWAYS_EVENT_BITS)
+                .bits();
+            let current_ready = ready_events
+                .intersection_bits(!Self::ALWAYS_EVENT_BITS)
+                .bits();
             let always_ready = ready_events
                 .intersection_bits(Self::ALWAYS_EVENT_BITS)
                 .bits();
-            newly_ready != 0 || always_ready != 0 || token != interest.last_token
+            let raised = current_ready & !previous_ready;
+            raised != 0 || always_ready != 0 || token != interest.last_token
         } else {
-            true
+            ready_events.bits() != 0
         };
 
         interest.last_ready = ready_events;

@@ -16,6 +16,7 @@ pub mod mm;
 pub mod preempt;
 pub mod process;
 pub mod startup;
+pub mod time;
 
 #[inline(never)]
 pub const fn retain() {}

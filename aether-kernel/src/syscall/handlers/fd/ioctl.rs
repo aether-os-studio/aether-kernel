@@ -8,6 +8,7 @@ use aether_drivers::{DrmFile, EvdevFile, drm::DrmModeInfo};
 use aether_terminal::{ConsoleCore, LinuxTermios, LinuxTermios2, LinuxVtMode, LinuxWinSize};
 use aether_vfs::{FsError, IoctlResponse};
 
+const DRM_USER_BLOB_MAX_SIZE: usize = 64 * 1024;
 const TCGETS: u64 = 0x5401;
 const TCSETS: u64 = 0x5402;
 const TCSETSW: u64 = 0x5403;
@@ -406,6 +407,22 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 // Match naos's permissive legacy connector property path:
                 // accept the ioctl even when DPMS is not wired into backend state.
             }
+            drm_abi::DRM_IOCTL_MODE_GETPROPBLOB => {
+                let mut request =
+                    drm_abi::DrmModeGetBlob::from_bytes(&bytes).ok_or(SysErr::Fault)?;
+                let blob = device
+                    .get_property_blob(request.blob_id)
+                    .ok_or(SysErr::NoEnt)?;
+                DrmUserWriter::new(self).write_bytes(
+                    request.data,
+                    request.length as usize,
+                    blob.as_slice(),
+                )?;
+                request.length = blob.len() as u32;
+                if !request.write_to_bytes(&mut bytes) {
+                    return Err(SysErr::Fault);
+                }
+            }
             drm_abi::DRM_IOCTL_MODE_GETPLANERESOURCES => {
                 let mut request =
                     drm_abi::DrmModeGetPlaneRes::from_bytes(&bytes).ok_or(SysErr::Fault)?;
@@ -464,6 +481,32 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 let _request =
                     drm_abi::DrmModeObjSetProperty::from_bytes(&bytes).ok_or(SysErr::Fault)?;
                 // Keep legacy/compat property sets permissive like naos.
+            }
+            drm_abi::DRM_IOCTL_MODE_ATOMIC => {
+                let request = drm_abi::DrmModeAtomic::from_bytes(&bytes).ok_or(SysErr::Fault)?;
+                if request.reserved != 0 {
+                    return Err(SysErr::Inval);
+                }
+                let obj_ids =
+                    self.read_drm_u32_array(request.objs_ptr, request.count_objs as usize)?;
+                let obj_prop_counts =
+                    self.read_drm_u32_array(request.count_props_ptr, request.count_objs as usize)?;
+                let prop_count = obj_prop_counts
+                    .iter()
+                    .try_fold(0usize, |sum, count| sum.checked_add(*count as usize))
+                    .ok_or(SysErr::Inval)?;
+                let prop_ids = self.read_drm_u32_array(request.props_ptr, prop_count)?;
+                let prop_values = self.read_drm_u64_array(request.prop_values_ptr, prop_count)?;
+                device
+                    .atomic_commit(
+                        request.flags,
+                        obj_ids.as_slice(),
+                        obj_prop_counts.as_slice(),
+                        prop_ids.as_slice(),
+                        prop_values.as_slice(),
+                        request.user_data,
+                    )
+                    .map_err(SysErr::from)?;
             }
             drm_abi::DRM_IOCTL_MODE_GETFB => {
                 let mut request = drm_abi::DrmModeFbCmd::from_bytes(&bytes).ok_or(SysErr::Fault)?;
@@ -531,6 +574,31 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                     return Err(SysErr::Fault);
                 }
             }
+            drm_abi::DRM_IOCTL_MODE_CREATEPROPBLOB => {
+                let mut request =
+                    drm_abi::DrmModeCreateBlob::from_bytes(&bytes).ok_or(SysErr::Fault)?;
+                let length = request.length as usize;
+                if request.data == 0 || length == 0 || length > DRM_USER_BLOB_MAX_SIZE {
+                    return Err(SysErr::Inval);
+                }
+                let blob = self.syscall_read_user_exact_buffer(request.data, length)?;
+                request.blob_id = device
+                    .create_property_blob(blob.as_slice())
+                    .map_err(SysErr::from)?;
+                if !request.write_to_bytes(&mut bytes) {
+                    return Err(SysErr::Fault);
+                }
+            }
+            drm_abi::DRM_IOCTL_MODE_DESTROYPROPBLOB => {
+                let request =
+                    drm_abi::DrmModeDestroyBlob::from_bytes(&bytes).ok_or(SysErr::Fault)?;
+                if request.blob_id == 0 {
+                    return Err(SysErr::Inval);
+                }
+                device
+                    .destroy_property_blob(request.blob_id)
+                    .map_err(SysErr::from)?;
+            }
             drm_abi::DRM_IOCTL_MODE_CLOSEFB => {
                 let request = drm_abi::DrmModeCloseFb::from_bytes(&bytes).ok_or(SysErr::Fault)?;
                 if request.pad != 0 {
@@ -572,6 +640,13 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                     device.set_crtc(request.fb_id).map_err(SysErr::from)?;
                 }
             }
+            drm_abi::DRM_IOCTL_WAIT_VBLANK => {
+                let request = drm_abi::DrmWaitVBlank::from_bytes(&bytes).ok_or(SysErr::Fault)?;
+                let reply = device.wait_vblank(request).map_err(SysErr::from)?;
+                if !reply.write_to_bytes(&mut bytes) {
+                    return Err(SysErr::Fault);
+                }
+            }
             drm_abi::DRM_IOCTL_MODE_PAGE_FLIP => {
                 let request =
                     drm_abi::DrmModeCrtcPageFlip::from_bytes(&bytes).ok_or(SysErr::Fault)?;
@@ -607,6 +682,38 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             self.write_user_buffer(argument, &bytes)?;
         }
         Ok(0)
+    }
+
+    fn read_drm_u32_array(
+        &mut self,
+        address: u64,
+        count: usize,
+    ) -> SysResult<alloc::vec::Vec<u32>> {
+        if count == 0 {
+            return Ok(alloc::vec::Vec::new());
+        }
+        if address == 0 {
+            return Err(SysErr::Fault);
+        }
+        decode_u32_array(
+            &self.syscall_read_user_exact_buffer(address, count * core::mem::size_of::<u32>())?,
+        )
+    }
+
+    fn read_drm_u64_array(
+        &mut self,
+        address: u64,
+        count: usize,
+    ) -> SysResult<alloc::vec::Vec<u64>> {
+        if count == 0 {
+            return Ok(alloc::vec::Vec::new());
+        }
+        if address == 0 {
+            return Err(SysErr::Fault);
+        }
+        decode_u64_array(
+            &self.syscall_read_user_exact_buffer(address, count * core::mem::size_of::<u64>())?,
+        )
     }
 }
 
@@ -668,4 +775,32 @@ impl<'ctx, 'proc, S: ProcessServices> DrmUserWriter<'ctx, 'proc, S> {
         let bytes = drm_abi::encode_property_enums(&values[..values.len().min(capacity)]);
         self.ctx.write_user_buffer(address, &bytes)
     }
+}
+
+fn decode_u32_array(bytes: &[u8]) -> SysResult<alloc::vec::Vec<u32>> {
+    if bytes.len() % core::mem::size_of::<u32>() != 0 {
+        return Err(SysErr::Fault);
+    }
+    bytes
+        .chunks_exact(core::mem::size_of::<u32>())
+        .map(|chunk| {
+            Ok(u32::from_ne_bytes(
+                chunk.try_into().map_err(|_| SysErr::Fault)?,
+            ))
+        })
+        .collect()
+}
+
+fn decode_u64_array(bytes: &[u8]) -> SysResult<alloc::vec::Vec<u64>> {
+    if bytes.len() % core::mem::size_of::<u64>() != 0 {
+        return Err(SysErr::Fault);
+    }
+    bytes
+        .chunks_exact(core::mem::size_of::<u64>())
+        .map(|chunk| {
+            Ok(u64::from_ne_bytes(
+                chunk.try_into().map_err(|_| SysErr::Fault)?,
+            ))
+        })
+        .collect()
 }

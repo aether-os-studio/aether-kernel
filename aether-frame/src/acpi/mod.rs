@@ -282,11 +282,11 @@ impl acpi::Handler for AetherAcpiHandler {
     }
 
     fn nanos_since_boot(&self) -> u64 {
-        crate::arch::timer::hpet::nanos_since_boot().unwrap_or(0)
+        crate::time::monotonic_nanos()
     }
 
     fn stall(&self, microseconds: u64) {
-        if crate::arch::timer::hpet::stall_nanos(microseconds.saturating_mul(1_000)).is_ok() {
+        if crate::time::spin_delay_nanos(microseconds.saturating_mul(1_000)).is_ok() {
             return;
         }
 
