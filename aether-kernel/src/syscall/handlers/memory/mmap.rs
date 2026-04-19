@@ -1,6 +1,7 @@
 use aether_frame::mm::MapFlags;
 use aether_frame::mm::PAGE_SIZE;
 use aether_vfs::{MmapCachePolicy, MmapKind, MmapRequest};
+use alloc::sync::Arc;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
@@ -69,17 +70,17 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let size = node.size();
         let start = core::cmp::min(offset as usize, size);
         let end = core::cmp::min(start.saturating_add(len as usize), size);
-        let source = NodeImageSource::new(node).ok_or(SysErr::Inval)?;
+        let source = Arc::new(NodeImageSource::new(node).ok_or(SysErr::Inval)?);
 
         process
             .task
             .address_space
-            .mmap_image(
+            .mmap_lazy_image(
                 address,
                 len,
                 flags,
                 page_flags,
-                &source,
+                source,
                 start as u64,
                 end.saturating_sub(start) as u64,
             )

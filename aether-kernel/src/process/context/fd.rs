@@ -418,8 +418,13 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let (_file_ref, socket) = self.socket_from_fd(fd)?;
         let bytes = self.read_user_buffer(buffer, len)?;
         let address = self.read_optional_socket_address(address, address_len)?;
+        let peer = address
+            .as_deref()
+            .map(|address| self.resolve_socket_address_target(address))
+            .transpose()?
+            .flatten();
         socket
-            .send_to(bytes.as_slice(), address.as_deref(), flags)
+            .send_to_socket(bytes.as_slice(), address.as_deref(), flags, peer)
             .map(|written| written as u64)
     }
 
@@ -494,8 +499,14 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
     pub(super) fn syscall_sendmsg(&mut self, fd: u64, message: u64, flags: u64) -> SysResult<u64> {
         let (_file_ref, socket) = self.socket_from_fd(fd)?;
         let message = self.read_socket_message(message)?;
+        let peer = message
+            .name
+            .as_deref()
+            .map(|address| self.resolve_socket_address_target(address))
+            .transpose()?
+            .flatten();
         socket
-            .send_msg(&message, flags)
+            .send_msg_to_socket(&message, flags, peer)
             .map(|written| written as u64)
     }
 
@@ -989,12 +1000,38 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
         let file_ref = descriptor.file.clone();
         let node = file_ref.lock().node();
+        let socket = self.socket_from_node(&node)?;
+        Ok((file_ref, socket))
+    }
+
+    pub(crate) fn socket_from_node(
+        &self,
+        node: &aether_vfs::NodeRef,
+    ) -> SysResult<Arc<dyn KernelSocket>> {
         let socket = node
             .file()
             .and_then(|file| file.as_any().downcast_ref::<SocketFile>())
             .map(SocketFile::socket)
             .ok_or(SysErr::NotSock)?;
-        Ok((file_ref, socket))
+        Ok(socket)
+    }
+
+    pub(crate) fn resolve_socket_address_target(
+        &mut self,
+        address: &[u8],
+    ) -> SysResult<Option<Arc<dyn KernelSocket>>> {
+        let Ok(Some(path)) = crate::net::unix_pathname_from_raw(address) else {
+            return Ok(None);
+        };
+        let (node, _) = self
+            .services
+            .lookup_node_with_identity(&self.process.fs, &path, true)?;
+        if node.kind() != aether_vfs::NodeKind::Socket {
+            return Err(SysErr::NotSock);
+        }
+        crate::net::unix_lookup_bound_socket(address)?
+            .ok_or(SysErr::ConnRefused)
+            .map(Some)
     }
 
     pub(crate) fn read_socket_address(

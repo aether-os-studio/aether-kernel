@@ -516,6 +516,27 @@ impl UserAddressSpace {
             .mmap_image(addr, len, flags, page_flags, image, image_offset, image_len)
     }
 
+    pub fn mmap_lazy_image(
+        &mut self,
+        addr: u64,
+        len: u64,
+        flags: u64,
+        page_flags: MapFlags,
+        image: Arc<dyn ProgramImageSource + Send + Sync>,
+        image_offset: u64,
+        image_len: u64,
+    ) -> Result<u64, BuildError> {
+        self.inner.lock().mmap_lazy_image(
+            addr,
+            len,
+            flags,
+            page_flags,
+            image,
+            image_offset,
+            image_len,
+        )
+    }
+
     pub fn mmap_physical(
         &mut self,
         addr: u64,
@@ -661,7 +682,7 @@ impl UserAddressSpaceInner {
         for index in 0..self.mappings.len() {
             let mapping_kind = self
                 .vma_for_address(self.mappings[index].virt.as_u64())
-                .map(|vma| vma.kind);
+                .map(|vma| vma.kind.clone());
             let mapping = &mut self.mappings[index];
             if matches!(mapping_kind, Some(UserVmaKind::Stack)) {
                 let frame = allocator.alloc(1)?;
@@ -876,6 +897,36 @@ impl UserAddressSpaceInner {
             page_flags,
             UserVmaKind::Anonymous,
             false,
+        );
+        Ok(base)
+    }
+
+    fn mmap_lazy_image(
+        &mut self,
+        addr: u64,
+        len: u64,
+        flags: u64,
+        page_flags: MapFlags,
+        image: Arc<dyn ProgramImageSource + Send + Sync>,
+        image_offset: u64,
+        image_len: u64,
+    ) -> Result<u64, BuildError> {
+        if len == 0 {
+            return Err(BuildError::AddressOverflow);
+        }
+
+        let aligned_len = align_up(len, PAGE_SIZE);
+        let base = self.prepare_mapping_base(addr, aligned_len, flags)?;
+        self.record_vma(
+            base,
+            base + aligned_len,
+            page_flags,
+            UserVmaKind::PagedImage {
+                source: image,
+                image_offset,
+                image_len,
+            },
+            true,
         );
         Ok(base)
     }
@@ -1145,7 +1196,7 @@ impl UserAddressSpaceInner {
                 source.read_exact_at(source_offset as usize, &mut page_buffer[..len])?;
                 self.write_mapped_page(page_base, dest_offset, &page_buffer[..len])?;
             }
-            self.record_vma(map_base, map_end, flags, kind, false);
+            self.record_vma(map_base, map_end, flags, kind.clone(), false);
         }
         Ok(())
     }
@@ -1197,7 +1248,30 @@ impl UserAddressSpaceInner {
         if write && !vma.flags.contains(MapFlags::WRITE) {
             return Ok(false);
         }
-        self.map_zeroed_page(page_base, vma.flags)?;
+        match &vma.kind {
+            UserVmaKind::Anonymous | UserVmaKind::Heap | UserVmaKind::Stack => {
+                self.map_zeroed_page(page_base, vma.flags)?;
+            }
+            UserVmaKind::PagedImage {
+                source,
+                image_offset,
+                image_len,
+            } => {
+                let page_offset = page_base.saturating_sub(vma.start);
+                if page_offset >= *image_len {
+                    self.map_zeroed_page(page_base, vma.flags)?;
+                } else {
+                    let copy_len = core::cmp::min(PAGE_SIZE, image_len.saturating_sub(page_offset));
+                    let source_offset = image_offset
+                        .checked_add(page_offset)
+                        .ok_or(BuildError::AddressOverflow)?;
+                    let mut page_buffer = vec![0u8; copy_len as usize];
+                    source.read_exact_at(source_offset as usize, &mut page_buffer)?;
+                    self.map_page(page_base, vma.flags, 0, &page_buffer)?;
+                }
+            }
+            _ => return Ok(false),
+        }
         Ok(true)
     }
 
@@ -1521,7 +1595,9 @@ impl UserAddressSpaceInner {
             if let Some(previous) = merged.last_mut()
                 && previous.end == vma.start
                 && previous.flags == vma.flags
-                && core::mem::discriminant(&previous.kind) == core::mem::discriminant(&vma.kind)
+                && previous
+                    .kind
+                    .can_merge_with(&vma.kind, previous.end.saturating_sub(previous.start))
                 && previous.lazy == vma.lazy
             {
                 previous.end = vma.end;
@@ -1573,26 +1649,15 @@ impl UserAddressSpaceInner {
             }
 
             if start > vma.start {
-                updated.push(UserVma {
-                    start: vma.start,
-                    end: start,
-                    ..vma.clone()
-                });
+                updated.push(vma.slice(vma.start, start));
             }
 
-            updated.push(UserVma {
-                start: vma.start.max(start),
-                end: vma.end.min(end),
-                flags,
-                ..vma.clone()
-            });
+            let mut middle = vma.slice(vma.start.max(start), vma.end.min(end));
+            middle.flags = flags;
+            updated.push(middle);
 
             if end < vma.end {
-                updated.push(UserVma {
-                    start: end,
-                    end: vma.end,
-                    ..vma
-                });
+                updated.push(vma.slice(end, vma.end));
             }
         }
         self.vmas = updated;
@@ -1607,18 +1672,10 @@ impl UserAddressSpaceInner {
                 continue;
             }
             if start > vma.start {
-                updated.push(UserVma {
-                    start: vma.start,
-                    end: start,
-                    ..vma.clone()
-                });
+                updated.push(vma.slice(vma.start, start));
             }
             if end < vma.end {
-                updated.push(UserVma {
-                    start: end,
-                    end: vma.end,
-                    ..vma
-                });
+                updated.push(vma.slice(end, vma.end));
             }
         }
         self.vmas = updated;
@@ -1691,13 +1748,18 @@ struct UserMapping {
     shared: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum UserVmaKind {
     Program,
     Interpreter,
     Heap,
     Stack,
     Anonymous,
+    PagedImage {
+        source: Arc<dyn ProgramImageSource + Send + Sync>,
+        image_offset: u64,
+        image_len: u64,
+    },
     Shared,
     Device,
 }
@@ -1709,6 +1771,52 @@ struct UserVma {
     flags: MapFlags,
     kind: UserVmaKind,
     lazy: bool,
+}
+
+impl UserVmaKind {
+    fn adjusted(&self, delta: u64) -> Self {
+        match self {
+            Self::PagedImage {
+                source,
+                image_offset,
+                image_len,
+            } => Self::PagedImage {
+                source: source.clone(),
+                image_offset: image_offset.saturating_add(delta),
+                image_len: image_len.saturating_sub(delta),
+            },
+            other => other.clone(),
+        }
+    }
+
+    fn can_merge_with(&self, other: &Self, span: u64) -> bool {
+        match (self, other) {
+            (Self::Program, Self::Program)
+            | (Self::Interpreter, Self::Interpreter)
+            | (Self::Heap, Self::Heap)
+            | (Self::Stack, Self::Stack)
+            | (Self::Anonymous, Self::Anonymous)
+            | (Self::Shared, Self::Shared)
+            | (Self::Device, Self::Device) => true,
+            (Self::PagedImage { .. }, Self::PagedImage { .. }) => {
+                let _ = span;
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
+impl UserVma {
+    fn slice(&self, start: u64, end: u64) -> Self {
+        Self {
+            start,
+            end,
+            flags: self.flags,
+            kind: self.kind.adjusted(start.saturating_sub(self.start)),
+            lazy: self.lazy,
+        }
+    }
 }
 
 fn initialize_linux_stack(

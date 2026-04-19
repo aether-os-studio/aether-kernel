@@ -175,6 +175,11 @@ pub trait KernelSocket: Any + Send + Sync {
         Err(SysErr::NoSys)
     }
 
+    fn connect_socket(&self, address: &[u8], peer: Option<Arc<dyn KernelSocket>>) -> SysResult<()> {
+        let _ = peer;
+        self.connect(address)
+    }
+
     fn bind(&self, _address: &[u8]) -> SysResult<()> {
         Err(SysErr::NoSys)
     }
@@ -191,8 +196,29 @@ pub trait KernelSocket: Any + Send + Sync {
         Err(SysErr::NoSys)
     }
 
+    fn send_to_socket(
+        &self,
+        buffer: &[u8],
+        address: Option<&[u8]>,
+        flags: u64,
+        peer: Option<Arc<dyn KernelSocket>>,
+    ) -> SysResult<usize> {
+        let _ = peer;
+        self.send_to(buffer, address, flags)
+    }
+
     fn send_msg(&self, message: &SocketMessage, flags: u64) -> SysResult<usize> {
         self.send_to(message.data.as_slice(), message.name.as_deref(), flags)
+    }
+
+    fn send_msg_to_socket(
+        &self,
+        message: &SocketMessage,
+        flags: u64,
+        peer: Option<Arc<dyn KernelSocket>>,
+    ) -> SysResult<usize> {
+        let _ = peer;
+        self.send_msg(message, flags)
     }
 
     fn setsockopt(&self, _level: i32, _optname: i32, _value: &[u8]) -> SysResult<()> {
@@ -381,7 +407,9 @@ pub fn init() {
 pub use self::netlink::{
     current_kobject_uevent_seqnum, publish_kobject_uevent, reserve_kobject_uevent_seqnum,
 };
-pub use self::unix::pathname_from_raw as unix_pathname_from_raw;
+pub use self::unix::{
+    lookup_bound_socket as unix_lookup_bound_socket, pathname_from_raw as unix_pathname_from_raw,
+};
 
 pub fn create_socket(
     domain: i32,

@@ -18,7 +18,8 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
     ) -> SysResult<u64> {
         let (_file_ref, socket) = self.socket_from_fd(fd)?;
         let address = self.read_socket_address(address, address_len)?;
-        socket.connect(address.as_slice())?;
+        let peer = self.resolve_socket_address_target(address.as_slice())?;
+        socket.connect_socket(address.as_slice(), peer)?;
         Ok(0)
     }
 

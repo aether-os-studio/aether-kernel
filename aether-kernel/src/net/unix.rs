@@ -226,6 +226,11 @@ pub fn pathname_from_raw(address: &[u8]) -> SysResult<Option<String>> {
         .map_err(|_| SysErr::Inval)
 }
 
+pub fn lookup_bound_socket(address: &[u8]) -> SysResult<Option<Arc<dyn KernelSocket>>> {
+    let address = UnixAddress::from_raw(address)?;
+    Ok(UnixSocket::lookup_bound(&address).map(|socket| socket as Arc<dyn KernelSocket>))
+}
+
 impl UnixSocket {
     fn shared(kind: u32, owner: SocketCredentials) -> Arc<Self> {
         let socket = Arc::new(Self {
@@ -267,6 +272,10 @@ impl UnixSocket {
         self.kind == SOCK_DGRAM || self.kind == SOCK_SEQPACKET
     }
 
+    fn is_connection_oriented(&self) -> bool {
+        self.kind == SOCK_STREAM || self.kind == SOCK_SEQPACKET
+    }
+
     fn unnamed_address() -> Vec<u8> {
         (AF_UNIX as u16).to_ne_bytes().to_vec()
     }
@@ -294,6 +303,36 @@ impl UnixSocket {
 
     fn shared_self(&self) -> Option<Arc<UnixSocket>> {
         self.self_ref.lock().upgrade()
+    }
+
+    fn peer_from_socket(socket: Arc<dyn KernelSocket>) -> SysResult<Arc<UnixSocket>> {
+        socket
+            .as_any()
+            .downcast_ref::<UnixSocket>()
+            .and_then(UnixSocket::shared_self)
+            .ok_or(SysErr::NotSock)
+    }
+
+    fn ensure_compatible_peer(&self, peer: &Arc<UnixSocket>) -> SysResult<()> {
+        if peer.kind != self.kind {
+            return Err(SysErr::ProtoType);
+        }
+        Ok(())
+    }
+
+    fn lookup_target(
+        &self,
+        address: &[u8],
+        peer: Option<Arc<dyn KernelSocket>>,
+    ) -> SysResult<Arc<UnixSocket>> {
+        let peer = if let Some(peer) = peer {
+            Self::peer_from_socket(peer)?
+        } else {
+            let address = UnixAddress::from_raw(address)?;
+            Self::lookup_bound(&address).ok_or(SysErr::NoEnt)?
+        };
+        self.ensure_compatible_peer(&peer)?;
+        Ok(peer)
     }
 
     fn local_name_locked(state: &UnixSocketState) -> Vec<u8> {
@@ -430,9 +469,9 @@ impl UnixSocket {
             return false;
         }
         if snapshot.listening {
-            return snapshot.backlog_limit != 0 && snapshot.backlog_len < snapshot.backlog_limit;
+            return false;
         }
-        if self.is_packet_like() {
+        if self.kind == SOCK_DGRAM && snapshot.peer.is_none() {
             return true;
         }
         if let Some(listener) = Self::pending_connect_target_from_snapshot(snapshot) {
@@ -442,7 +481,7 @@ impl UnixSocket {
                     && listener_state.backlog.len() < listener_state.backlog_limit);
         }
         let Some(peer) = Self::peer_from_snapshot(snapshot) else {
-            return false;
+            return self.kind == SOCK_DGRAM;
         };
         let peer_state = peer.state.lock();
         !peer_state.shut_rd && peer_state.recv_size < peer_state.rcvbuf
@@ -576,9 +615,13 @@ impl UnixSocket {
 
         let mut written = 0usize;
         let mut received_ancillary = None;
+        let mut hit_barrier = false;
 
         if peek {
             for chunk in state.recv_stream.iter() {
+                if written != 0 && (chunk.ancillary.is_some() || hit_barrier) {
+                    break;
+                }
                 if written >= buffer.len() {
                     break;
                 }
@@ -586,18 +629,17 @@ impl UnixSocket {
                 if available.is_empty() {
                     continue;
                 }
-                if include_control && received_ancillary.is_none() {
+                let chunk_had_ancillary = written == 0 && chunk.ancillary.is_some();
+                if include_control && written == 0 && received_ancillary.is_none() {
                     received_ancillary = chunk.ancillary.clone();
-                } else if include_control && let Some(ancillary) = chunk.ancillary.clone() {
-                    if let Some(collected) = received_ancillary.as_mut() {
-                        collected.append(ancillary);
-                    } else {
-                        received_ancillary = Some(ancillary);
-                    }
                 }
+                hit_barrier |= chunk_had_ancillary;
                 let count = min(buffer.len() - written, available.len());
                 buffer[written..written + count].copy_from_slice(&available[..count]);
                 written += count;
+                if hit_barrier {
+                    break;
+                }
             }
             return Ok(Self::receive_from_ancillary(
                 None,
@@ -609,8 +651,16 @@ impl UnixSocket {
 
         let was_full = state.recv_size == state.rcvbuf;
         while written < buffer.len() {
+            if state
+                .recv_stream
+                .front()
+                .is_some_and(|chunk| written != 0 && (chunk.ancillary.is_some() || hit_barrier))
+            {
+                break;
+            }
             let remove_front;
             let mut consumed = 0usize;
+            let mut chunk_had_ancillary = false;
             {
                 let Some(chunk) = state.recv_stream.front_mut() else {
                     break;
@@ -619,15 +669,11 @@ impl UnixSocket {
                 if available == 0 {
                     remove_front = true;
                 } else {
-                    if include_control {
-                        if let Some(ancillary) = chunk.ancillary.take() {
-                            if let Some(collected) = received_ancillary.as_mut() {
-                                collected.append(ancillary);
-                            } else {
-                                received_ancillary = Some(ancillary);
-                            }
-                        }
-                    } else {
+                    if written == 0 && include_control && received_ancillary.is_none() {
+                        chunk_had_ancillary = chunk.ancillary.is_some();
+                        received_ancillary = chunk.ancillary.take();
+                    } else if written == 0 && !include_control {
+                        chunk_had_ancillary = chunk.ancillary.is_some();
                         chunk.ancillary = None;
                     }
                     let count = min(buffer.len() - written, available);
@@ -640,8 +686,12 @@ impl UnixSocket {
                 }
             }
             state.recv_size = state.recv_size.saturating_sub(consumed);
+            hit_barrier |= chunk_had_ancillary;
             if remove_front {
                 let _ = state.recv_stream.pop_front();
+            }
+            if hit_barrier {
+                break;
             }
         }
 
@@ -798,12 +848,16 @@ impl KernelSocket for UnixSocket {
     }
 
     fn connect(&self, address: &[u8]) -> SysResult<()> {
+        self.connect_socket(address, None)
+    }
+
+    fn connect_socket(&self, address: &[u8], peer: Option<Arc<dyn KernelSocket>>) -> SysResult<()> {
         let address = UnixAddress::from_raw(address)?;
         let client = self.shared_self();
         if let Some(client) = &client {
             Self::clear_pending_connect(client);
         }
-        let target = Self::lookup_bound(&address).ok_or(SysErr::NoEnt)?;
+        let target = self.lookup_target(&address.serialize(), peer)?;
 
         if self.kind == SOCK_DGRAM {
             let mut state = self.state.lock();
@@ -878,9 +932,8 @@ impl KernelSocket for UnixSocket {
         {
             return Err(SysErr::AddrInUse);
         }
-        // TODO: Pathname AF_UNIX sockets should also create a filesystem socket inode and
-        // participate in VFS lifetime rules. The current implementation keeps a kernel-only
-        // bind table so connect()/sendto() can resolve the address correctly.
+        // Pathname AF_UNIX sockets are created in the VFS at bind() time; this table tracks the
+        // live bound socket object, while syscall-layer pathname resolution consults the VFS first.
         bound.insert(address.clone(), Arc::downgrade(&this));
         let mut state = self.state.lock();
         state.bound_address = Some(address);
@@ -898,7 +951,6 @@ impl KernelSocket for UnixSocket {
         } else {
             backlog.max(0) as usize
         };
-        state.backlog.clear();
         drop(state);
         self.notify(PollEvents::WRITE);
         Ok(())
@@ -923,12 +975,24 @@ impl KernelSocket for UnixSocket {
     }
 
     fn send_to(&self, buffer: &[u8], address: Option<&[u8]>, _flags: u64) -> SysResult<usize> {
+        self.send_to_socket(buffer, address, _flags, None)
+    }
+
+    fn send_to_socket(
+        &self,
+        buffer: &[u8],
+        address: Option<&[u8]>,
+        _flags: u64,
+        peer: Option<Arc<dyn KernelSocket>>,
+    ) -> SysResult<usize> {
         if buffer.is_empty() && self.is_stream_like() {
             return Ok(0);
         }
+        if self.is_connection_oriented() && address.is_some() {
+            return Err(SysErr::IsConn);
+        }
         let peer = if let Some(address) = address {
-            let address = UnixAddress::from_raw(address)?;
-            Self::lookup_bound(&address).ok_or(SysErr::NoEnt)?
+            self.lookup_target(address, peer)?
         } else {
             self.peer().ok_or(if self.kind == SOCK_DGRAM {
                 SysErr::DestAddrReq
@@ -951,9 +1015,20 @@ impl KernelSocket for UnixSocket {
     }
 
     fn send_msg(&self, message: &SocketMessage, _flags: u64) -> SysResult<usize> {
+        self.send_msg_to_socket(message, _flags, None)
+    }
+
+    fn send_msg_to_socket(
+        &self,
+        message: &SocketMessage,
+        _flags: u64,
+        peer: Option<Arc<dyn KernelSocket>>,
+    ) -> SysResult<usize> {
+        if self.is_connection_oriented() && message.name.is_some() {
+            return Err(SysErr::IsConn);
+        }
         let peer = if let Some(address) = message.name.as_deref() {
-            let address = UnixAddress::from_raw(address)?;
-            Self::lookup_bound(&address).ok_or(SysErr::NoEnt)?
+            self.lookup_target(address, peer)?
         } else {
             self.peer().ok_or(if self.kind == SOCK_DGRAM {
                 SysErr::DestAddrReq
@@ -964,7 +1039,7 @@ impl KernelSocket for UnixSocket {
 
         let passcred = peer.state.lock().passcred;
         let ancillary = Self::build_outbound_ancillary(message, passcred);
-        if ancillary.is_some() && message.data.is_empty() {
+        if ancillary.is_some() && message.data.is_empty() && self.is_stream_like() {
             return Err(SysErr::Inval);
         }
 
@@ -1053,8 +1128,8 @@ impl KernelSocket for UnixSocket {
         }
         if events.contains(PollEvents::WRITE)
             && self.write_ready_snapshot(&snapshot)
-            && (snapshot.listening
-                || self.is_packet_like()
+            && ((self.kind == SOCK_DGRAM && snapshot.peer.is_none())
+                || Self::pending_connect_target_from_snapshot(&snapshot).is_some()
                 || (!peer_closed && !peer_shut_rd && peer_has_space))
         {
             ready = ready | PollEvents::WRITE;
