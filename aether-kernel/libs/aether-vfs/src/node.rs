@@ -26,6 +26,7 @@ pub enum FsError {
     NotFile,
     AlreadyExists,
     Unsupported,
+    PermissionDenied,
     InvalidInput,
     RootNotMounted,
     WouldBlock,
@@ -572,6 +573,12 @@ pub struct SharedMemoryFile {
     allow_sealing: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemfdOptions {
+    pub allow_sealing: bool,
+    pub executable: bool,
+}
+
 impl MutableMemoryFile {
     pub fn new(bytes: &[u8]) -> Self {
         Self {
@@ -601,17 +608,35 @@ impl CowMemoryFile {
 
 impl SharedMemoryFile {
     pub fn new() -> Self {
-        Self::new_with_sealing(false)
+        Self::new_memfd(MemfdOptions {
+            allow_sealing: false,
+            executable: true,
+        })
     }
 
     pub fn new_with_sealing(allow_sealing: bool) -> Self {
+        Self::new_memfd(MemfdOptions {
+            allow_sealing,
+            executable: true,
+        })
+    }
+
+    pub fn new_memfd(options: MemfdOptions) -> Self {
+        let mut seals = if options.allow_sealing {
+            0
+        } else {
+            F_SEAL_SEAL
+        };
+        if !options.executable {
+            seals |= F_SEAL_EXEC;
+        }
         Self {
             state: SpinLock::new(SharedMemoryState {
                 size: 0,
                 pages: Vec::new(),
             }),
-            seals: AtomicU32::new(if allow_sealing { 0 } else { F_SEAL_SEAL }),
-            allow_sealing,
+            seals: AtomicU32::new(seals),
+            allow_sealing: options.allow_sealing,
         }
     }
 
@@ -620,6 +645,15 @@ impl SharedMemoryFile {
     }
 
     pub fn add_seals(&self, seals: u32) -> FsResult<()> {
+        let supported = F_SEAL_SEAL
+            | F_SEAL_SHRINK
+            | F_SEAL_GROW
+            | F_SEAL_WRITE
+            | F_SEAL_FUTURE_WRITE
+            | F_SEAL_EXEC;
+        if (seals & !supported) != 0 {
+            return Err(FsError::InvalidInput);
+        }
         if !self.allow_sealing {
             return Err(FsError::InvalidInput);
         }
@@ -736,6 +770,15 @@ impl SharedMemoryFile {
     fn ensure_write_allowed(&self) -> FsResult<()> {
         if (self.seals() & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) != 0 {
             return Err(FsError::InvalidInput);
+        }
+        Ok(())
+    }
+
+    fn ensure_exec_allowed(&self, prot: u64) -> FsResult<()> {
+        const PROT_EXEC: u64 = 0x4;
+
+        if (prot & PROT_EXEC) != 0 && (self.seals() & F_SEAL_EXEC) != 0 {
+            return Err(FsError::PermissionDenied);
         }
         Ok(())
     }
@@ -933,6 +976,7 @@ impl FileOperations for SharedMemoryFile {
         if !request.offset.is_multiple_of(PAGE_SIZE) {
             return Err(FsError::InvalidInput);
         }
+        self.ensure_exec_allowed(request.prot)?;
         let offset = usize::try_from(request.offset).map_err(|_| FsError::InvalidInput)?;
         let len = usize::try_from(request.length).map_err(|_| FsError::InvalidInput)?;
         if len == 0 {
@@ -978,6 +1022,7 @@ const F_SEAL_SHRINK: u32 = 0x0002;
 const F_SEAL_GROW: u32 = 0x0004;
 const F_SEAL_WRITE: u32 = 0x0008;
 const F_SEAL_FUTURE_WRITE: u32 = 0x0010;
+const F_SEAL_EXEC: u32 = 0x0020;
 
 fn frame_ptr(frame: PhysFrame) -> *mut u8 {
     phys_to_virt(frame.start_address().as_u64()) as *mut u8

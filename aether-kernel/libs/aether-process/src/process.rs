@@ -441,6 +441,10 @@ impl UserAddressSpace {
         self.inner.lock().layout
     }
 
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
     pub fn root(&self) -> PhysFrame {
         self.inner.lock().root
     }

@@ -26,6 +26,7 @@ pub const DRM_MODE_ENCODER_VIRTUAL: u32 = 5;
 pub const DRM_MODE_CONNECTOR_VIRTUAL: u32 = 15;
 pub const DRM_MODE_OBJECT_CRTC: u32 = 0xcccc_cccc;
 pub const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
+pub const DRM_MODE_OBJECT_ENCODER: u32 = 0xe0e0_e0e0;
 pub const DRM_MODE_OBJECT_FB: u32 = 0xfbfb_fbfb;
 pub const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
 pub const DRM_MODE_OBJECT_ANY: u32 = 0;
@@ -355,6 +356,14 @@ struct DrmState {
     next_handle: u32,
     next_fb_id: u32,
     current_fb_id: u32,
+    plane_crtc_id: u32,
+    connector_crtc_id: u32,
+    crtc_x: u32,
+    crtc_y: u32,
+    crtc_w: u32,
+    crtc_h: u32,
+    crtc_mode_valid: bool,
+    crtc_mode: DrmModeInfo,
     master_pid: Option<u32>,
     universal_planes: bool,
     dumb_buffers: BTreeMap<u32, Arc<DumbBuffer>>,
@@ -518,8 +527,9 @@ impl DrmDevice {
     pub fn get_property_blob(&self, blob_id: u32) -> Option<Vec<u8>> {
         if blob_id == self.crtc_mode_blob_id() {
             let mut bytes = [0u8; DrmModeInfo::SIZE];
-            self.backend
-                .mode()
+            self.state
+                .lock()
+                .crtc_mode
                 .write_to_bytes(&mut bytes)
                 .then_some(bytes.to_vec())
         } else if blob_id == self.connector_edid_blob_id() {
@@ -553,7 +563,7 @@ impl DrmDevice {
 
     fn mode_from_blob(&self, blob_id: u32) -> Result<DrmModeInfo, DrmIoctlError> {
         if blob_id == self.crtc_mode_blob_id() {
-            return Ok(self.backend.mode());
+            return Ok(self.state.lock().crtc_mode);
         }
         let bytes = self
             .get_property_blob(blob_id)
@@ -562,7 +572,8 @@ impl DrmDevice {
     }
 
     pub fn new(index: usize, backend: Arc<dyn DrmScanoutBackend>) -> Arc<Self> {
-        let refresh_hz = backend.mode().vrefresh.max(1) as u64;
+        let mode = backend.mode();
+        let refresh_hz = mode.vrefresh.max(1) as u64;
         let vblank_period_ns = 1_000_000_000u64 / refresh_hz;
         let next_vblank_ns = time::monotonic_nanos().saturating_add(vblank_period_ns);
         let device = Arc::new(Self {
@@ -579,6 +590,14 @@ impl DrmDevice {
                 next_handle: 1,
                 next_fb_id: 16,
                 current_fb_id: 0,
+                plane_crtc_id: 2,
+                connector_crtc_id: 2,
+                crtc_x: 0,
+                crtc_y: 0,
+                crtc_w: u32::from(mode.hdisplay),
+                crtc_h: u32::from(mode.vdisplay),
+                crtc_mode_valid: true,
+                crtc_mode: mode,
                 master_pid: None,
                 universal_planes: false,
                 dumb_buffers: BTreeMap::new(),
@@ -696,11 +715,11 @@ impl DrmDevice {
             DrmCrtcSnapshot {
                 crtc_id: self.crtc_id,
                 framebuffer_id: state.current_fb_id,
-                x: 0,
-                y: 0,
+                x: state.crtc_x,
+                y: state.crtc_y,
                 gamma_size: 0,
-                mode_valid: true,
-                mode: self.backend.mode(),
+                mode_valid: state.crtc_mode_valid,
+                mode: state.crtc_mode,
             }
         })
     }
@@ -744,7 +763,7 @@ impl DrmDevice {
             let state = self.state.lock();
             DrmPlaneSnapshot {
                 plane_id: self.plane_id,
-                crtc_id: self.crtc_id,
+                crtc_id: state.plane_crtc_id,
                 framebuffer_id: state.current_fb_id,
                 possible_crtcs: 1,
                 gamma_size: 0,
@@ -780,6 +799,8 @@ impl DrmDevice {
                 DRM_MODE_OBJECT_CRTC
             } else if object_id == self.connector_id {
                 DRM_MODE_OBJECT_CONNECTOR
+            } else if object_id == self.encoder_id {
+                DRM_MODE_OBJECT_ENCODER
             } else if object_id == self.plane_id {
                 DRM_MODE_OBJECT_PLANE
             } else if self.get_framebuffer(object_id).is_some() {
@@ -796,15 +817,20 @@ impl DrmDevice {
                 if object_id != self.crtc_id {
                     return Err(DrmIoctlError::NotFound);
                 }
+                let state = self.state.lock();
                 Ok(DrmObjectPropertiesSnapshot {
                     ids: alloc::vec![DRM_CRTC_ACTIVE_PROP_ID, DRM_CRTC_MODE_ID_PROP_ID],
-                    values: alloc::vec![1, u64::from(self.crtc_mode_blob_id())],
+                    values: alloc::vec![
+                        u64::from(state.crtc_mode_valid),
+                        u64::from(self.crtc_mode_blob_id()),
+                    ],
                 })
             }
             DRM_MODE_OBJECT_CONNECTOR => {
                 if object_id != self.connector_id {
                     return Err(DrmIoctlError::NotFound);
                 }
+                let state = self.state.lock();
                 Ok(DrmObjectPropertiesSnapshot {
                     ids: alloc::vec![
                         DRM_CONNECTOR_DPMS_PROP_ID,
@@ -814,21 +840,25 @@ impl DrmDevice {
                     values: alloc::vec![
                         DRM_MODE_DPMS_ON,
                         u64::from(self.connector_edid_blob_id()),
-                        u64::from(self.crtc_id),
+                        u64::from(state.connector_crtc_id),
                     ],
                 })
             }
             DRM_MODE_OBJECT_PLANE => {
                 let snapshot = self.get_plane(object_id).ok_or(DrmIoctlError::NotFound)?;
+                let (crtc_x, crtc_y, crtc_w, crtc_h) = {
+                    let state = self.state.lock();
+                    (state.crtc_x, state.crtc_y, state.crtc_w, state.crtc_h)
+                };
                 let (src_w, src_h) = self
                     .get_framebuffer(snapshot.framebuffer_id)
                     .map(|fb| ((u64::from(fb.width)) << 16, (u64::from(fb.height)) << 16))
                     .unwrap_or_else(|| {
-                        let mode = self.backend.mode();
-                        (
-                            (u64::from(mode.hdisplay)) << 16,
-                            (u64::from(mode.vdisplay)) << 16,
-                        )
+                        if snapshot.crtc_id != 0 {
+                            ((u64::from(crtc_w)) << 16, (u64::from(crtc_h)) << 16)
+                        } else {
+                            (0, 0)
+                        }
                     });
                 Ok(DrmObjectPropertiesSnapshot {
                     ids: alloc::vec![
@@ -854,11 +884,36 @@ impl DrmDevice {
                         0,
                         src_w,
                         src_h,
-                        0,
-                        0,
-                        u64::from(self.backend.mode().hdisplay),
-                        u64::from(self.backend.mode().vdisplay),
+                        if snapshot.crtc_id != 0 {
+                            u64::from(crtc_x)
+                        } else {
+                            0
+                        },
+                        if snapshot.crtc_id != 0 {
+                            u64::from(crtc_y)
+                        } else {
+                            0
+                        },
+                        if snapshot.crtc_id != 0 {
+                            u64::from(crtc_w)
+                        } else {
+                            0
+                        },
+                        if snapshot.crtc_id != 0 {
+                            u64::from(crtc_h)
+                        } else {
+                            0
+                        },
                     ],
+                })
+            }
+            DRM_MODE_OBJECT_ENCODER => {
+                if object_id != self.encoder_id {
+                    return Err(DrmIoctlError::NotFound);
+                }
+                Ok(DrmObjectPropertiesSnapshot {
+                    ids: Vec::new(),
+                    values: Vec::new(),
                 })
             }
             DRM_MODE_OBJECT_FB => {
@@ -1076,9 +1131,32 @@ impl DrmDevice {
             return Err(DrmIoctlError::Invalid);
         }
 
+        let (
+            mut next_fb_id,
+            mut next_plane_crtc_id,
+            mut next_connector_crtc_id,
+            mut next_crtc_x,
+            mut next_crtc_y,
+            mut next_crtc_w,
+            mut next_crtc_h,
+            mut next_crtc_mode_valid,
+            mut next_crtc_mode,
+        ) = {
+            let state = self.state.lock();
+            (
+                state.current_fb_id,
+                state.plane_crtc_id,
+                state.connector_crtc_id,
+                state.crtc_x,
+                state.crtc_y,
+                state.crtc_w,
+                state.crtc_h,
+                state.crtc_mode_valid,
+                state.crtc_mode,
+            )
+        };
         let mut prop_index = 0usize;
-        let mut committed_fb_id = None;
-        let mut active = true;
+        let mut plane_fb_changed = false;
 
         for (&obj_id, &count) in obj_ids.iter().zip(obj_prop_counts.iter()) {
             let count = count as usize;
@@ -1101,22 +1179,29 @@ impl DrmDevice {
                             if value != 0 && self.get_framebuffer(value as u32).is_none() {
                                 return Err(DrmIoctlError::NotFound);
                             }
-                            committed_fb_id = (value != 0).then_some(value as u32);
+                            next_fb_id = value as u32;
+                            plane_fb_changed = true;
                         }
                         DRM_PROPERTY_ID_CRTC_ID => {
-                            if value != 0 && value != u64::from(self.crtc_id) {
-                                return Err(DrmIoctlError::NotFound);
-                            }
+                            next_plane_crtc_id = value as u32;
                         }
                         DRM_PROPERTY_ID_SRC_X
                         | DRM_PROPERTY_ID_SRC_Y
                         | DRM_PROPERTY_ID_SRC_W
                         | DRM_PROPERTY_ID_SRC_H
-                        | DRM_PROPERTY_ID_CRTC_X
-                        | DRM_PROPERTY_ID_CRTC_Y
-                        | DRM_PROPERTY_ID_CRTC_W
-                        | DRM_PROPERTY_ID_CRTC_H
                         | DRM_PROPERTY_ID_IN_FORMATS => {}
+                        DRM_PROPERTY_ID_CRTC_X => {
+                            next_crtc_x = value as u32;
+                        }
+                        DRM_PROPERTY_ID_CRTC_Y => {
+                            next_crtc_y = value as u32;
+                        }
+                        DRM_PROPERTY_ID_CRTC_W => {
+                            next_crtc_w = value as u32;
+                        }
+                        DRM_PROPERTY_ID_CRTC_H => {
+                            next_crtc_h = value as u32;
+                        }
                         _ => {}
                     }
                 }
@@ -1126,13 +1211,22 @@ impl DrmDevice {
                     .zip(&prop_values[prop_index..prop_index + count])
                 {
                     match prop_id {
-                        DRM_CRTC_ACTIVE_PROP_ID => active = value != 0,
+                        DRM_CRTC_ACTIVE_PROP_ID => next_crtc_mode_valid = value != 0,
                         DRM_CRTC_MODE_ID_PROP_ID => {
-                            if value != 0 {
+                            if value == 0 {
+                                next_crtc_mode_valid = false;
+                                next_crtc_mode = DrmModeInfo::simple(0, 0, 0);
+                                next_crtc_w = 0;
+                                next_crtc_h = 0;
+                            } else {
                                 let mode = self.mode_from_blob(value as u32)?;
                                 if mode.hdisplay == 0 || mode.vdisplay == 0 {
                                     return Err(DrmIoctlError::Invalid);
                                 }
+                                next_crtc_mode = mode;
+                                next_crtc_mode_valid = true;
+                                next_crtc_w = u32::from(mode.hdisplay);
+                                next_crtc_h = u32::from(mode.vdisplay);
                             }
                         }
                         _ => {}
@@ -1149,11 +1243,7 @@ impl DrmDevice {
                                 return Err(DrmIoctlError::Invalid);
                             }
                         }
-                        DRM_CONNECTOR_CRTC_ID_PROP_ID => {
-                            if value != 0 && value != u64::from(self.crtc_id) {
-                                return Err(DrmIoctlError::NotFound);
-                            }
-                        }
+                        DRM_CONNECTOR_CRTC_ID_PROP_ID => next_connector_crtc_id = value as u32,
                         DRM_CONNECTOR_EDID_PROP_ID => {}
                         _ => {}
                     }
@@ -1169,13 +1259,32 @@ impl DrmDevice {
         if prop_index != prop_ids.len() {
             return Err(DrmIoctlError::Invalid);
         }
+        if next_plane_crtc_id != 0 && next_plane_crtc_id != self.crtc_id {
+            return Err(DrmIoctlError::NotFound);
+        }
+        if next_connector_crtc_id != 0 && next_connector_crtc_id != self.crtc_id {
+            return Err(DrmIoctlError::NotFound);
+        }
         if (flags & super::ioctl::DRM_MODE_ATOMIC_TEST_ONLY) != 0 {
             return Ok(());
         }
-        let Some(framebuffer_id) = committed_fb_id.filter(|_| active) else {
-            return Ok(());
-        };
-        self.set_crtc(framebuffer_id)?;
+
+        let mut state = self.state.lock();
+        state.current_fb_id = next_fb_id;
+        state.plane_crtc_id = next_plane_crtc_id;
+        state.connector_crtc_id = next_connector_crtc_id;
+        state.crtc_x = next_crtc_x;
+        state.crtc_y = next_crtc_y;
+        state.crtc_w = next_crtc_w;
+        state.crtc_h = next_crtc_h;
+        state.crtc_mode_valid = next_crtc_mode_valid;
+        state.crtc_mode = next_crtc_mode;
+        drop(state);
+
+        if plane_fb_changed && next_crtc_mode_valid && next_fb_id != 0 {
+            self.present_framebuffer(next_fb_id)?;
+            self.bump();
+        }
         if (flags & DRM_MODE_PAGE_FLIP_EVENT) != 0 {
             self.defer_flip_event(user_data);
         }
@@ -1307,7 +1416,10 @@ impl DrmDevice {
 
     pub fn set_crtc(&self, framebuffer_id: u32) -> Result<(), DrmIoctlError> {
         self.present_framebuffer(framebuffer_id)?;
-        self.state.lock().current_fb_id = framebuffer_id;
+        let mut state = self.state.lock();
+        state.current_fb_id = framebuffer_id;
+        state.plane_crtc_id = self.crtc_id;
+        state.connector_crtc_id = self.crtc_id;
         self.bump();
         Ok(())
     }

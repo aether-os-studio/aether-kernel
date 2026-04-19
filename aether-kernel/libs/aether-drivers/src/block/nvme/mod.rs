@@ -283,6 +283,10 @@ impl AsyncBlockDevice for NvmeNamespaceDevice {
         self.geometry
     }
 
+    fn max_transfer_bytes(&self) -> usize {
+        aligned_transfer_bytes(self._controller.max_transfer_size, self.geometry.block_size)
+    }
+
     fn read_blocks<'a>(&'a self, block: u64, buffer: &'a mut [u8]) -> BlockFuture<'a, usize> {
         Box::pin(async move { self.read_blocks_sync(block, buffer) })
     }

@@ -4,7 +4,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use aether_frame::libs::mutex::Mutex;
+use aether_frame::libs::spin::SpinLock;
 use aether_vfs::{NodeRef, VfsPath};
 
 use crate::errno::{SysErr, SysResult};
@@ -173,13 +173,13 @@ pub type FsLocation = VfsPath;
 
 #[derive(Clone)]
 pub struct ProcessFsContext {
-    namespace: Arc<Mutex<MountNamespace>>,
+    namespace: Arc<SpinLock<MountNamespace>>,
     root: FsLocation,
     cwd: FsLocation,
 }
 
 impl ProcessFsContext {
-    pub fn new(namespace: Arc<Mutex<MountNamespace>>) -> Self {
+    pub fn new(namespace: Arc<SpinLock<MountNamespace>>) -> Self {
         let root_node = namespace.lock().root_node();
         let root = FsLocation::new(String::from("/"), root_node);
         Self {
@@ -189,7 +189,7 @@ impl ProcessFsContext {
         }
     }
 
-    pub fn namespace(&self) -> Arc<Mutex<MountNamespace>> {
+    pub fn namespace(&self) -> Arc<SpinLock<MountNamespace>> {
         self.namespace.clone()
     }
 

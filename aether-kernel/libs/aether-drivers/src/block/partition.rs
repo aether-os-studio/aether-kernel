@@ -84,6 +84,10 @@ impl AsyncBlockDevice for PartitionBlockDevice {
         BlockGeometry::new(self.parent.geometry().block_size, self.entry.block_count)
     }
 
+    fn max_transfer_bytes(&self) -> usize {
+        self.parent.max_transfer_bytes()
+    }
+
     fn read_blocks<'a>(&'a self, block: u64, buffer: &'a mut [u8]) -> BlockFuture<'a, usize> {
         self.parent
             .read_blocks(self.entry.first_lba.saturating_add(block), buffer)
@@ -389,7 +393,11 @@ fn block_on<T>(
         }
 
         fn park(&self) {
-            aether_frame::arch::cpu::wait_for_interrupt();
+            if aether_frame::interrupt::are_enabled() {
+                aether_frame::arch::cpu::wait_for_interrupt();
+            } else {
+                core::hint::spin_loop();
+            }
         }
     }
 

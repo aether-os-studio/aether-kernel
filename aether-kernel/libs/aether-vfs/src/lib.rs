@@ -24,8 +24,8 @@ pub use self::file::{
 pub use self::inode::{Inode, InodeOperations, NodeRef};
 pub use self::node::{
     CowMemoryFile, DirectoryEntry, DirectoryNode, FileNode, FileOperations, FsError, FsResult,
-    MemoryFile, MutableMemoryFile, NodeKind, NodeMetadata, NodeTimestamp, SharedMemoryFile,
-    SymlinkNode,
+    MemfdOptions, MemoryFile, MutableMemoryFile, NodeKind, NodeMetadata, NodeTimestamp,
+    SharedMemoryFile, SymlinkNode,
 };
 pub use self::path::{
     VfsPath, display_path_from_root, is_within, leaf_name, normalize_absolute_path, parent_path,

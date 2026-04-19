@@ -11,7 +11,7 @@ crate::declare_syscall!(
 
 impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
     pub(crate) fn syscall_set_tid_address(&mut self, address: u64) -> SysResult<u64> {
-        self.process.clear_child_tid = Some(address);
+        self.process.clear_child_tid = (address != 0).then_some(address);
         Ok(self.process.identity.pid as u64)
     }
 }

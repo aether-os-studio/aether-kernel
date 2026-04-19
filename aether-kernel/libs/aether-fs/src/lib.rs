@@ -8,6 +8,7 @@ mod pipe;
 pub mod pseudo;
 mod runtime_async;
 
+pub(crate) use self::block::TransferBufferLease;
 pub use self::block::{
     AsyncBlockDevice, BlockDeviceFile, BlockFuture, BlockGeometry, SyncBlockDevice,
     SyncToAsyncBlockDevice,

@@ -577,6 +577,7 @@ impl From<FsError> for SysErr {
             FsError::NotFile => Self::Inval,
             FsError::AlreadyExists => Self::Exists,
             FsError::Unsupported => Self::NotSup,
+            FsError::PermissionDenied => Self::Access,
             FsError::InvalidInput | FsError::RootNotMounted => Self::Inval,
             FsError::WouldBlock => Self::Again,
             FsError::BrokenPipe => Self::Pipe,

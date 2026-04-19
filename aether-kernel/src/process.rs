@@ -44,6 +44,34 @@ pub struct ProcessIdentity {
     pub session: Pid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FutexScope {
+    Private { address_space_id: usize },
+    Shared,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FutexKey {
+    pub scope: FutexScope,
+    pub uaddr: u64,
+}
+
+impl FutexKey {
+    pub const fn private(address_space_id: usize, uaddr: u64) -> Self {
+        Self {
+            scope: FutexScope::Private { address_space_id },
+            uaddr,
+        }
+    }
+
+    pub const fn shared(uaddr: u64) -> Self {
+        Self {
+            scope: FutexScope::Shared,
+            uaddr,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
     Runnable,
@@ -73,8 +101,9 @@ pub enum ProcessBlock {
         options: u64,
     },
     Futex {
-        uaddr: u64,
+        key: FutexKey,
         bitset: u32,
+        deadline_nanos: Option<u64>,
     },
     Timer {
         target_nanos: u64,
@@ -98,6 +127,9 @@ pub struct KernelProcess {
     pub pending_file_waits: Vec<PendingPollRegistration>,
     pub mmap_regions: Vec<MmapRegion>,
     pub vfork_parent: Option<Pid>,
+    pub set_child_tid: Option<u64>,
+    pub robust_list_head: Option<u64>,
+    pub robust_list_len: u64,
     pub clear_child_tid: Option<u64>,
     pub files: FdTable,
     pub fs: ProcessFsContext,
@@ -524,11 +556,13 @@ pub trait ProcessServices {
     fn has_child(&mut self, parent_pid: Pid, requested: i32) -> bool;
     fn wake_vfork_parent(&mut self, parent_pid: Pid, child_pid: Pid);
     fn send_kernel_signal(&mut self, pid: Pid, signal: crate::signal::SignalInfo) -> bool;
-    fn wake_futex(&mut self, uaddr: u64, bitset: u32, count: usize) -> usize;
+    fn arm_futex_wait(&mut self, pid: Pid, key: FutexKey, bitset: u32);
+    fn disarm_futex_wait(&mut self, pid: Pid);
+    fn wake_futex(&mut self, key: FutexKey, bitset: u32, count: usize) -> usize;
     fn requeue_futex(
         &mut self,
-        from: u64,
-        to: u64,
+        from: FutexKey,
+        to: FutexKey,
         wake_count: usize,
         requeue_count: usize,
         bitset: u32,
@@ -553,7 +587,8 @@ pub struct ProcessManager {
     blocked_files: BTreeSet<Pid>,
     blocked_timers: BTreeMap<u64, BTreeSet<Pid>>,
     next_timer_deadline_nanos: Option<u64>,
-    blocked_futexes: BTreeMap<u64, BTreeSet<Pid>>,
+    blocked_futexes: BTreeMap<FutexKey, BTreeSet<Pid>>,
+    armed_futex_waits: BTreeMap<Pid, ArmedFutexWait>,
     file_wait_queue: Arc<SpinLock<VecDeque<Pid>, LocalIrqDisabled>>,
     file_wait_enqueued: Arc<SpinLock<BTreeSet<Pid>, LocalIrqDisabled>>,
     file_wait_pending: Arc<AtomicBool>,
@@ -565,6 +600,13 @@ pub struct ProcessManager {
 struct FileWaitRegistration {
     file: SharedOpenFile,
     waiter_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArmedFutexWait {
+    key: FutexKey,
+    bitset: u32,
+    raced_wake: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

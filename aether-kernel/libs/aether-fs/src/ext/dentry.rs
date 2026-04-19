@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use aether_frame::libs::spin::PreemptDisabled;
 use aether_vfs::{
     DirectoryEntry, FsError, FsResult, InodeOperations, NodeKind, NodeMetadata, NodeRef,
 };
@@ -12,8 +13,8 @@ use super::inode::{ExtInodeNode, ext_mode, load_inode_node_from_ext_inode};
 use super::io::{block_on_future, map_ext_error};
 
 struct LockedNodePair<'a> {
-    _first: aether_frame::libs::mutex::MutexGuard<'a, ()>,
-    _second: Option<aether_frame::libs::mutex::MutexGuard<'a, ()>>,
+    _first: aether_frame::libs::spin::SpinLockGuard<'a, (), PreemptDisabled>,
+    _second: Option<aether_frame::libs::spin::SpinLockGuard<'a, (), PreemptDisabled>>,
 }
 
 fn lock_node_pair<'a>(left: &'a ExtInodeNode, right: &'a ExtInodeNode) -> LockedNodePair<'a> {

@@ -1,7 +1,6 @@
 extern crate alloc;
 
-use aether_frame::libs::mutex::{Mutex, MutexGuard};
-use aether_frame::libs::spin::SpinLock;
+use aether_frame::libs::spin::{PreemptDisabled, SpinLock, SpinLockGuard};
 use aether_vfs::{FsError, FsResult, Inode, NodeKind, NodeMetadata, NodeRef, NodeTimestamp};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -23,8 +22,8 @@ pub(crate) struct ExtInodeNode {
     pub(crate) inode: SpinLock<ExtInode>,
     pub(crate) metadata: SpinLock<NodeMetadata>,
     pub(crate) symlink_target: Option<String>,
-    pub(crate) io_lock: Mutex<()>,
-    pub(crate) open_state: Mutex<ExtOpenState>,
+    pub(crate) io_lock: SpinLock<()>,
+    pub(crate) open_state: SpinLock<ExtOpenState>,
     pub(crate) children: SpinLock<BTreeMap<String, NodeRef>>,
 }
 
@@ -52,13 +51,13 @@ impl ExtInodeNode {
             inode: SpinLock::new(inode),
             metadata: SpinLock::new(metadata),
             symlink_target,
-            io_lock: Mutex::new(()),
-            open_state: Mutex::new(ExtOpenState::default()),
+            io_lock: SpinLock::new(()),
+            open_state: SpinLock::new(ExtOpenState::default()),
             children: SpinLock::new(BTreeMap::new()),
         }))
     }
 
-    pub(crate) fn lock_io(&self) -> MutexGuard<'_, ()> {
+    pub(crate) fn lock_io(&self) -> SpinLockGuard<'_, (), PreemptDisabled> {
         self.io_lock.lock()
     }
 

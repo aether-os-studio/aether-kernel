@@ -10,14 +10,14 @@ crate::declare_syscall!(
 );
 
 impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_set_robust_list(&mut self, _head: u64, len: u64) -> SysResult<u64> {
+    pub(crate) fn syscall_set_robust_list(&mut self, head: u64, len: u64) -> SysResult<u64> {
         const ROBUST_LIST_HEAD_LEN: u64 = 24;
 
         if len != ROBUST_LIST_HEAD_LEN {
             return Err(SysErr::Inval);
         }
-        // The pointer is accepted for libc compatibility, but robust-list walk on thread exit
-        // is not wired up yet.
+        self.process.robust_list_head = (head != 0).then_some(head);
+        self.process.robust_list_len = len;
         Ok(0)
     }
 }

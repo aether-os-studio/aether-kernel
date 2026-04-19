@@ -13,6 +13,7 @@ use super::{KernelProcess, ProcessServices};
 use crate::errno::SysErr;
 use crate::errno::SysResult;
 use crate::fs::{FileSystemIdentity, linux_open_flags};
+use crate::process::FutexKey;
 use crate::rootfs::FsLocation;
 use crate::syscall::{
     BlockResult, BlockType, KernelSyscallContext, SyscallArgs, SyscallDisposition,
@@ -147,10 +148,15 @@ impl<S> ProcessSyscallContext<'_, S> {
 
     pub(crate) fn wait_futex(
         &mut self,
-        uaddr: u64,
+        key: FutexKey,
         bitset: u32,
+        deadline_nanos: Option<u64>,
     ) -> Result<BlockResult, SyscallDisposition> {
-        self.take_wake_result_or_block(BlockType::Futex { uaddr, bitset })
+        self.take_wake_result_or_block(BlockType::Futex {
+            key,
+            bitset,
+            deadline_nanos,
+        })
     }
 
     pub(crate) fn wait_wait_child(

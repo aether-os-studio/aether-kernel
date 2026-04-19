@@ -2,7 +2,6 @@ extern crate alloc;
 
 use aether_vfs::{FsError, FsResult};
 use alloc::boxed::Box;
-use alloc::vec;
 use async_trait::async_trait;
 use core::cmp::min;
 use core::error::Error;
@@ -102,7 +101,7 @@ pub(crate) async fn read_exact(
     let mut copied = 0usize;
     let mut block = offset / geometry.block_size as u64;
     let mut block_offset = (offset % geometry.block_size as u64) as usize;
-    let mut scratch = None::<alloc::vec::Vec<u8>>;
+    let mut scratch = None::<crate::TransferBufferLease>;
 
     while remaining > 0 {
         if block_offset == 0 {
@@ -125,13 +124,17 @@ pub(crate) async fn read_exact(
             }
         }
 
-        let scratch = scratch.get_or_insert_with(|| vec![0u8; geometry.block_size]);
-        let available = device.read_blocks(block, scratch).await?;
+        let scratch =
+            scratch.get_or_insert_with(|| device.acquire_transfer_buffer(geometry.block_size));
+        let available = device
+            .read_blocks(block, scratch.as_mut_slice(geometry.block_size))
+            .await?;
         if available <= block_offset {
             return Err(FsError::InvalidInput);
         }
 
         let chunk = min(remaining, available - block_offset);
+        let scratch = scratch.as_mut_slice(available);
         buffer[copied..copied + chunk]
             .copy_from_slice(&scratch[block_offset..block_offset + chunk]);
         copied += chunk;
@@ -164,7 +167,7 @@ pub(crate) async fn write_exact(
     let mut copied = 0usize;
     let mut block = offset / geometry.block_size as u64;
     let mut block_offset = (offset % geometry.block_size as u64) as usize;
-    let mut scratch = None::<alloc::vec::Vec<u8>>;
+    let mut scratch = None::<crate::TransferBufferLease>;
 
     while remaining > 0 {
         if block_offset == 0 {
@@ -187,13 +190,17 @@ pub(crate) async fn write_exact(
             }
         }
 
-        let scratch = scratch.get_or_insert_with(|| vec![0u8; geometry.block_size]);
-        let prepared = device.read_blocks(block, scratch).await?;
+        let scratch =
+            scratch.get_or_insert_with(|| device.acquire_transfer_buffer(geometry.block_size));
+        let prepared = device
+            .read_blocks(block, scratch.as_mut_slice(geometry.block_size))
+            .await?;
         if prepared <= block_offset {
             return Err(FsError::InvalidInput);
         }
 
         let chunk = min(remaining, prepared - block_offset);
+        let scratch = scratch.as_mut_slice(prepared);
         scratch[block_offset..block_offset + chunk]
             .copy_from_slice(&buffer[copied..copied + chunk]);
         let written = device.write_blocks(block, &scratch[..prepared]).await?;

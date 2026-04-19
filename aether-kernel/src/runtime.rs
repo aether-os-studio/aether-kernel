@@ -701,18 +701,6 @@ impl ProcessServices for RuntimeServices<'_> {
         {
             child_task.process.context_mut().set_thread_pointer(tls);
         }
-        if params.set_child_tid()
-            && let Some(child_tid) = params.child_tid
-        {
-            let raw = pid.to_ne_bytes();
-            let written = child_task
-                .address_space
-                .write(child_tid, &raw)
-                .map_err(SysErr::from)?;
-            if written != raw.len() {
-                return Err(SysErr::Fault);
-            }
-        }
         if params.set_parent_tid()
             && let Some(parent_tid) = params.parent_tid
         {
@@ -755,6 +743,9 @@ impl ProcessServices for RuntimeServices<'_> {
             pending_file_waits: Vec::new(),
             mmap_regions: parent.mmap_regions.clone(),
             vfork_parent,
+            set_child_tid: params.set_child_tid().then_some(params.child_tid).flatten(),
+            robust_list_head: None,
+            robust_list_len: 0,
             clear_child_tid: params
                 .clear_child_tid()
                 .then_some(params.child_tid)
@@ -795,14 +786,22 @@ impl ProcessServices for RuntimeServices<'_> {
         self.processes.lock().send_signal(pid, signal)
     }
 
-    fn wake_futex(&mut self, uaddr: u64, bitset: u32, count: usize) -> usize {
-        self.processes.lock().wake_futex(uaddr, bitset, count)
+    fn arm_futex_wait(&mut self, pid: Pid, key: crate::process::FutexKey, bitset: u32) {
+        self.processes.lock().arm_futex_wait(pid, key, bitset);
+    }
+
+    fn disarm_futex_wait(&mut self, pid: Pid) {
+        self.processes.lock().disarm_futex_wait(pid);
+    }
+
+    fn wake_futex(&mut self, key: crate::process::FutexKey, bitset: u32, count: usize) -> usize {
+        self.processes.lock().wake_futex(key, bitset, count)
     }
 
     fn requeue_futex(
         &mut self,
-        from: u64,
-        to: u64,
+        from: crate::process::FutexKey,
+        to: crate::process::FutexKey,
         wake_count: usize,
         requeue_count: usize,
         bitset: u32,

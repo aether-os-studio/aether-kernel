@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 
-use aether_vfs::{FileNode, OpenFlags, SharedMemoryFile};
+use aether_vfs::{FileNode, MemfdOptions, OpenFlags, SharedMemoryFile};
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
@@ -22,6 +22,8 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         const MFD_CLOEXEC: u64 = 0x0001;
         const MFD_ALLOW_SEALING: u64 = 0x0002;
         const MFD_HUGETLB: u64 = 0x0004;
+        const MFD_NOEXEC_SEAL: u64 = 0x0008;
+        const MFD_EXEC: u64 = 0x0010;
 
         if name.len() > 249 {
             return Err(SysErr::Inval);
@@ -29,15 +31,18 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         if (flags & MFD_HUGETLB) != 0 {
             return Err(SysErr::NotSup);
         }
-        if (flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING)) != 0 {
+        if (flags & MFD_NOEXEC_SEAL) != 0 && (flags & MFD_EXEC) != 0 {
             return Err(SysErr::Inval);
         }
 
+        let options = MemfdOptions {
+            allow_sealing: (flags & (MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL)) != 0,
+            executable: (flags & MFD_NOEXEC_SEAL) == 0,
+        };
+
         let node = FileNode::new(
             if name.is_empty() { "memfd" } else { name },
-            Arc::new(SharedMemoryFile::new_with_sealing(
-                (flags & MFD_ALLOW_SEALING) != 0,
-            )),
+            Arc::new(SharedMemoryFile::new_memfd(options)),
         );
         Ok(self.process.files.insert_node(
             node,

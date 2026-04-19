@@ -12,7 +12,6 @@ use alloc::vec::Vec;
 
 use aether_device::DeviceNamespace;
 use aether_frame::boot;
-use aether_frame::libs::mutex::Mutex;
 use aether_frame::libs::spin::SpinLock;
 use aether_initramfs::{InitramfsError, load_initramfs};
 use aether_tmpfs as tmpfs;
@@ -81,6 +80,12 @@ pub struct ExecPlan {
 struct NamespaceLookup {
     node: NodeRef,
     path: String,
+}
+
+#[derive(Clone, Copy)]
+enum NamespaceCreateKind {
+    Directory { mode: u32 },
+    File { mode: u32 },
 }
 
 impl RootfsManager {
@@ -231,7 +236,7 @@ impl RootfsManager {
     }
 
     pub fn initial_fs_context(&self) -> ProcessFsContext {
-        ProcessFsContext::new(Arc::new(Mutex::new(MountNamespace::new(
+        ProcessFsContext::new(Arc::new(SpinLock::new(MountNamespace::new(
             self.boot_root.clone(),
         ))))
     }
@@ -890,11 +895,12 @@ impl RootfsManager {
             let namespace = fs.namespace();
             namespace.lock().clone()
         };
-        self.create_child_namespace_locked(&namespace, path, |parent, name| {
-            parent
-                .create_file(String::from(name), mode)
-                .map_err(SysErr::from)
-        })
+        self.create_namespace_path_locked(
+            &namespace,
+            path,
+            NamespaceCreateKind::File { mode },
+            0o040755,
+        )
     }
 
     fn create_dir_namespace(
@@ -907,11 +913,12 @@ impl RootfsManager {
             let namespace = fs.namespace();
             namespace.lock().clone()
         };
-        self.create_child_namespace_locked(&namespace, path, |parent, name| {
-            parent
-                .create_dir(String::from(name), mode)
-                .map_err(SysErr::from)
-        })
+        self.create_namespace_path_locked(
+            &namespace,
+            path,
+            NamespaceCreateKind::Directory { mode },
+            mode,
+        )
     }
 
     fn create_symlink_namespace(
@@ -995,6 +1002,82 @@ impl RootfsManager {
             current
                 .insert_child(component, next.clone())
                 .map_err(SysErr::from)?;
+            current = next;
+            current_path = next_path;
+        }
+
+        Ok(current)
+    }
+
+    fn create_namespace_path_locked(
+        &self,
+        namespace: &MountNamespace,
+        path: &str,
+        kind: NamespaceCreateKind,
+        parent_dir_mode: u32,
+    ) -> SysResult<NodeRef> {
+        let normalized = normalize_absolute_path(path);
+        if normalized == "/" {
+            return Err(SysErr::Exists);
+        }
+
+        let components = split_components(normalized.as_str());
+        let mut current = namespace.root_node();
+        let mut current_path = String::from("/");
+
+        for (index, component) in components.iter().enumerate() {
+            let next_path = resolve_namespace_path(current_path.as_str(), component.as_str());
+            let is_final = index + 1 == components.len();
+
+            if let Some(mount) = namespace.lookup_mount(next_path.as_str()) {
+                if is_final {
+                    return Err(SysErr::Exists);
+                }
+                let mount_node = mount.node();
+                if mount_node.kind() != NodeKind::Directory {
+                    return Err(SysErr::NotDir);
+                }
+                current = mount_node;
+                current_path = next_path;
+                continue;
+            }
+
+            if let Some(existing) = current.lookup(component.as_str()) {
+                let next = if existing.kind() == NodeKind::Symlink {
+                    self.lookup_namespace_path(namespace, next_path.as_str(), true, 0)?
+                } else {
+                    existing
+                };
+                if is_final {
+                    return Err(SysErr::Exists);
+                }
+                if next.kind() != NodeKind::Directory {
+                    return Err(SysErr::NotDir);
+                }
+                current = next;
+                current_path = next_path;
+                continue;
+            }
+
+            let next = if is_final {
+                match kind {
+                    NamespaceCreateKind::Directory { mode } => current
+                        .create_dir(component.clone(), mode)
+                        .map_err(SysErr::from)?,
+                    NamespaceCreateKind::File { mode } => current
+                        .create_file(component.clone(), mode)
+                        .map_err(SysErr::from)?,
+                }
+            } else {
+                current
+                    .create_dir(component.clone(), parent_dir_mode)
+                    .map_err(SysErr::from)?
+            };
+
+            if !is_final && next.kind() != NodeKind::Directory {
+                return Err(SysErr::NotDir);
+            }
+
             current = next;
             current_path = next_path;
         }

@@ -48,6 +48,143 @@ impl WaitListener for FileBlockListener {
 }
 
 impl ProcessManager {
+    const ROBUST_LIST_HEAD_LEN: u64 = 24;
+    const ROBUST_LIST_LIMIT: usize = 2048;
+    const FUTEX_WAITERS: u32 = 0x8000_0000;
+    const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+    const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+
+    fn read_exit_u64(process: &KernelProcess, address: u64) -> Option<u64> {
+        let bytes = process
+            .task
+            .address_space
+            .read_user_exact(address, 8)
+            .ok()?;
+        Some(u64::from_ne_bytes(bytes.as_slice().try_into().ok()?))
+    }
+
+    fn read_exit_i64(process: &KernelProcess, address: u64) -> Option<i64> {
+        let bytes = process
+            .task
+            .address_space
+            .read_user_exact(address, 8)
+            .ok()?;
+        Some(i64::from_ne_bytes(bytes.as_slice().try_into().ok()?))
+    }
+
+    fn read_exit_u32(process: &KernelProcess, address: u64) -> Option<u32> {
+        let bytes = process
+            .task
+            .address_space
+            .read_user_exact(address, 4)
+            .ok()?;
+        Some(u32::from_ne_bytes(bytes.as_slice().try_into().ok()?))
+    }
+
+    fn wake_futex_scopes(
+        &mut self,
+        process: &KernelProcess,
+        uaddr: u64,
+        count: usize,
+        bitset: u32,
+    ) {
+        let private =
+            crate::process::FutexKey::private(process.task.address_space.identity(), uaddr);
+        let _ = self.wake_futex(private, bitset, count);
+        let shared = crate::process::FutexKey::shared(uaddr);
+        let _ = self.wake_futex(shared, bitset, count);
+    }
+
+    fn prepare_child_return(&mut self, process: &mut KernelProcess) {
+        let Some(child_tid) = process.set_child_tid.take() else {
+            return;
+        };
+
+        let raw = process.identity.pid.to_ne_bytes();
+        let status = match process.task.address_space.write(child_tid, &raw) {
+            Ok(written) if written == raw.len() => None,
+            _ => Some(128 + crate::signal::SIGSEGV as i32),
+        };
+
+        if let Some(status) = status {
+            process.state = ProcessState::Exited(status);
+        }
+    }
+
+    fn cleanup_robust_word(&mut self, process: &KernelProcess, futex_uaddr: u64) {
+        let Some(word) = Self::read_exit_u32(process, futex_uaddr) else {
+            return;
+        };
+        if (word & Self::FUTEX_TID_MASK) != process.identity.pid {
+            return;
+        }
+
+        let new_word = (word & Self::FUTEX_WAITERS) | Self::FUTEX_OWNER_DIED;
+        let raw = new_word.to_ne_bytes();
+        let Ok(written) = process.task.address_space.write(futex_uaddr, &raw) else {
+            return;
+        };
+        if written != raw.len() {
+            return;
+        }
+
+        if (word & Self::FUTEX_WAITERS) != 0 {
+            self.wake_futex_scopes(process, futex_uaddr, 1, u32::MAX);
+        }
+    }
+
+    fn cleanup_robust_entry(
+        &mut self,
+        process: &KernelProcess,
+        futex_offset: i64,
+        entry_addr: u64,
+    ) {
+        let futex_uaddr = if futex_offset < 0 {
+            entry_addr.checked_sub((-futex_offset) as u64)
+        } else {
+            entry_addr.checked_add(futex_offset as u64)
+        };
+        let Some(futex_uaddr) = futex_uaddr else {
+            return;
+        };
+        self.cleanup_robust_word(process, futex_uaddr);
+    }
+
+    fn cleanup_robust_list(&mut self, process: &KernelProcess) {
+        let Some(head_addr) = process.robust_list_head else {
+            return;
+        };
+        if process.robust_list_len < Self::ROBUST_LIST_HEAD_LEN {
+            return;
+        }
+
+        let Some(list_next) = Self::read_exit_u64(process, head_addr) else {
+            return;
+        };
+        let Some(futex_offset) = Self::read_exit_i64(process, head_addr + 8) else {
+            return;
+        };
+        let Some(list_op_pending) = Self::read_exit_u64(process, head_addr + 16) else {
+            return;
+        };
+
+        let mut entry_addr = list_next;
+        for _ in 0..Self::ROBUST_LIST_LIMIT {
+            if entry_addr == 0 || entry_addr == head_addr {
+                break;
+            }
+            let Some(next) = Self::read_exit_u64(process, entry_addr) else {
+                break;
+            };
+            self.cleanup_robust_entry(process, futex_offset, entry_addr);
+            entry_addr = next;
+        }
+
+        if list_op_pending != 0 && list_op_pending != head_addr {
+            self.cleanup_robust_entry(process, futex_offset, list_op_pending);
+        }
+    }
+
     fn enqueue_runnable_pid(&mut self, pid: Pid, assigned_cpu: usize) {
         crate::processor::enqueue_runnable_pid(pid, assigned_cpu);
     }
@@ -120,6 +257,92 @@ impl ProcessManager {
         if self.next_timer_deadline_nanos == Some(deadline_nanos) {
             self.refresh_next_timer_deadline();
         }
+    }
+
+    pub(crate) fn arm_futex_wait(&mut self, pid: Pid, key: crate::process::FutexKey, bitset: u32) {
+        self.armed_futex_waits.insert(
+            pid,
+            super::ArmedFutexWait {
+                key,
+                bitset,
+                raced_wake: false,
+            },
+        );
+    }
+
+    pub(crate) fn disarm_futex_wait(&mut self, pid: Pid) {
+        self.armed_futex_waits.remove(&pid);
+    }
+
+    fn take_armed_futex_wait(&mut self, pid: Pid) -> Option<super::ArmedFutexWait> {
+        self.armed_futex_waits.remove(&pid)
+    }
+
+    fn wake_armed_futex_waits(
+        &mut self,
+        key: crate::process::FutexKey,
+        bitset: u32,
+        count: usize,
+    ) -> usize {
+        if count == 0 {
+            return 0;
+        }
+
+        let targets = self
+            .armed_futex_waits
+            .iter()
+            .filter_map(|(&pid, wait)| {
+                (wait.key == key && (wait.bitset & bitset) != 0 && !wait.raced_wake).then_some(pid)
+            })
+            .take(count)
+            .collect::<Vec<_>>();
+
+        let mut woke = 0usize;
+        for pid in targets {
+            let Some(wait) = self.armed_futex_waits.get_mut(&pid) else {
+                continue;
+            };
+            if wait.key != key || (wait.bitset & bitset) == 0 || wait.raced_wake {
+                continue;
+            }
+            wait.raced_wake = true;
+            woke += 1;
+        }
+        woke
+    }
+
+    fn requeue_armed_futex_waits(
+        &mut self,
+        from: crate::process::FutexKey,
+        to: crate::process::FutexKey,
+        requeue_count: usize,
+        bitset: u32,
+    ) -> usize {
+        if requeue_count == 0 {
+            return 0;
+        }
+
+        let targets = self
+            .armed_futex_waits
+            .iter()
+            .filter_map(|(&pid, wait)| {
+                (wait.key == from && (wait.bitset & bitset) != 0 && !wait.raced_wake).then_some(pid)
+            })
+            .take(requeue_count)
+            .collect::<Vec<_>>();
+
+        let mut moved = 0usize;
+        for pid in targets {
+            let Some(wait) = self.armed_futex_waits.get_mut(&pid) else {
+                continue;
+            };
+            if wait.key != from || (wait.bitset & bitset) == 0 || wait.raced_wake {
+                continue;
+            }
+            wait.key = to;
+            moved += 1;
+        }
+        moved
     }
 
     pub(crate) fn timer_deadline_due(&self, current_nanos: u64) -> bool {
@@ -243,7 +466,30 @@ impl ProcessManager {
             },
             BlockType::File { fd, events } => ProcessBlock::File { fd, events },
             BlockType::Poll { deadline_nanos, .. } => ProcessBlock::Poll { deadline_nanos },
-            BlockType::Futex { uaddr, bitset } => ProcessBlock::Futex { uaddr, bitset },
+            BlockType::Futex {
+                key,
+                bitset,
+                deadline_nanos,
+            } => {
+                match self.take_armed_futex_wait(pid) {
+                    Some(armed)
+                        if armed.key == key && armed.bitset == bitset && armed.raced_wake =>
+                    {
+                        process.wake_result = Some(BlockResult::Futex {
+                            woke: true,
+                            timed_out: false,
+                        });
+                        process.state = ProcessState::Runnable;
+                        return;
+                    }
+                    Some(_) | None => {}
+                }
+                ProcessBlock::Futex {
+                    key,
+                    bitset,
+                    deadline_nanos,
+                }
+            }
             BlockType::SignalSuspend => ProcessBlock::SignalSuspend,
             BlockType::Vfork { child } => ProcessBlock::Vfork { child },
             BlockType::WaitChild {
@@ -309,8 +555,19 @@ impl ProcessManager {
                     .insert(pid);
                 self.note_timer_deadline_inserted(target_nanos);
             }
-            ProcessBlock::Futex { uaddr, .. } => {
-                self.blocked_futexes.entry(uaddr).or_default().insert(pid);
+            ProcessBlock::Futex {
+                key,
+                deadline_nanos,
+                ..
+            } => {
+                self.blocked_futexes.entry(key).or_default().insert(pid);
+                if let Some(deadline_nanos) = deadline_nanos {
+                    self.blocked_timers
+                        .entry(deadline_nanos)
+                        .or_default()
+                        .insert(pid);
+                    self.note_timer_deadline_inserted(deadline_nanos);
+                }
             }
             ProcessBlock::SignalSuspend
             | ProcessBlock::Vfork { .. }
@@ -350,11 +607,24 @@ impl ProcessManager {
                     }
                 }
             }
-            ProcessBlock::Futex { uaddr, .. } => {
-                if let Some(waiters) = self.blocked_futexes.get_mut(&uaddr) {
+            ProcessBlock::Futex {
+                key,
+                deadline_nanos,
+                ..
+            } => {
+                if let Some(waiters) = self.blocked_futexes.get_mut(&key) {
                     waiters.remove(&pid);
                     if waiters.is_empty() {
-                        self.blocked_futexes.remove(&uaddr);
+                        self.blocked_futexes.remove(&key);
+                    }
+                }
+                if let Some(deadline_nanos) = deadline_nanos
+                    && let Some(waiters) = self.blocked_timers.get_mut(&deadline_nanos)
+                {
+                    waiters.remove(&pid);
+                    if waiters.is_empty() {
+                        self.blocked_timers.remove(&deadline_nanos);
+                        self.note_timer_deadline_removed(deadline_nanos);
                     }
                 }
             }
@@ -375,6 +645,7 @@ impl ProcessManager {
             blocked_timers: alloc::collections::BTreeMap::new(),
             next_timer_deadline_nanos: None,
             blocked_futexes: alloc::collections::BTreeMap::new(),
+            armed_futex_waits: alloc::collections::BTreeMap::new(),
             file_wait_queue: Arc::new(SpinLock::new(alloc::collections::VecDeque::new())),
             file_wait_enqueued: Arc::new(SpinLock::new(alloc::collections::BTreeSet::new())),
             file_wait_pending: Arc::new(core::sync::atomic::AtomicBool::new(false)),
@@ -425,6 +696,9 @@ impl ProcessManager {
                 pending_file_waits: Vec::new(),
                 mmap_regions: Vec::new(),
                 vfork_parent: None,
+                set_child_tid: None,
+                robust_list_head: None,
+                robust_list_len: 0,
                 clear_child_tid: None,
                 files: self.initial_files.clone(),
                 fs: self.initial_fs.clone().ok_or(BuildError::EmptyProgram)?,
@@ -550,6 +824,21 @@ impl ProcessManager {
         if process.pending_syscall.is_some() {
             process.state = ProcessState::Running;
             return Some(DispatchWork::KernelSyscall(process));
+        }
+
+        self.prepare_child_return(&mut process);
+        if let ProcessState::Exited(status) = process.state {
+            self.finish_process_exit(&mut process);
+            let parent = process.identity.parent;
+            self.zombies.insert(pid, ZombieProcess { parent });
+            self.notify_child_event(
+                parent,
+                ChildEvent {
+                    pid,
+                    kind: ChildEventKind::Exited(status),
+                },
+            );
+            return Some(DispatchWork::Event(ScheduleEvent::Exited { pid, status }));
         }
 
         process.state = ProcessState::Running;
@@ -708,6 +997,7 @@ impl ProcessManager {
         let pid = process.identity.pid;
         let event = match dispatch.disposition {
             SyscallDisposition::Return(value) => {
+                self.disarm_futex_wait(pid);
                 if matches!(process.state, ProcessState::Running) {
                     let replaced_image = self.commit_pending_exec(&mut process);
                     process.pending_syscall = None;
@@ -731,11 +1021,15 @@ impl ProcessManager {
                 }
             }
             SyscallDisposition::Exit(status) => {
+                self.disarm_futex_wait(pid);
                 process.pending_syscall = None;
                 process.state = ProcessState::Exited(status);
                 ScheduleEvent::Exited { pid, status }
             }
             SyscallDisposition::Block(block) => {
+                if !matches!(block, BlockType::Futex { .. }) {
+                    self.disarm_futex_wait(pid);
+                }
                 self.block_from_disposition(pid, &mut process, block);
                 ScheduleEvent::Syscall {
                     pid,
@@ -847,6 +1141,9 @@ impl ProcessManager {
     }
 
     fn finish_process_exit(&mut self, process: &mut KernelProcess) {
+        self.disarm_futex_wait(process.identity.pid);
+        self.cleanup_robust_list(process);
+
         let Some(clear_child_tid) = process.clear_child_tid.take() else {
             return;
         };
@@ -855,7 +1152,7 @@ impl ProcessManager {
         if let Ok(written) = process.task.address_space.write(clear_child_tid, &zero)
             && written == zero.len()
         {
-            let _ = self.wake_futex(clear_child_tid, u32::MAX, 1);
+            self.wake_futex_scopes(process, clear_child_tid, i32::MAX as usize, u32::MAX);
         }
     }
 
@@ -955,6 +1252,15 @@ impl ProcessManager {
                             },
                         );
                     }
+                    ProcessState::Blocked(ProcessBlock::Futex { .. }) => {
+                        self.wake_process_with_result(
+                            pid,
+                            BlockResult::Futex {
+                                woke: false,
+                                timed_out: true,
+                            },
+                        );
+                    }
                     ProcessState::Blocked(ProcessBlock::Poll { .. }) => {
                         self.wake_process_with_result(pid, BlockResult::Poll { timed_out: true });
                     }
@@ -1038,6 +1344,13 @@ impl ProcessManager {
                 process.state = ProcessState::Runnable;
                 queue_assigned_cpu = Some(process.assigned_cpu);
             }
+
+            if let ProcessState::Blocked(ProcessBlock::Futex { .. }) = process.state {
+                process.wake_result = Some(BlockResult::SignalInterrupted);
+                unblock_block = Some(process.state);
+                process.state = ProcessState::Runnable;
+                queue_assigned_cpu = Some(process.assigned_cpu);
+            }
         }
         if let Some(assigned_cpu) = queue_assigned_cpu {
             self.enqueue_runnable_pid(pid, assigned_cpu);
@@ -1096,10 +1409,19 @@ impl ProcessManager {
         targets.len()
     }
 
-    pub(crate) fn wake_futex(&mut self, uaddr: u64, bitset: u32, count: usize) -> usize {
-        let mut woke = 0usize;
-        let Some(waiters) = self.blocked_futexes.get(&uaddr).cloned() else {
-            return 0;
+    pub(crate) fn wake_futex(
+        &mut self,
+        key: crate::process::FutexKey,
+        bitset: u32,
+        count: usize,
+    ) -> usize {
+        let mut woke = self.wake_armed_futex_waits(key, bitset, count);
+        if woke >= count {
+            return woke;
+        }
+
+        let Some(waiters) = self.blocked_futexes.get(&key).cloned() else {
+            return woke;
         };
         for pid in waiters {
             if woke >= count {
@@ -1109,20 +1431,24 @@ impl ProcessManager {
                 continue;
             };
             let ProcessState::Blocked(ProcessBlock::Futex {
-                uaddr: wait_uaddr,
+                key: wait_key,
                 bitset: wait_bitset,
+                ..
             }) = state
             else {
                 continue;
             };
-            if wait_uaddr != uaddr || (wait_bitset & bitset) == 0 {
+            if wait_key != key || (wait_bitset & bitset) == 0 {
                 continue;
             }
             self.untrack_blocked_process(pid, state);
             let Some(process) = self.processes.get_mut(&pid) else {
                 continue;
             };
-            process.wake_result = Some(BlockResult::Futex { woke: true });
+            process.wake_result = Some(BlockResult::Futex {
+                woke: true,
+                timed_out: false,
+            });
             process.state = ProcessState::Runnable;
             let assigned_cpu = process.assigned_cpu;
             let _ = process;
@@ -1134,14 +1460,15 @@ impl ProcessManager {
 
     pub(crate) fn requeue_futex(
         &mut self,
-        from: u64,
-        to: u64,
+        from: crate::process::FutexKey,
+        to: crate::process::FutexKey,
         wake_count: usize,
         requeue_count: usize,
         bitset: u32,
     ) -> usize {
         let woke = self.wake_futex(from, bitset, wake_count);
         let mut moved = 0usize;
+        moved += self.requeue_armed_futex_waits(from, to, requeue_count, bitset);
         let Some(waiters) = self.blocked_futexes.get(&from).cloned() else {
             return woke;
         };
@@ -1153,13 +1480,14 @@ impl ProcessManager {
                 continue;
             };
             let ProcessState::Blocked(ProcessBlock::Futex {
-                uaddr,
+                key,
                 bitset: wait_bitset,
+                deadline_nanos,
             }) = state
             else {
                 continue;
             };
-            if uaddr != from || (wait_bitset & bitset) == 0 {
+            if key != from || (wait_bitset & bitset) == 0 {
                 continue;
             }
             self.untrack_blocked_process(pid, state);
@@ -1168,8 +1496,9 @@ impl ProcessManager {
                     continue;
                 };
                 process.state = ProcessState::Blocked(ProcessBlock::Futex {
-                    uaddr: to,
+                    key: to,
                     bitset: wait_bitset,
+                    deadline_nanos,
                 });
                 process.state
             };

@@ -304,7 +304,6 @@ impl TimerFdFile {
         let (old_spec, notify_readable) = {
             let mut registry = REGISTRY.lock();
             let mut state = self.inner.lock();
-            let was_readable = state.ticks != 0;
             let _ =
                 Self::refresh_due_locked(&mut registry, self.id, self.clock, &mut state, now_ns);
 
@@ -319,6 +318,10 @@ impl TimerFdFile {
 
             state.interval_ns = interval_ns;
             state.cancel_on_set = cancel_on_set;
+            // Linux timerfd_settime() resets the pending expiration count, so
+            // the fd only becomes readable for expirations that happen after
+            // the new timer settings take effect.
+            state.ticks = 0;
             state.expires_ns = if value_ns == 0 {
                 0
             } else if absolute {
@@ -341,7 +344,7 @@ impl TimerFdFile {
                 }
             }
 
-            (old, !was_readable && state.ticks != 0)
+            (old, state.ticks != 0)
         };
 
         self.bump();

@@ -285,6 +285,15 @@ impl EpollInstance {
         }
     }
 
+    fn poll_interest_state(interest: &EpollInterest) -> Option<(EpollEvents, u64)> {
+        let poll_events = interest.event.events.to_poll_events() | PollEvents::ALWAYS;
+        let ready = interest.node.poll(poll_events).ok()?;
+        Some((
+            EpollEvents::from_poll_events(ready),
+            interest.node.wait_token(),
+        ))
+    }
+
     fn register_interest_waiter(
         &self,
         fd: u64,
@@ -327,12 +336,9 @@ impl EpollInstance {
             return;
         }
 
-        let poll_events = interest.event.events.to_poll_events() | PollEvents::ALWAYS;
-        let Ok(ready) = interest.node.poll(poll_events) else {
+        let Some((ready_events, token)) = Self::poll_interest_state(interest) else {
             return;
         };
-        let ready_events = EpollEvents::from_poll_events(ready);
-        let token = interest.node.wait_token();
 
         if ready_events.bits() == 0 {
             interest.last_ready = EpollEvents::empty();
@@ -437,39 +443,54 @@ impl EpollInstance {
             return Ok(Vec::new());
         }
 
-        let ready = self.notifier.take_ready(max_events);
-        let mut interests = self.interests.lock();
-        let mut result = Vec::with_capacity(ready.len());
-
-        for (fd, ready_bits) in ready {
-            let Some(interest) = interests.get_mut(&fd) else {
-                continue;
-            };
-            if interest.disabled {
-                continue;
+        let mut result = Vec::with_capacity(max_events);
+        while result.len() < max_events {
+            let ready = self.notifier.take_ready(max_events - result.len());
+            if ready.is_empty() {
+                break;
             }
 
-            let mut final_events = ready_bits;
-            if interest.event.events.contains(EpollEvents::ONESHOT) {
-                final_events.insert(EpollEvents::ONESHOT);
-                Self::unregister_interest_waiter(interest);
-                interest.waiter_id = None;
-                interest.disabled = true;
-            }
-            result.push(EpollEvent::new(final_events, interest.event.data));
+            let mut interests = self.interests.lock();
+            for (fd, _) in ready {
+                let Some(interest) = interests.get_mut(&fd) else {
+                    continue;
+                };
+                if interest.disabled {
+                    continue;
+                }
 
-            if interest.event.events.contains(EpollEvents::ONESHOT) {
-                continue;
-            }
-            if interest.event.events.contains(EpollEvents::ET) {
-                continue;
-            }
+                let Some((current_ready, token)) = Self::poll_interest_state(interest) else {
+                    continue;
+                };
 
-            let poll_events = interest.event.events.to_poll_events() | PollEvents::ALWAYS;
-            if let Ok(still_ready) = interest.node.poll(poll_events) {
-                let still_ready = EpollEvents::from_poll_events(still_ready);
-                if still_ready.bits() != 0 {
-                    self.notifier.mark_ready(fd, still_ready);
+                if current_ready.bits() == 0 {
+                    interest.last_ready = EpollEvents::empty();
+                    interest.last_token = token;
+                    continue;
+                }
+
+                interest.last_ready = current_ready;
+                interest.last_token = token;
+
+                let mut final_events = current_ready;
+                if interest.event.events.contains(EpollEvents::ONESHOT) {
+                    final_events.insert(EpollEvents::ONESHOT);
+                    Self::unregister_interest_waiter(interest);
+                    interest.waiter_id = None;
+                    interest.disabled = true;
+                }
+                result.push(EpollEvent::new(final_events, interest.event.data));
+
+                if interest.event.events.contains(EpollEvents::ONESHOT)
+                    || interest.event.events.contains(EpollEvents::ET)
+                {
+                    if result.len() >= max_events {
+                        break;
+                    }
+                    continue;
+                }
+                if result.len() >= max_events {
+                    break;
                 }
             }
         }

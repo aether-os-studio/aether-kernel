@@ -6,7 +6,7 @@ mod registry;
 
 use crate::arch::ArchContext;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{CloneParams, Pid};
+use crate::process::{CloneParams, FutexKey, Pid};
 use aether_vfs::PollEvents;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -46,8 +46,9 @@ pub enum BlockType {
         deadline_nanos: Option<u64>,
     },
     Futex {
-        uaddr: u64,
+        key: FutexKey,
         bitset: u32,
+        deadline_nanos: Option<u64>,
     },
     SignalSuspend,
     Vfork {
@@ -76,6 +77,7 @@ pub enum BlockResult {
     },
     Futex {
         woke: bool,
+        timed_out: bool,
     },
     SignalInterrupted,
     CompletedValue {

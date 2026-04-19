@@ -8,7 +8,11 @@ impl aether_async::Parker for FrameParker {
     }
 
     fn park(&self) {
-        aether_frame::arch::cpu::wait_for_interrupt();
+        if aether_frame::interrupt::are_enabled() {
+            aether_frame::arch::cpu::wait_for_interrupt();
+        } else {
+            core::hint::spin_loop();
+        }
     }
 }
 

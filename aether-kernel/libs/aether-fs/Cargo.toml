@@ -8,4 +8,4 @@ aether-async = { path = "../aether-async" }
 aether-frame = { path = "../../../aether-frame" }
 aether-vfs = { path = "../aether-vfs" }
 async-trait = { version = "0.1.89", default-features = false }
-ext4plus = { version = "0.1.0-beta.1" }
+ext4plus = { version = "0.1.0-beta.2" }
