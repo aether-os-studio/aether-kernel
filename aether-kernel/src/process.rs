@@ -2,6 +2,7 @@ extern crate alloc;
 
 mod clone;
 mod context;
+mod itimer;
 mod manager;
 mod util;
 
@@ -31,6 +32,11 @@ pub type ProcessBox = Box<KernelProcess>;
 pub(crate) use self::clone::{CloneParams, LinuxCloneArgs};
 pub(crate) use self::context::ProcessSyscallContext;
 pub(crate) use self::context::fd::resolve_at_path;
+pub(crate) use self::itimer::{
+    deadline_due as real_itimer_deadline_due, next_deadline as next_real_itimer_deadline,
+    read_real_timer, set_real_timer, take_expired as take_expired_real_itimers,
+    thread_group_reaped as reap_thread_group_itimer,
+};
 pub(crate) use self::util::anonymous_filesystem_identity;
 pub(crate) use self::util::decode_sigset;
 pub(crate) use self::util::read_iovec_array;

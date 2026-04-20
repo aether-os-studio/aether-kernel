@@ -135,6 +135,10 @@ pub trait KernelSyscallContext {
         new_address: u64,
     ) -> SysResult<u64>;
     fn mincore(&mut self, address: u64, len: u64, vec: u64) -> SysResult<u64>;
+    fn shmget(&mut self, key: i32, size: usize, shmflg: i32) -> SysResult<u64>;
+    fn shmat(&mut self, shmid: i32, shmaddr: u64, shmflg: i32) -> SysResult<u64>;
+    fn shmctl(&mut self, shmid: i32, cmd: i32, buf: u64) -> SysResult<u64>;
+    fn shmdt(&mut self, shmaddr: u64) -> SysResult<u64>;
     fn openat(&mut self, dirfd: i64, path: &str, flags: u64, mode: u64) -> SysResult<u64>;
     fn creat(&mut self, path: &str, mode: u64) -> SysResult<u64>;
     fn link(&mut self, old_path: &str, new_path: &str) -> SysResult<u64>;
@@ -218,6 +222,7 @@ pub trait KernelSyscallContext {
     fn pwritev64(&mut self, fd: u64, iov: u64, iovcnt: usize, offset: u64) -> SysResult<u64>;
     fn fadvise64(&mut self, fd: u64, offset: u64, len: u64, advice: u64) -> SysResult<u64>;
     fn fallocate(&mut self, fd: u64, mode: u64, offset: i64, len: i64) -> SysResult<u64>;
+    fn ftruncate(&mut self, fd: u64, length: u64) -> SysResult<u64>;
     fn ioctl_fd(&mut self, fd: u64, command: u64, argument: u64) -> SysResult<u64>;
     fn flock(&mut self, fd: u64, operation: u64) -> SysResult<u64>;
     fn flock_blocking(&mut self, fd: u64, operation: u64) -> SyscallDisposition;
@@ -325,6 +330,8 @@ pub trait KernelSyscallContext {
         old_value: u64,
     ) -> SysResult<u64>;
     fn timerfd_gettime(&mut self, fd: i32, curr_value: u64) -> SysResult<u64>;
+    fn getitimer(&mut self, which: i32, curr_value: u64) -> SysResult<u64>;
+    fn setitimer(&mut self, which: i32, new_value: u64, old_value: u64) -> SysResult<u64>;
     fn signalfd(&mut self, fd: i32, mask: u64, sigsetsize: usize) -> SysResult<u64>;
     fn signalfd4(&mut self, fd: i32, mask: u64, sigsetsize: usize, flags: u64) -> SysResult<u64>;
     fn inotify_init(&mut self) -> SysResult<u64>;

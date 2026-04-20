@@ -5,6 +5,7 @@ mod image;
 mod inotify;
 mod pidfd;
 mod pty;
+mod shm;
 mod timerfd;
 
 pub use self::abi::{
@@ -20,6 +21,11 @@ pub use self::inotify::{
 };
 pub use self::pidfd::{PidFdFile, PidFdHandle, create_pidfd_node};
 pub use self::pty::{DevPtsFs, DevPtsSlaveFile, PtmxMasterFile};
+pub(crate) use self::shm::{
+    clone_process as clone_sysv_shm_process, register_process as register_sysv_shm_process,
+    replace_process as replace_sysv_shm_process, shmat as sysv_shmat, shmctl as sysv_shmctl,
+    shmdt as sysv_shmdt, shmget as sysv_shmget, unregister_process as unregister_sysv_shm_process,
+};
 pub use self::timerfd::{
     LinuxItimerSpec, TFD_CLOEXEC, TFD_CREATE_FLAGS, TFD_NONBLOCK, TFD_SETTIME_FLAGS, TimerFdFile,
     deadline_due as timerfd_deadline_due, next_wakeup_deadline as next_timerfd_wakeup_deadline,

@@ -24,6 +24,11 @@ pub mod nr {
     pub const PWRITE64: u64 = 18;
     pub const READV: u64 = 19;
     pub const WRITEV: u64 = 20;
+    pub const SHMGET: u64 = 29;
+    pub const SHMAT: u64 = 30;
+    pub const SHMCTL: u64 = 31;
+    pub const GETITIMER: u64 = 36;
+    pub const SETITIMER: u64 = 38;
     pub const MINCORE: u64 = 27;
     pub const MREMAP: u64 = 25;
     pub const SENDFILE: u64 = 40;
@@ -52,8 +57,10 @@ pub mod nr {
     pub const WAIT4: u64 = 61;
     pub const KILL: u64 = 62;
     pub const UNAME: u64 = 63;
+    pub const SHMDT: u64 = 67;
     pub const FLOCK: u64 = 73;
     pub const FCNTL: u64 = 72;
+    pub const FTRUNCATE: u64 = 77;
     pub const GETCWD: u64 = 79;
     pub const CHDIR: u64 = 80;
     pub const FCHDIR: u64 = 81;

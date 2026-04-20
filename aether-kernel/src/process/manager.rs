@@ -935,6 +935,9 @@ impl ProcessManager {
                 state: ProcessState::Runnable,
             }),
         );
+        if let Some(process) = self.processes.get(&pid) {
+            crate::fs::register_sysv_shm_process(process.task.address_space.identity());
+        }
         self.enqueue_runnable_pid(pid, assigned_cpu);
         Ok(pid)
     }
@@ -1363,7 +1366,14 @@ impl ProcessManager {
         let Some(new_task) = process.pending_exec.take() else {
             return false;
         };
+        let old_address_space_id = process.task.address_space.identity();
+        let new_address_space_id = new_task.address_space.identity();
         process.task = new_task;
+        crate::fs::replace_sysv_shm_process(
+            old_address_space_id,
+            new_address_space_id,
+            process.identity.pid as i32,
+        );
         process.mmap_regions.clear();
         process.rseq = None;
         process.signals.prepare_for_exec();
@@ -1460,6 +1470,7 @@ impl ProcessManager {
         if group.is_empty() {
             self.thread_groups.remove(&tgid);
             self.group_exit_status.remove(&tgid);
+            crate::process::reap_thread_group_itimer(tgid);
         }
     }
 
@@ -1500,6 +1511,10 @@ impl ProcessManager {
     }
 
     fn finish_process_exit(&mut self, process: &mut KernelProcess) {
+        crate::fs::unregister_sysv_shm_process(
+            process.task.address_space.identity(),
+            process.identity.pid as i32,
+        );
         self.disarm_futex_wait(process.identity.pid);
         self.cleanup_robust_list(process);
 

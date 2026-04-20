@@ -15,6 +15,8 @@ mod mprotect;
 mod mremap;
 #[path = "memory/munmap.rs"]
 mod munmap;
+#[path = "memory/shm.rs"]
+mod shm;
 
 #[path = "time/clock_getres.rs"]
 mod clock_getres;
@@ -22,8 +24,12 @@ mod clock_getres;
 mod clock_gettime;
 #[path = "time/clock_nanosleep.rs"]
 mod clock_nanosleep;
+#[path = "time/getitimer.rs"]
+mod getitimer;
 #[path = "time/gettimeofday.rs"]
 mod gettimeofday;
+#[path = "time/setitimer.rs"]
+mod setitimer;
 #[path = "time/time.rs"]
 mod time;
 #[path = "time/timerfd.rs"]
@@ -177,6 +183,8 @@ mod flock;
 mod fstat;
 #[path = "fd/fstatfs.rs"]
 mod fstatfs;
+#[path = "fd/ftruncate.rs"]
+mod ftruncate;
 #[path = "fd/getdents64.rs"]
 mod getdents64;
 #[path = "fd/ioctl.rs"]
@@ -396,13 +404,19 @@ pub fn init() {
             clock_getres::ClockGetresSyscall,
             clock_gettime::ClockGettimeSyscall,
             clock_nanosleep::ClockNanosleepSyscall,
+            getitimer::GetitimerSyscall,
             time::TimeSyscall,
+            setitimer::SetitimerSyscall,
             timerfd::TimerfdCreateSyscall,
             timerfd::TimerfdSettimeSyscall,
             timerfd::TimerfdGettimeSyscall,
             iopl::IoplSyscall,
             brk::BrkSyscall,
             mincore::MincoreSyscall,
+            shm::ShmgetSyscall,
+            shm::ShmatSyscall,
+            shm::ShmctlSyscall,
+            shm::ShmdtSyscall,
             chdir::ChdirSyscall,
             chown::ChownSyscall,
             chmod::ChmodSyscall,
@@ -438,6 +452,7 @@ pub fn init() {
             signalfd4::Signalfd4Syscall,
             eventfd::Eventfd2Syscall,
             fallocate::FallocateSyscall,
+            ftruncate::FtruncateSyscall,
             inotify_init::InotifyInitSyscall,
             inotify_init1::InotifyInit1Syscall,
             inotify_add_watch::InotifyAddWatchSyscall,

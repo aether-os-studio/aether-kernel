@@ -27,16 +27,15 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         flags: u64,
     ) -> SysResult<u64> {
         const AT_FDCWD: i64 = -100;
-        const AT_EACCESS: u64 = 0x200;
+        // const AT_EACCESS: u64 = 0x200;
         const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
         const AT_EMPTY_PATH: u64 = 0x1000;
-        const VALID_FLAGS: u64 = AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
         const F_OK: u64 = 0;
         const X_OK: u64 = 1;
         const W_OK: u64 = 2;
         const R_OK: u64 = 4;
 
-        if (flags & !VALID_FLAGS) != 0 || (mode & !(F_OK | X_OK | W_OK | R_OK)) != 0 {
+        if (mode & !(F_OK | X_OK | W_OK | R_OK)) != 0 {
             return Err(SysErr::Inval);
         }
 

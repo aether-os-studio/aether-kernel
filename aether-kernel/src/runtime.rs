@@ -104,7 +104,10 @@ fn runtime_tick_handler() {
     }
     let deadline_nanos = NEXT_TIMER_DEADLINE_NANOS.load(Ordering::Acquire);
     let process_due = deadline_nanos != u64::MAX && time::monotonic_nanos() >= deadline_nanos;
-    if process_due || crate::fs::timerfd_deadline_due() {
+    if process_due
+        || crate::fs::timerfd_deadline_due()
+        || crate::process::real_itimer_deadline_due(time::monotonic_nanos())
+    {
         TIMER_TICK_PENDING.store(true, Ordering::Release);
     }
 }
@@ -138,6 +141,11 @@ impl KernelRuntime {
         let mut processes = self.processes.lock();
         if timer_tick_pending && processes.timer_deadline_due(current_nanos) {
             processes.wake_expired_timers(current_nanos);
+        }
+        if timer_tick_pending {
+            for (tgid, info) in crate::process::take_expired_real_itimers(current_nanos) {
+                let _ = processes.send_signal_thread_group(tgid, info);
+            }
         }
         processes.wake_ready_file_blocks();
     }
@@ -333,12 +341,18 @@ impl KernelRuntime {
                     let next_deadline = {
                         let processes = self.processes.lock();
                         let process_deadline = processes.next_timer_deadline_nanos();
+                        let itimer_deadline = crate::process::next_real_itimer_deadline();
                         let timerfd_deadline = crate::fs::next_timerfd_wakeup_deadline();
                         let drm_deadline = aether_drivers::drm::next_vblank_wakeup_deadline();
-                        [process_deadline, timerfd_deadline, drm_deadline]
-                            .into_iter()
-                            .flatten()
-                            .min()
+                        [
+                            process_deadline,
+                            itimer_deadline,
+                            timerfd_deadline,
+                            drm_deadline,
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .min()
                     };
 
                     aether_frame::interrupt::timer::publish_wakeup_deadline(next_deadline);
@@ -363,7 +377,10 @@ impl KernelRuntime {
                                 let processes = self.processes.lock();
                                 processes.timer_deadline_due(current_nanos)
                             };
-                            if crate::fs::timerfd_deadline_due() || process_timer_due {
+                            if crate::fs::timerfd_deadline_due()
+                                || process_timer_due
+                                || crate::process::real_itimer_deadline_due(current_nanos)
+                            {
                                 TIMER_TICK_PENDING.store(true, Ordering::Release);
                             }
                             continue;
@@ -868,6 +885,11 @@ impl ProcessServices for RuntimeServices<'_> {
             state: ProcessState::Runnable,
         };
 
+        crate::fs::clone_sysv_shm_process(
+            parent.task.address_space.identity(),
+            child.task.address_space.identity(),
+            params.shares_vm(),
+        );
         Ok(self.processes.lock().insert_cloned_process(child))
     }
 

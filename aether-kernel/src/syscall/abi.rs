@@ -24,6 +24,9 @@ pub const CLOCK_BOOTTIME: u64 = 7;
 pub const CLOCK_REALTIME_ALARM: u64 = 8;
 pub const CLOCK_BOOTTIME_ALARM: u64 = 9;
 pub const CLOCK_TAI: u64 = 11;
+pub const ITIMER_REAL: u64 = 0;
+pub const ITIMER_VIRTUAL: u64 = 1;
+pub const ITIMER_PROF: u64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinuxTimespec {
@@ -58,6 +61,100 @@ impl LinuxTimespec {
         Ok((self.tv_sec as u64)
             .saturating_mul(1_000_000_000)
             .saturating_add(self.tv_nsec as u64))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinuxTimeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+impl LinuxTimeval {
+    pub const SIZE: usize = 16;
+
+    pub fn read_from(ctx: &dyn KernelSyscallContext, address: u64) -> SysResult<Self> {
+        let bytes = ctx.read_user_buffer(address, Self::SIZE)?;
+        if bytes.len() != Self::SIZE {
+            return Err(SysErr::Fault);
+        }
+
+        Ok(Self {
+            tv_sec: i64::from_ne_bytes(bytes[..8].try_into().map_err(|_| SysErr::Fault)?),
+            tv_usec: i64::from_ne_bytes(bytes[8..].try_into().map_err(|_| SysErr::Fault)?),
+        })
+    }
+
+    pub fn write_to(self, ctx: &mut dyn KernelSyscallContext, address: u64) -> SysResult<()> {
+        let mut bytes = [0u8; Self::SIZE];
+        bytes[..8].copy_from_slice(&self.tv_sec.to_ne_bytes());
+        bytes[8..].copy_from_slice(&self.tv_usec.to_ne_bytes());
+        ctx.write_user_buffer(address, &bytes)
+    }
+
+    pub fn validate(self) -> SysResult<Self> {
+        if self.tv_sec < 0 || !(0..1_000_000).contains(&self.tv_usec) {
+            return Err(SysErr::Inval);
+        }
+        Ok(self)
+    }
+
+    pub fn total_nanos(self) -> SysResult<u64> {
+        self.validate()?;
+        Ok((self.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add((self.tv_usec as u64).saturating_mul(1_000)))
+    }
+
+    pub fn from_nanos(nanos: u64) -> Self {
+        Self {
+            tv_sec: (nanos / 1_000_000_000) as i64,
+            tv_usec: ((nanos % 1_000_000_000) / 1_000) as i64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinuxItimerval {
+    pub it_interval: LinuxTimeval,
+    pub it_value: LinuxTimeval,
+}
+
+impl LinuxItimerval {
+    pub const SIZE: usize = LinuxTimeval::SIZE * 2;
+
+    pub fn read_from(ctx: &dyn KernelSyscallContext, address: u64) -> SysResult<Self> {
+        let bytes = ctx.read_user_buffer(address, Self::SIZE)?;
+        if bytes.len() != Self::SIZE {
+            return Err(SysErr::Fault);
+        }
+
+        Ok(Self {
+            it_interval: LinuxTimeval {
+                tv_sec: i64::from_ne_bytes(bytes[0..8].try_into().map_err(|_| SysErr::Fault)?),
+                tv_usec: i64::from_ne_bytes(bytes[8..16].try_into().map_err(|_| SysErr::Fault)?),
+            },
+            it_value: LinuxTimeval {
+                tv_sec: i64::from_ne_bytes(bytes[16..24].try_into().map_err(|_| SysErr::Fault)?),
+                tv_usec: i64::from_ne_bytes(bytes[24..32].try_into().map_err(|_| SysErr::Fault)?),
+            },
+        })
+    }
+
+    pub fn write_to(self, ctx: &mut dyn KernelSyscallContext, address: u64) -> SysResult<()> {
+        let mut bytes = [0u8; Self::SIZE];
+        bytes[0..8].copy_from_slice(&self.it_interval.tv_sec.to_ne_bytes());
+        bytes[8..16].copy_from_slice(&self.it_interval.tv_usec.to_ne_bytes());
+        bytes[16..24].copy_from_slice(&self.it_value.tv_sec.to_ne_bytes());
+        bytes[24..32].copy_from_slice(&self.it_value.tv_usec.to_ne_bytes());
+        ctx.write_user_buffer(address, &bytes)
+    }
+
+    pub fn from_nanos(interval_nanos: u64, value_nanos: u64) -> Self {
+        Self {
+            it_interval: LinuxTimeval::from_nanos(interval_nanos),
+            it_value: LinuxTimeval::from_nanos(value_nanos),
+        }
     }
 }
 

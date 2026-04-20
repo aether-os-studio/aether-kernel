@@ -25,11 +25,6 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
     ) -> SysResult<u64> {
         const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
         const AT_EMPTY_PATH: u64 = 0x1000;
-        const VALID_FLAGS: u64 = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
-
-        if (flags & !VALID_FLAGS) != 0 {
-            return Err(SysErr::Inval);
-        }
 
         let node = if (flags & AT_EMPTY_PATH) != 0 && path.is_empty() {
             let descriptor = self.process.files.get(dirfd as u32).ok_or(SysErr::BadFd)?;

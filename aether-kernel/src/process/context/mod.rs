@@ -296,6 +296,18 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     fn mincore(&mut self, address: u64, len: u64, vec: u64) -> SysResult<u64> {
         Self::syscall_mincore(self, address, len, vec)
     }
+    fn shmget(&mut self, key: i32, size: usize, shmflg: i32) -> SysResult<u64> {
+        Self::syscall_shmget(self, key, size, shmflg)
+    }
+    fn shmat(&mut self, shmid: i32, shmaddr: u64, shmflg: i32) -> SysResult<u64> {
+        Self::syscall_shmat(self, shmid, shmaddr, shmflg)
+    }
+    fn shmctl(&mut self, shmid: i32, cmd: i32, buf: u64) -> SysResult<u64> {
+        Self::syscall_shmctl(self, shmid, cmd, buf)
+    }
+    fn shmdt(&mut self, shmaddr: u64) -> SysResult<u64> {
+        Self::syscall_shmdt(self, shmaddr)
+    }
     fn openat(&mut self, dirfd: i64, path: &str, flags: u64, mode: u64) -> SysResult<u64> {
         Self::syscall_openat(self, dirfd, path, flags, mode)
     }
@@ -471,6 +483,9 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     }
     fn fallocate(&mut self, fd: u64, mode: u64, offset: i64, len: i64) -> SysResult<u64> {
         Self::syscall_fallocate(self, fd, mode, offset, len)
+    }
+    fn ftruncate(&mut self, fd: u64, length: u64) -> SysResult<u64> {
+        Self::syscall_ftruncate(self, fd, length)
     }
     fn ioctl_fd(&mut self, fd: u64, command: u64, argument: u64) -> SysResult<u64> {
         Self::syscall_ioctl_fd(self, fd, command, argument)
@@ -681,6 +696,12 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     }
     fn timerfd_gettime(&mut self, fd: i32, curr_value: u64) -> SysResult<u64> {
         Self::syscall_timerfd_gettime(self, fd, curr_value)
+    }
+    fn getitimer(&mut self, which: i32, curr_value: u64) -> SysResult<u64> {
+        Self::syscall_getitimer(self, which, curr_value)
+    }
+    fn setitimer(&mut self, which: i32, new_value: u64, old_value: u64) -> SysResult<u64> {
+        Self::syscall_setitimer(self, which, new_value, old_value)
     }
     fn signalfd(&mut self, fd: i32, mask: u64, sigsetsize: usize) -> SysResult<u64> {
         Self::syscall_signalfd4(self, fd, mask, sigsetsize, 0)
