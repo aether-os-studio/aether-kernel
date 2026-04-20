@@ -29,6 +29,24 @@ pub trait FdSyscallContext {
         sigmask: u64,
         sigsetsize: usize,
     ) -> SyscallDisposition;
+    fn pselect6(
+        &mut self,
+        nfds: i32,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+        timeout: u64,
+        sigmask: u64,
+    ) -> SysResult<u64>;
+    fn pselect6_blocking(
+        &mut self,
+        nfds: i32,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+        timeout: u64,
+        sigmask: u64,
+    ) -> SyscallDisposition;
     fn sendfile(&mut self, out_fd: u64, in_fd: u64, offset: u64, count: usize) -> SysResult<u64>;
     fn sendfile_blocking(
         &mut self,

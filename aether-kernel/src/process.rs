@@ -116,6 +116,7 @@ pub enum ProcessBlock {
 
 pub struct KernelProcess {
     pub identity: ProcessIdentity,
+    pub controlling_terminal: Option<u64>,
     pub pidfd: Arc<PidFdHandle>,
     pub exit_signal: u8,
     pub task: BuiltProcess,
@@ -569,6 +570,12 @@ pub trait ProcessServices {
     fn thread_group_of(&mut self, pid: Pid) -> Option<Pid>;
     fn has_thread_group(&mut self, tgid: Pid) -> bool;
     fn has_process_group(&mut self, process_group: Pid) -> bool;
+    fn setpgid(
+        &mut self,
+        caller: &mut KernelProcess,
+        pid: Pid,
+        process_group: Pid,
+    ) -> SysResult<u64>;
     fn wake_vfork_parent(&mut self, parent_pid: Pid, child_pid: Pid);
     fn send_kernel_signal(&mut self, pid: Pid, signal: crate::signal::SignalInfo) -> bool;
     fn send_process_signal(&mut self, pid: Pid, signal: crate::signal::SignalInfo) -> bool;

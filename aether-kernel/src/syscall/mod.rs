@@ -137,6 +137,7 @@ pub trait KernelSyscallContext {
         flags: u64,
         new_address: u64,
     ) -> SysResult<u64>;
+    fn mincore(&mut self, address: u64, len: u64, vec: u64) -> SysResult<u64>;
     fn openat(&mut self, dirfd: i64, path: &str, flags: u64, mode: u64) -> SysResult<u64>;
     fn creat(&mut self, path: &str, mode: u64) -> SysResult<u64>;
     fn link(&mut self, old_path: &str, new_path: &str) -> SysResult<u64>;
@@ -183,6 +184,24 @@ pub trait KernelSyscallContext {
         timeout: u64,
         sigmask: u64,
         sigsetsize: usize,
+    ) -> SyscallDisposition;
+    fn pselect6(
+        &mut self,
+        nfds: i32,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+        timeout: u64,
+        sigmask: u64,
+    ) -> SysResult<u64>;
+    fn pselect6_blocking(
+        &mut self,
+        nfds: i32,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+        timeout: u64,
+        sigmask: u64,
     ) -> SyscallDisposition;
     fn sendfile(&mut self, out_fd: u64, in_fd: u64, offset: u64, count: usize) -> SysResult<u64>;
     fn sendfile_blocking(
@@ -351,6 +370,8 @@ pub trait KernelSyscallContext {
     fn getresuid(&mut self, ruid: u64, euid: u64, suid: u64) -> SysResult<u64>;
     fn getresgid(&mut self, rgid: u64, egid: u64, sgid: u64) -> SysResult<u64>;
     fn getppid(&self) -> SysResult<u64>;
+    fn getpgrp(&self) -> SysResult<u64>;
+    fn setpgid(&mut self, pid: i32, pgid: i32) -> SysResult<u64>;
     fn getpgid(&self) -> SysResult<u64>;
     fn setsid(&mut self) -> SysResult<u64>;
     fn gettid(&self) -> SysResult<u64>;

@@ -181,6 +181,24 @@ impl ProcessManager {
         None
     }
 
+    fn thread_group_session(&self, tgid: Pid) -> Option<Pid> {
+        let members = self.thread_groups.get(&tgid)?;
+        for pid in members {
+            if let Some(process) = self.processes.get(pid) {
+                return Some(process.identity.session);
+            }
+        }
+        None
+    }
+
+    fn process_group_session(&self, process_group: Pid) -> Option<Pid> {
+        self.thread_groups.keys().copied().find_map(|tgid| {
+            (self.thread_group_process_group(tgid) == Some(process_group))
+                .then(|| self.thread_group_session(tgid))
+                .flatten()
+        })
+    }
+
     fn pick_thread_group_target(&self, tgid: Pid, signal: u8) -> Option<Pid> {
         let members = self.thread_groups.get(&tgid)?;
         let mut fallback = None;
@@ -863,6 +881,7 @@ impl ProcessManager {
             pid,
             Box::new(KernelProcess {
                 identity,
+                controlling_terminal: None,
                 pidfd: PidFdHandle::new(pid),
                 exit_signal: crate::signal::SIGCHLD,
                 task,
@@ -1676,6 +1695,102 @@ impl ProcessManager {
             .keys()
             .copied()
             .any(|tgid| self.thread_group_process_group(tgid) == Some(process_group))
+    }
+
+    pub(crate) fn setpgid(
+        &mut self,
+        caller: &mut KernelProcess,
+        target_pid: Pid,
+        process_group: Pid,
+    ) -> SysResult<u64> {
+        let target_pid = if target_pid == 0 {
+            caller.identity.pid
+        } else {
+            target_pid
+        };
+        let process_group = if process_group == 0 {
+            target_pid
+        } else {
+            process_group
+        };
+
+        if target_pid == caller.identity.pid {
+            if caller.identity.session == caller.identity.pid {
+                return Err(crate::errno::SysErr::Perm);
+            }
+            if process_group != target_pid
+                && process_group != caller.identity.process_group
+                && self.process_group_session(process_group) != Some(caller.identity.session)
+            {
+                return Err(crate::errno::SysErr::Perm);
+            }
+
+            caller.identity.process_group = process_group;
+
+            // TODO: If CLONE_THREAD is exercised heavily, running sibling threads outside the
+            // manager map still need synchronized process-group updates.
+            if let Some(members) = self
+                .thread_groups
+                .get(&caller.identity.thread_group)
+                .cloned()
+            {
+                for pid in members {
+                    if pid == caller.identity.pid {
+                        continue;
+                    }
+                    if let Some(process) = self.processes.get_mut(&pid) {
+                        process.identity.process_group = process_group;
+                    }
+                }
+            }
+            return Ok(0);
+        }
+
+        let target_tgid = self
+            .thread_group_of(target_pid)
+            .ok_or(crate::errno::SysErr::Srch)?;
+        let is_child = self
+            .parent_children
+            .get(&caller.identity.pid)
+            .is_some_and(|children| {
+                children.contains(&target_tgid) || children.contains(&target_pid)
+            });
+        if !is_child {
+            return Err(crate::errno::SysErr::Srch);
+        }
+
+        let Some(members) = self.thread_groups.get(&target_tgid).cloned() else {
+            return Err(crate::errno::SysErr::Srch);
+        };
+
+        let Some(representative) = members.iter().find_map(|pid| self.processes.get(pid)) else {
+            // TODO: Linux allows setpgid() on an eligible child even if it is currently
+            // running. Supporting that here needs scheduler-visible mutable process metadata.
+            return Err(crate::errno::SysErr::Srch);
+        };
+
+        if representative.identity.session != caller.identity.session {
+            return Err(crate::errno::SysErr::Perm);
+        }
+        if representative.identity.session == target_tgid {
+            return Err(crate::errno::SysErr::Perm);
+        }
+        if process_group != target_tgid
+            && process_group != caller.identity.process_group
+            && self.process_group_session(process_group) != Some(caller.identity.session)
+        {
+            return Err(crate::errno::SysErr::Perm);
+        }
+
+        // TODO: Linux returns EACCES if the child already passed through execve(). We do not
+        // track that state separately yet, so this check is still missing.
+        for pid in members {
+            let Some(process) = self.processes.get_mut(&pid) else {
+                return Err(crate::errno::SysErr::Srch);
+            };
+            process.identity.process_group = process_group;
+        }
+        Ok(0)
     }
 
     pub(crate) fn send_signal_thread_group(&mut self, tgid: Pid, info: SignalInfo) -> bool {

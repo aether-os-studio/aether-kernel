@@ -5,6 +5,8 @@ mod iopl;
 
 #[path = "memory/brk.rs"]
 mod brk;
+#[path = "memory/mincore.rs"]
+mod mincore;
 #[path = "memory/mmap.rs"]
 mod mmap;
 #[path = "memory/mprotect.rs"]
@@ -195,6 +197,8 @@ mod ppoll;
 mod pread64;
 #[path = "fd/preadv64.rs"]
 mod preadv64;
+#[path = "fd/pselect6.rs"]
+mod pselect6;
 #[path = "fd/pwrite64.rs"]
 mod pwrite64;
 #[path = "fd/pwritev64.rs"]
@@ -234,6 +238,8 @@ mod geteuid;
 mod getgid;
 #[path = "process/getpgid.rs"]
 mod getpgid;
+#[path = "process/getpgrp.rs"]
+mod getpgrp;
 #[path = "process/getpid.rs"]
 mod getpid;
 #[path = "process/getppid.rs"]
@@ -258,6 +264,8 @@ mod set_tid_address;
 mod setgid;
 #[path = "process/setgroups.rs"]
 mod setgroups;
+#[path = "process/setpgid.rs"]
+mod setpgid;
 #[path = "process/setresgid.rs"]
 mod setresgid;
 #[path = "process/setresuid.rs"]
@@ -373,6 +381,7 @@ pub fn init() {
             geteuid::GeteUidSyscall,
             getegid::GeteGidSyscall,
             getgid::GetGidSyscall,
+            getpgrp::GetPgrpSyscall,
             getpgid::GetPgidSyscall,
             setsid::SetSidSyscall,
             getresgid::GetResGidSyscall,
@@ -388,6 +397,7 @@ pub fn init() {
             timerfd::TimerfdGettimeSyscall,
             iopl::IoplSyscall,
             brk::BrkSyscall,
+            mincore::MincoreSyscall,
             chdir::ChdirSyscall,
             chown::ChownSyscall,
             chmod::ChmodSyscall,
@@ -429,6 +439,7 @@ pub fn init() {
             link::LinkSyscall,
             linkat::LinkAtSyscall,
             poll::PollSyscall,
+            pselect6::Pselect6Syscall,
             ppoll::PpollSyscall,
             sendfile::SendfileSyscall,
             prctl::PrctlSyscall,
@@ -454,6 +465,7 @@ pub fn init() {
             setuid::SetUidSyscall,
             setgid::SetGidSyscall,
             setgroups::SetGroupsSyscall,
+            setpgid::SetPgidSyscall,
             setresuid::SetResUidSyscall,
             setresgid::SetResGidSyscall,
             writev::WritevSyscall,

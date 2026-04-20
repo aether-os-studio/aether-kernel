@@ -3,6 +3,7 @@ extern crate alloc;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::str::FromStr;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -21,6 +22,18 @@ const DEVPTS_NAME_LEN: u64 = 255;
 const PTMX_MAJOR: u32 = 5;
 const PTMX_MINOR: u32 = 2;
 const UNIX98_PTY_SLAVE_MAJOR: u32 = 136;
+const TCXONC: u64 = 0x540a;
+const TCSBRK: u64 = 0x5409;
+const TCSBRKP: u64 = 0x5425;
+const OPOST: u32 = 0o000001;
+const ONLCR: u32 = 0o000004;
+const IXON: u32 = 0o002000;
+const VSTART: usize = 8;
+const VSTOP: usize = 9;
+const TCOOFF: i32 = 0;
+const TCOON: i32 = 1;
+const TCIOFF: i32 = 2;
+const TCION: i32 = 3;
 
 #[derive(Clone)]
 struct PtyShared {
@@ -29,6 +42,8 @@ struct PtyShared {
     locked: Arc<AtomicBool>,
     master_alive: Arc<AtomicBool>,
     slave_open_count: Arc<AtomicU32>,
+    master_output_stopped: Arc<AtomicBool>,
+    slave_output_stopped: Arc<AtomicBool>,
     master_buffer: Arc<SpinLock<VecDeque<u8>, LocalIrqDisabled>>,
     master_version: Arc<AtomicU64>,
     master_waiters: Arc<WaitQueue>,
@@ -42,10 +57,17 @@ impl PtyShared {
             locked: Arc::new(AtomicBool::new(true)),
             master_alive: Arc::new(AtomicBool::new(true)),
             slave_open_count: Arc::new(AtomicU32::new(0)),
+            master_output_stopped: Arc::new(AtomicBool::new(false)),
+            slave_output_stopped: Arc::new(AtomicBool::new(false)),
             master_buffer: Arc::new(SpinLock::new(VecDeque::new())),
             master_version: Arc::new(AtomicU64::new(1)),
             master_waiters: Arc::new(WaitQueue::new()),
         }
+    }
+
+    fn bump_master_waiters(&self, events: PollEvents) {
+        let _ = self.master_version.fetch_add(1, Ordering::AcqRel);
+        self.master_waiters.notify(events);
     }
 
     fn enqueue_master_bytes(&self, bytes: &[u8]) {
@@ -59,8 +81,7 @@ impl PtyShared {
         }
         drop(queue);
 
-        let _ = self.master_version.fetch_add(1, Ordering::AcqRel);
-        self.master_waiters.notify(PollEvents::READ);
+        self.bump_master_waiters(PollEvents::READ);
     }
 
     fn dequeue_master_bytes(&self, buffer: &mut [u8]) -> usize {
@@ -84,15 +105,32 @@ impl PtyShared {
         self.master_alive.load(Ordering::Acquire)
     }
 
+    fn master_output_stopped(&self) -> bool {
+        self.master_output_stopped.load(Ordering::Acquire)
+    }
+
+    fn slave_output_stopped(&self) -> bool {
+        self.slave_output_stopped.load(Ordering::Acquire)
+    }
+
+    fn set_master_output_stopped(&self, stopped: bool) {
+        let previous = self.master_output_stopped.swap(stopped, Ordering::AcqRel);
+        if previous != stopped {
+            self.bump_master_waiters(PollEvents::WRITE);
+        }
+    }
+
+    fn set_slave_output_stopped(&self, stopped: bool) -> bool {
+        self.slave_output_stopped.swap(stopped, Ordering::AcqRel) != stopped
+    }
+
     fn slave_connected(&self) -> bool {
         self.slave_open_count.load(Ordering::Acquire) != 0
     }
 
     fn open_slave(&self) {
         if self.slave_open_count.fetch_add(1, Ordering::AcqRel) == 0 {
-            let _ = self.master_version.fetch_add(1, Ordering::AcqRel);
-            self.master_waiters
-                .notify(PollEvents::WRITE | PollEvents::HUP | PollEvents::RDHUP);
+            self.bump_master_waiters(PollEvents::WRITE | PollEvents::HUP | PollEvents::RDHUP);
         }
     }
 
@@ -111,9 +149,12 @@ impl PtyShared {
             ) {
                 Ok(previous) => {
                     if previous == 1 {
-                        let _ = self.master_version.fetch_add(1, Ordering::AcqRel);
-                        self.master_waiters
-                            .notify(PollEvents::WRITE | PollEvents::HUP | PollEvents::RDHUP);
+                        self.bump_master_waiters(
+                            PollEvents::WRITE
+                                | PollEvents::ERROR
+                                | PollEvents::HUP
+                                | PollEvents::RDHUP,
+                        );
                         self.cleanup_if_unused();
                     }
                     return;
@@ -140,6 +181,23 @@ impl PtyShared {
     }
 }
 
+fn translate_slave_output(termios: aether_terminal::LinuxTermios, bytes: &[u8]) -> Vec<u8> {
+    // TODO: Linux c_oflag handling is broader than OPOST|ONLCR. Extend this once
+    // userspace needs more PTY output transformations.
+    if bytes.is_empty() || (termios.c_oflag & OPOST) == 0 || (termios.c_oflag & ONLCR) == 0 {
+        return bytes.to_vec();
+    }
+
+    let mut translated = Vec::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        if *byte == b'\n' {
+            translated.push(b'\r');
+        }
+        translated.push(*byte);
+    }
+    translated
+}
+
 struct PtySlaveBackend {
     shared: PtyShared,
 }
@@ -151,7 +209,10 @@ impl TtyBackend for PtySlaveBackend {
 
     fn poll_ready(&self, events: PollEvents) -> PollEvents {
         let mut ready = PollEvents::empty();
-        if events.contains(PollEvents::WRITE) && self.shared.master_alive() {
+        if events.contains(PollEvents::WRITE)
+            && self.shared.master_alive()
+            && !self.shared.slave_output_stopped()
+        {
             ready = ready | PollEvents::WRITE;
         }
         ready
@@ -170,6 +231,35 @@ pub struct DevPtsSlaveFile {
 impl DevPtsSlaveFile {
     pub fn tty(&self) -> &TtyFile {
         self.tty.as_ref()
+    }
+
+    fn apply_tcxonc(&self, action: i32) -> FsResult<()> {
+        match action {
+            TCOOFF => {
+                if self.shared.set_slave_output_stopped(true) {
+                    self.tty.notify_events(PollEvents::WRITE);
+                }
+                Ok(())
+            }
+            TCOON => {
+                if self.shared.set_slave_output_stopped(false) {
+                    self.tty.notify_events(PollEvents::WRITE);
+                }
+                Ok(())
+            }
+            TCIOFF | TCION => {
+                if !self.shared.master_alive() {
+                    return Ok(());
+                }
+                let termios = self.tty.termios();
+                if (termios.c_iflag & IXON) != 0 {
+                    let index = if action == TCIOFF { VSTOP } else { VSTART };
+                    self.shared.enqueue_master_bytes(&[termios.c_cc[index]]);
+                }
+                Ok(())
+            }
+            _ => Err(FsError::InvalidInput),
+        }
     }
 }
 
@@ -194,14 +284,32 @@ impl FileOperations for DevPtsSlaveFile {
     }
 
     fn write(&self, offset: usize, buffer: &[u8]) -> FsResult<usize> {
+        let _ = offset;
+        if buffer.is_empty() {
+            return Ok(0);
+        }
         if !self.shared.master_alive() {
             return Err(FsError::Io);
         }
-        self.tty.write(offset, buffer)
+        if self.shared.slave_output_stopped() {
+            return Err(FsError::WouldBlock);
+        }
+
+        let translated = translate_slave_output(self.tty.termios(), buffer);
+        self.shared.enqueue_master_bytes(&translated);
+        Ok(buffer.len())
     }
 
     fn ioctl(&self, command: u64, argument: u64) -> FsResult<IoctlResponse> {
-        self.tty.ioctl(command, argument)
+        match command {
+            TCXONC => {
+                self.apply_tcxonc(argument as i32)?;
+                Ok(IoctlResponse::success())
+            }
+            // TODO: PTY break timing/propagation is still not implemented.
+            TCSBRK | TCSBRKP => Ok(IoctlResponse::success()),
+            _ => self.tty.ioctl(command, argument),
+        }
     }
 
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
@@ -213,12 +321,13 @@ impl FileOperations for DevPtsSlaveFile {
         }
         if events.contains(PollEvents::WRITE)
             && self.shared.master_alive()
+            && !self.shared.slave_output_stopped()
             && tty_ready.contains(PollEvents::WRITE)
         {
             ready = ready | PollEvents::WRITE;
         }
         if !self.shared.master_alive() {
-            ready = ready | PollEvents::HUP | PollEvents::RDHUP;
+            ready = ready | PollEvents::ERROR | PollEvents::HUP | PollEvents::RDHUP;
         }
 
         Ok(ready)
@@ -456,6 +565,38 @@ impl PtmxMasterFile {
     pub fn slave(&self) -> &TtyFile {
         self.slave.as_ref()
     }
+
+    pub fn peer_node(&self) -> Option<NodeRef> {
+        self.shared
+            .manager
+            .upgrade()
+            .and_then(|manager| manager.lookup_slave(self.shared.id))
+    }
+
+    fn apply_tcxonc(&self, action: i32) -> FsResult<()> {
+        match action {
+            TCOOFF => {
+                self.shared.set_master_output_stopped(true);
+                Ok(())
+            }
+            TCOON => {
+                self.shared.set_master_output_stopped(false);
+                Ok(())
+            }
+            TCIOFF | TCION => {
+                if !self.shared.slave_connected() {
+                    return Ok(());
+                }
+                let termios = self.slave.termios();
+                if (termios.c_iflag & IXON) != 0 {
+                    let index = if action == TCIOFF { VSTOP } else { VSTART };
+                    self.slave.receive_bytes(&[termios.c_cc[index]]);
+                }
+                Ok(())
+            }
+            _ => Err(FsError::InvalidInput),
+        }
+    }
 }
 
 impl FileOperations for PtmxMasterFile {
@@ -480,6 +621,12 @@ impl FileOperations for PtmxMasterFile {
     }
 
     fn write(&self, _offset: usize, buffer: &[u8]) -> FsResult<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.shared.master_output_stopped() {
+            return Err(FsError::WouldBlock);
+        }
         if !self.shared.slave_connected() {
             return Err(FsError::Io);
         }
@@ -491,7 +638,22 @@ impl FileOperations for PtmxMasterFile {
     fn release(&self) {
         self.shared.close_master();
         self.slave
-            .notify_events(PollEvents::HUP | PollEvents::RDHUP);
+            .notify_events(PollEvents::ERROR | PollEvents::HUP | PollEvents::RDHUP);
+        self.shared
+            .master_waiters
+            .notify(PollEvents::ERROR | PollEvents::HUP | PollEvents::RDHUP);
+    }
+
+    fn ioctl(&self, command: u64, argument: u64) -> FsResult<IoctlResponse> {
+        match command {
+            TCXONC => {
+                self.apply_tcxonc(argument as i32)?;
+                Ok(IoctlResponse::success())
+            }
+            // TODO: PTY break timing/propagation is still not implemented.
+            TCSBRK | TCSBRKP => Ok(IoctlResponse::success()),
+            _ => Err(FsError::Unsupported),
+        }
     }
 
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {
@@ -500,11 +662,14 @@ impl FileOperations for PtmxMasterFile {
         if events.contains(PollEvents::READ) && self.shared.master_readable() {
             ready = ready | PollEvents::READ;
         }
-        if events.contains(PollEvents::WRITE) && self.shared.slave_connected() {
+        if events.contains(PollEvents::WRITE)
+            && self.shared.slave_connected()
+            && !self.shared.master_output_stopped()
+        {
             ready = ready | PollEvents::WRITE;
         }
         if !self.shared.slave_connected() {
-            ready = ready | PollEvents::HUP | PollEvents::RDHUP;
+            ready = ready | PollEvents::ERROR | PollEvents::HUP | PollEvents::RDHUP;
         }
 
         Ok(ready)

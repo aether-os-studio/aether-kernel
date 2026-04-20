@@ -13,6 +13,8 @@ pub trait ProcessSyscallOps {
     fn getresuid(&mut self, ruid: u64, euid: u64, suid: u64) -> SysResult<u64>;
     fn getresgid(&mut self, rgid: u64, egid: u64, sgid: u64) -> SysResult<u64>;
     fn getppid(&self) -> SysResult<u64>;
+    fn getpgrp(&self) -> SysResult<u64>;
+    fn setpgid(&mut self, pid: i32, pgid: i32) -> SysResult<u64>;
     fn gettid(&self) -> SysResult<u64>;
     fn setuid(&mut self, uid: u64) -> SysResult<u64>;
     fn setgid(&mut self, gid: u64) -> SysResult<u64>;

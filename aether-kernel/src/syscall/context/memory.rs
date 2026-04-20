@@ -21,4 +21,5 @@ pub trait MemorySyscallContext {
         flags: u64,
         new_address: u64,
     ) -> SysResult<u64>;
+    fn mincore(&mut self, address: u64, len: u64, vec: u64) -> SysResult<u64>;
 }

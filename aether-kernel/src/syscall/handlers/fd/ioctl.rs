@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::fs::{DevPtsSlaveFile, PtmxMasterFile};
+use crate::fs::{DevPtsSlaveFile, FileSystemIdentity, PtmxMasterFile};
 use crate::process::{ProcessServices, ProcessSyscallContext};
 use crate::syscall::KernelSyscallContext;
 use crate::syscall::SyscallDisposition;
@@ -22,6 +22,7 @@ const TIOCNOTTY: u64 = 0x5422;
 const TIOCGPTN: u64 = 0x8004_5430;
 const TIOCSPTLCK: u64 = 0x4004_5431;
 const TIOCGPTLCK: u64 = 0x8004_5439;
+const TIOCGPTPEER: u64 = 0x5441;
 const TCFLSH: u64 = 0x540b;
 const TIOCNXCL: u64 = 0x540d;
 const KDSETMODE: u64 = 0x4b3a;
@@ -51,7 +52,8 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         if let Some(ptmx) = file
             .file_ops()
             .and_then(|ops| ops.as_any().downcast_ref::<PtmxMasterFile>())
-            && let Some(result) = self.syscall_ptmx_ioctl(ptmx, command, argument)?
+            && let Some(result) =
+                self.syscall_ptmx_ioctl(ptmx, descriptor.filesystem, command, argument)?
         {
             drop(file);
             return self.finish_ioctl_result(argument, result);
@@ -117,6 +119,9 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         command: u64,
         argument: u64,
     ) -> SysResult<Option<IoctlResponse>> {
+        let tty_id = console.tty_id();
+        let current_session = self.process.identity.session as i32;
+        let current_process_group = self.process.identity.process_group as i32;
         let result = match command {
             TCGETS => Some(IoctlResponse::Data(console.termios().to_bytes().to_vec())),
             TCGETS2 => Some(IoctlResponse::Data(console.termios2().to_bytes().to_vec())),
@@ -138,14 +143,34 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 console.set_termios2(termios);
                 Some(IoctlResponse::success())
             }
-            TIOCGPGRP => Some(IoctlResponse::Data(
-                console.process_group().to_ne_bytes().to_vec(),
-            )),
+            TIOCGPGRP => {
+                if self.process.controlling_terminal != Some(tty_id)
+                    || console.session() != current_session
+                {
+                    return Err(SysErr::NoTty);
+                }
+                Some(IoctlResponse::Data(
+                    console.process_group().to_ne_bytes().to_vec(),
+                ))
+            }
             TIOCSPGRP => {
+                if self.process.controlling_terminal != Some(tty_id)
+                    || console.session() != current_session
+                {
+                    return Err(SysErr::NoTty);
+                }
                 let bytes =
                     self.syscall_read_user_exact_buffer(argument, core::mem::size_of::<i32>())?;
                 let process_group =
                     i32::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| SysErr::Fault)?);
+                if process_group <= 0 {
+                    return Err(SysErr::Inval);
+                }
+                if !self.services.has_process_group(process_group as u32) {
+                    return Err(SysErr::Srch);
+                }
+                // TODO: Linux also verifies that the target process group belongs to the
+                // caller's session before updating the tty foreground process group.
                 console.set_process_group(process_group);
                 Some(IoctlResponse::success())
             }
@@ -159,10 +184,38 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 Some(IoctlResponse::success())
             }
             TIOCSCTTY => {
-                console.set_process_group(self.process.identity.process_group as i32);
+                if self.process.identity.session != self.process.identity.pid {
+                    return Err(SysErr::Perm);
+                }
+                if let Some(controlling_tty) = self.process.controlling_terminal
+                    && controlling_tty != tty_id
+                {
+                    return Err(SysErr::Perm);
+                }
+                if console.session() != 0 && console.session() != current_session {
+                    // TODO: Linux supports stealing the controlling tty in restricted cases
+                    // when the caller passes a non-zero argument and has sufficient privilege.
+                    return Err(SysErr::Perm);
+                }
+
+                self.process.controlling_terminal = Some(tty_id);
+                console.set_session(current_session);
+                console.set_process_group(current_process_group);
                 Some(IoctlResponse::success())
             }
-            TIOCNOTTY => Some(IoctlResponse::success()),
+            TIOCNOTTY => {
+                if self.process.controlling_terminal == Some(tty_id) {
+                    self.process.controlling_terminal = None;
+                    if console.session() == current_session {
+                        // TODO: Linux detaches the controlling tty from the whole session and
+                        // sends SIGHUP/SIGCONT to the foreground process group. We only clear
+                        // the current session's tty ownership state for now.
+                        console.set_session(0);
+                        console.set_process_group(0);
+                    }
+                }
+                Some(IoctlResponse::success())
+            }
             TCFLSH => Some(IoctlResponse::success()),
             TIOCNXCL => Some(IoctlResponse::success()),
             KDSETMODE => {
@@ -196,9 +249,16 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
     fn syscall_ptmx_ioctl(
         &mut self,
         master: &PtmxMasterFile,
+        filesystem: FileSystemIdentity,
         command: u64,
         argument: u64,
     ) -> SysResult<Option<IoctlResponse>> {
+        const O_ACCMODE: u64 = 0o3;
+        const O_NOCTTY: u64 = 0o0000400;
+        const O_NONBLOCK: u64 = 0o0004000;
+        const O_CLOEXEC: u64 = 0o2000000;
+        const PT_PEER_ALLOWED_FLAGS: u64 = O_ACCMODE | O_NOCTTY | O_NONBLOCK | O_CLOEXEC;
+
         let result = match command {
             TIOCGPTN => Some(IoctlResponse::Data(
                 master.pty_number().to_ne_bytes().to_vec(),
@@ -217,6 +277,15 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                     .to_ne_bytes()
                     .to_vec(),
             )),
+            TIOCGPTPEER => {
+                if (argument & !PT_PEER_ALLOWED_FLAGS) != 0 {
+                    return Err(SysErr::Inval);
+                }
+
+                let peer = master.peer_node().ok_or(SysErr::Io)?;
+                let fd = self.open_node(peer, filesystem, None, argument)?;
+                Some(IoctlResponse::None(fd))
+            }
             _ => self.syscall_tty_ioctl(master.slave(), command, argument)?,
         };
         Ok(result)

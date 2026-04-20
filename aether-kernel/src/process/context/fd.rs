@@ -39,6 +39,7 @@ const SOCK_NONBLOCK: u64 = 0o0004000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 const ACCEPT4_FLAGS_MASK: u64 = SOCK_NONBLOCK | SOCK_CLOEXEC;
 const SCM_MAX_FD: usize = 253;
+const FD_SET_LIMIT: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct LinuxPollFd {
@@ -75,6 +76,28 @@ struct PollWaitOptions {
     timeout_nanos: Option<u64>,
     timeout_address: Option<u64>,
     restore_sigmask: Option<SigSet>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LinuxPselectSigmaskArg {
+    sigmask: u64,
+    sigsetsize: usize,
+}
+
+impl LinuxPselectSigmaskArg {
+    const SIZE: usize = 16;
+
+    fn read_from(
+        ctx: &ProcessSyscallContext<'_, impl ProcessServices>,
+        address: u64,
+    ) -> SysResult<Self> {
+        let bytes = ctx.syscall_read_user_exact_buffer(address, Self::SIZE)?;
+        Ok(Self {
+            sigmask: u64::from_ne_bytes(bytes[0..8].try_into().map_err(|_| SysErr::Fault)?),
+            sigsetsize: u64::from_ne_bytes(bytes[8..16].try_into().map_err(|_| SysErr::Fault)?)
+                .min(usize::MAX as u64) as usize,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -258,6 +281,238 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         };
 
         self.poll_wait_loop(fds, poll_fds, options)
+    }
+
+    pub(super) fn syscall_pselect6(
+        &mut self,
+        nfds: i32,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+        timeout: u64,
+        sigmask: u64,
+    ) -> SysResult<u64> {
+        let nfds = usize::try_from(nfds).map_err(|_| SysErr::Inval)?;
+        let mut options = self.parse_ppoll_timeout(timeout)?;
+        options.restore_sigmask = self.parse_pselect6_sigmask(sigmask)?;
+
+        let result = (|| {
+            let (mut read_set, mut write_set, mut except_set) =
+                self.read_select_fd_sets(nfds, readfds, writefds, exceptfds)?;
+            let ready = self.evaluate_select_fd_sets(
+                nfds,
+                read_set.as_mut_slice(),
+                write_set.as_mut_slice(),
+                except_set.as_mut_slice(),
+            )?;
+            self.write_select_fd_sets(
+                readfds,
+                writefds,
+                exceptfds,
+                &read_set,
+                &write_set,
+                &except_set,
+            )?;
+            if ready == 0 {
+                return Err(SysErr::Again);
+            }
+            Ok(ready as u64)
+        })();
+
+        self.restore_poll_wait_state(options.restore_sigmask, options.timeout_address, options);
+        result
+    }
+
+    pub(super) fn syscall_pselect6_blocking(
+        &mut self,
+        nfds: i32,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+        timeout: u64,
+        sigmask: u64,
+    ) -> SyscallDisposition {
+        let nfds = match usize::try_from(nfds) {
+            Ok(nfds) => nfds,
+            Err(_) => return SyscallDisposition::err(SysErr::Inval),
+        };
+        let mut options = match self.parse_ppoll_timeout(timeout) {
+            Ok(options) => options,
+            Err(error) => return SyscallDisposition::err(error),
+        };
+        options.restore_sigmask = match self.parse_pselect6_sigmask(sigmask) {
+            Ok(mask) => mask,
+            Err(error) => return SyscallDisposition::err(error),
+        };
+
+        let (read_set, write_set, except_set) =
+            match self.read_select_fd_sets(nfds, readfds, writefds, exceptfds) {
+                Ok(sets) => sets,
+                Err(error) => {
+                    self.restore_poll_wait_state(
+                        options.restore_sigmask,
+                        options.timeout_address,
+                        options,
+                    );
+                    return SyscallDisposition::err(error);
+                }
+            };
+
+        self.pselect_wait_loop(
+            nfds, readfds, writefds, exceptfds, read_set, write_set, except_set, options,
+        )
+    }
+
+    fn parse_pselect6_sigmask(&mut self, sigmask: u64) -> SysResult<Option<SigSet>> {
+        if sigmask == 0 {
+            return Ok(None);
+        }
+
+        let argument = LinuxPselectSigmaskArg::read_from(self, sigmask)?;
+        if argument.sigmask == 0 {
+            return Ok(None);
+        }
+        self.parse_ppoll_sigmask(argument.sigmask, argument.sigsetsize)
+    }
+
+    fn pselect_wait_loop(
+        &mut self,
+        nfds: usize,
+        readfds_address: u64,
+        writefds_address: u64,
+        exceptfds_address: u64,
+        read_set: Vec<u8>,
+        write_set: Vec<u8>,
+        except_set: Vec<u8>,
+        options: PollWaitOptions,
+    ) -> SyscallDisposition {
+        let registrations =
+            self.collect_select_registrations(nfds, &read_set, &write_set, &except_set);
+
+        loop {
+            let mut current_read_set = read_set.clone();
+            let mut current_write_set = write_set.clone();
+            let mut current_except_set = except_set.clone();
+            let ready = match self.evaluate_select_fd_sets(
+                nfds,
+                current_read_set.as_mut_slice(),
+                current_write_set.as_mut_slice(),
+                current_except_set.as_mut_slice(),
+            ) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    self.restore_poll_wait_state(
+                        options.restore_sigmask,
+                        options.timeout_address,
+                        options,
+                    );
+                    return SyscallDisposition::err(error);
+                }
+            };
+            if let Err(error) = self.write_select_fd_sets(
+                readfds_address,
+                writefds_address,
+                exceptfds_address,
+                &current_read_set,
+                &current_write_set,
+                &current_except_set,
+            ) {
+                self.restore_poll_wait_state(
+                    options.restore_sigmask,
+                    options.timeout_address,
+                    options,
+                );
+                return SyscallDisposition::err(error);
+            }
+            if ready != 0 {
+                self.restore_poll_wait_state(
+                    options.restore_sigmask,
+                    options.timeout_address,
+                    options,
+                );
+                return SyscallDisposition::ok(ready as u64);
+            }
+            if options.timeout_nanos == Some(0) {
+                self.restore_poll_wait_state(
+                    options.restore_sigmask,
+                    options.timeout_address,
+                    options,
+                );
+                return SyscallDisposition::ok(0);
+            }
+            if self
+                .process
+                .signals
+                .has_deliverable(crate::arch::supports_user_handlers())
+            {
+                self.restore_poll_wait_state(
+                    options.restore_sigmask,
+                    options.timeout_address,
+                    options,
+                );
+                return SyscallDisposition::err(SysErr::Intr);
+            }
+
+            match self.wait_poll(options.deadline_nanos, &registrations) {
+                Ok(BlockResult::Poll { timed_out: false }) => {}
+                Ok(BlockResult::Poll { timed_out: true }) => {
+                    let ready = match self.evaluate_select_fd_sets(
+                        nfds,
+                        current_read_set.as_mut_slice(),
+                        current_write_set.as_mut_slice(),
+                        current_except_set.as_mut_slice(),
+                    ) {
+                        Ok(ready) => ready,
+                        Err(error) => {
+                            self.restore_poll_wait_state(
+                                options.restore_sigmask,
+                                options.timeout_address,
+                                options,
+                            );
+                            return SyscallDisposition::err(error);
+                        }
+                    };
+                    if let Err(error) = self.write_select_fd_sets(
+                        readfds_address,
+                        writefds_address,
+                        exceptfds_address,
+                        &current_read_set,
+                        &current_write_set,
+                        &current_except_set,
+                    ) {
+                        self.restore_poll_wait_state(
+                            options.restore_sigmask,
+                            options.timeout_address,
+                            options,
+                        );
+                        return SyscallDisposition::err(error);
+                    }
+                    self.restore_poll_wait_state(
+                        options.restore_sigmask,
+                        options.timeout_address,
+                        options,
+                    );
+                    return SyscallDisposition::ok(ready as u64);
+                }
+                Ok(BlockResult::SignalInterrupted) => {
+                    self.restore_poll_wait_state(
+                        options.restore_sigmask,
+                        options.timeout_address,
+                        options,
+                    );
+                    return SyscallDisposition::err(SysErr::Intr);
+                }
+                Ok(_) => {
+                    self.restore_poll_wait_state(
+                        options.restore_sigmask,
+                        options.timeout_address,
+                        options,
+                    );
+                    return SyscallDisposition::err(SysErr::Intr);
+                }
+                Err(disposition) => return disposition,
+            }
+        }
     }
 
     fn parse_ppoll_timeout(&self, timeout: u64) -> SysResult<PollWaitOptions> {
@@ -892,9 +1147,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
     }
 
     fn read_poll_fds(&self, address: u64, nfds: usize) -> SysResult<Vec<LinuxPollFd>> {
-        const POLLFD_LIMIT: usize = 16 * 1024;
-
-        if nfds > POLLFD_LIMIT {
+        if nfds > FD_SET_LIMIT {
             return Err(SysErr::Inval);
         }
 
@@ -964,6 +1217,142 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 continue;
             };
             registrations.push(crate::process::PendingPollRegistration { fd, events });
+        }
+
+        registrations
+    }
+
+    fn read_select_fd_sets(
+        &self,
+        nfds: usize,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+    ) -> SysResult<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        if nfds > FD_SET_LIMIT {
+            return Err(SysErr::Inval);
+        }
+        let bytes = fd_set_bytes_len(nfds);
+        Ok((
+            self.read_select_fd_set(readfds, bytes)?,
+            self.read_select_fd_set(writefds, bytes)?,
+            self.read_select_fd_set(exceptfds, bytes)?,
+        ))
+    }
+
+    fn read_select_fd_set(&self, address: u64, bytes: usize) -> SysResult<Vec<u8>> {
+        if bytes == 0 || address == 0 {
+            return Ok(vec![0; bytes]);
+        }
+        self.syscall_read_user_exact_buffer(address, bytes)
+    }
+
+    fn write_select_fd_sets(
+        &mut self,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+        read_set: &[u8],
+        write_set: &[u8],
+        except_set: &[u8],
+    ) -> SysResult<()> {
+        self.write_select_fd_set(readfds, read_set)?;
+        self.write_select_fd_set(writefds, write_set)?;
+        self.write_select_fd_set(exceptfds, except_set)?;
+        Ok(())
+    }
+
+    fn write_select_fd_set(&mut self, address: u64, bytes: &[u8]) -> SysResult<()> {
+        if address == 0 || bytes.is_empty() {
+            return Ok(());
+        }
+        self.write_user_buffer(address, bytes)
+    }
+
+    fn evaluate_select_fd_sets(
+        &self,
+        nfds: usize,
+        read_set: &mut [u8],
+        write_set: &mut [u8],
+        except_set: &mut [u8],
+    ) -> SysResult<usize> {
+        let mut ready_count = 0usize;
+        let exceptional_mask =
+            PollEvents::ERROR | PollEvents::HUP | PollEvents::RDHUP | PollEvents::INVALID;
+
+        for fd in 0..nfds {
+            let want_read = fd_set_test(read_set, fd);
+            let want_write = fd_set_test(write_set, fd);
+            let want_except = fd_set_test(except_set, fd);
+            if !want_read && !want_write && !want_except {
+                continue;
+            }
+
+            let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
+            let mut requested = PollEvents::ALWAYS;
+            if want_read {
+                requested = requested | PollEvents::READ;
+            }
+            if want_write {
+                requested = requested | PollEvents::WRITE;
+            }
+
+            let ready = descriptor
+                .file
+                .lock()
+                .poll(requested)
+                .map_err(SysErr::from)?;
+            let read_ready = want_read
+                && (ready.contains(PollEvents::READ) || ready.intersects(exceptional_mask));
+            let write_ready = want_write
+                && (ready.contains(PollEvents::WRITE) || ready.intersects(exceptional_mask));
+            // TODO: Linux exceptfds is driven by POLLPRI-style out-of-band readiness.
+            // PollEvents does not expose that signal yet, so we conservatively clear exceptfds.
+            let except_ready = false && want_except;
+
+            fd_set_assign(read_set, fd, read_ready);
+            fd_set_assign(write_set, fd, write_ready);
+            fd_set_assign(except_set, fd, except_ready);
+
+            if read_ready || write_ready || except_ready {
+                ready_count += 1;
+            }
+        }
+
+        Ok(ready_count)
+    }
+
+    fn collect_select_registrations(
+        &self,
+        nfds: usize,
+        read_set: &[u8],
+        write_set: &[u8],
+        except_set: &[u8],
+    ) -> Vec<crate::process::PendingPollRegistration> {
+        let mut registrations = Vec::new();
+
+        for fd in 0..nfds {
+            let want_read = fd_set_test(read_set, fd);
+            let want_write = fd_set_test(write_set, fd);
+            let want_except = fd_set_test(except_set, fd);
+            if !want_read && !want_write && !want_except {
+                continue;
+            }
+
+            let mut events = PollEvents::ALWAYS;
+            if want_read {
+                events = events | PollEvents::READ;
+            }
+            if want_write {
+                events = events | PollEvents::WRITE;
+            }
+            let Some(_descriptor) = self.process.files.get(fd as u32) else {
+                continue;
+            };
+            registrations.push(crate::process::PendingPollRegistration {
+                fd: fd as u32,
+                events,
+            });
         }
 
         registrations
@@ -1514,6 +1903,29 @@ fn events_to_linux_poll(events: PollEvents) -> i16 {
         result |= POLLRDHUP;
     }
     result
+}
+
+fn fd_set_bytes_len(nfds: usize) -> usize {
+    nfds.div_ceil(8)
+}
+
+fn fd_set_test(bits: &[u8], fd: usize) -> bool {
+    let Some(byte) = bits.get(fd / 8) else {
+        return false;
+    };
+    (*byte & (1u8 << (fd % 8))) != 0
+}
+
+fn fd_set_assign(bits: &mut [u8], fd: usize, value: bool) {
+    let Some(byte) = bits.get_mut(fd / 8) else {
+        return;
+    };
+    let mask = 1u8 << (fd % 8);
+    if value {
+        *byte |= mask;
+    } else {
+        *byte &= !mask;
+    }
 }
 
 pub(crate) fn resolve_at_path(fs: &ProcessFsContext, path: &str) -> alloc::string::String {

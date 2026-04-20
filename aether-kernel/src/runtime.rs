@@ -787,6 +787,7 @@ impl ProcessServices for RuntimeServices<'_> {
                 process_group: parent.identity.process_group,
                 session: parent.identity.session,
             },
+            controlling_terminal: parent.controlling_terminal,
             pidfd,
             exit_signal: if params.thread() {
                 0
@@ -848,6 +849,15 @@ impl ProcessServices for RuntimeServices<'_> {
 
     fn has_process_group(&mut self, process_group: Pid) -> bool {
         self.processes.lock().has_process_group(process_group)
+    }
+
+    fn setpgid(
+        &mut self,
+        caller: &mut KernelProcess,
+        pid: Pid,
+        process_group: Pid,
+    ) -> SysResult<u64> {
+        self.processes.lock().setpgid(caller, pid, process_group)
     }
 
     fn wake_vfork_parent(&mut self, parent_pid: Pid, child_pid: Pid) {

@@ -79,7 +79,9 @@ const ECHOK: u32 = 0o000040;
 const SIGINT: i32 = 2;
 const SIGQUIT: i32 = 3;
 const SIGTSTP: i32 = 20;
+const SIGWINCH: i32 = 28;
 const TTY_INPUT_BUF_SIZE: usize = 1024;
+static NEXT_TTY_ID: AtomicU64 = AtomicU64::new(1);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,6 +427,7 @@ struct ConsoleTtyState {
     termios: LinuxTermios,
     winsize: LinuxWinSize,
     process_group: i32,
+    session: i32,
     tty_mode: i32,
     keyboard_mode: i32,
     vt_mode: LinuxVtMode,
@@ -441,6 +444,7 @@ struct ConsoleTtyState {
 }
 
 struct TtyEndpoint {
+    id: u64,
     backend: Arc<dyn TtyBackend>,
     tty: SpinLock<ConsoleTtyState, LocalIrqDisabled>,
     version: AtomicU64,
@@ -450,11 +454,13 @@ struct TtyEndpoint {
 impl TtyEndpoint {
     fn new(backend: Arc<dyn TtyBackend>, winsize: LinuxWinSize) -> Self {
         Self {
+            id: NEXT_TTY_ID.fetch_add(1, Ordering::Relaxed),
             backend,
             tty: SpinLock::new(ConsoleTtyState {
                 termios: LinuxTermios::linux_default(),
                 winsize,
                 process_group: 0,
+                session: 0,
                 tty_mode: KD_TEXT,
                 keyboard_mode: 0,
                 vt_mode: LinuxVtMode::default(),
@@ -1227,7 +1233,23 @@ impl TtyFile {
     }
 
     pub fn set_winsize(&self, winsize: LinuxWinSize) {
-        self.with_state_mut(|state| state.winsize = winsize);
+        let endpoint = self.endpoint();
+        let process_group = {
+            let mut state = endpoint.tty.lock();
+            if state.winsize == winsize {
+                return;
+            }
+            state.winsize = winsize;
+            state.process_group
+        };
+        endpoint.bump_version();
+        if process_group != 0 {
+            send_process_group_signal(process_group, SIGWINCH);
+        }
+    }
+
+    pub fn tty_id(&self) -> u64 {
+        self.endpoint().id
     }
 
     pub fn process_group(&self) -> i32 {
@@ -1236,6 +1258,14 @@ impl TtyFile {
 
     pub fn set_process_group(&self, process_group: i32) {
         self.with_state_mut(|state| state.process_group = process_group);
+    }
+
+    pub fn session(&self) -> i32 {
+        self.with_state(|state| state.session)
+    }
+
+    pub fn set_session(&self, session: i32) {
+        self.with_state_mut(|state| state.session = session);
     }
 
     pub fn tty_mode(&self) -> i32 {

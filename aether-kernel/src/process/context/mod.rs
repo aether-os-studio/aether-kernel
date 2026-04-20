@@ -268,6 +268,9 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     ) -> SysResult<u64> {
         Self::syscall_mremap(self, old_address, old_size, new_size, flags, new_address)
     }
+    fn mincore(&mut self, address: u64, len: u64, vec: u64) -> SysResult<u64> {
+        Self::syscall_mincore(self, address, len, vec)
+    }
     fn openat(&mut self, dirfd: i64, path: &str, flags: u64, mode: u64) -> SysResult<u64> {
         Self::syscall_openat(self, dirfd, path, flags, mode)
     }
@@ -369,6 +372,28 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
         sigsetsize: usize,
     ) -> crate::syscall::SyscallDisposition {
         Self::syscall_ppoll_blocking(self, fds, nfds, timeout, sigmask, sigsetsize)
+    }
+    fn pselect6(
+        &mut self,
+        nfds: i32,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+        timeout: u64,
+        sigmask: u64,
+    ) -> SysResult<u64> {
+        Self::syscall_pselect6(self, nfds, readfds, writefds, exceptfds, timeout, sigmask)
+    }
+    fn pselect6_blocking(
+        &mut self,
+        nfds: i32,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+        timeout: u64,
+        sigmask: u64,
+    ) -> crate::syscall::SyscallDisposition {
+        Self::syscall_pselect6_blocking(self, nfds, readfds, writefds, exceptfds, timeout, sigmask)
     }
     fn sendfile(&mut self, out_fd: u64, in_fd: u64, offset: u64, count: usize) -> SysResult<u64> {
         Self::syscall_sendfile(self, out_fd, in_fd, offset, count)
@@ -704,6 +729,12 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     }
     fn getgid(&self) -> SysResult<u64> {
         Self::syscall_getgid(self)
+    }
+    fn getpgrp(&self) -> SysResult<u64> {
+        Self::syscall_getpgrp(self)
+    }
+    fn setpgid(&mut self, pid: i32, pgid: i32) -> SysResult<u64> {
+        Self::syscall_setpgid(self, pid, pgid)
     }
     fn getpgid(&self) -> SysResult<u64> {
         Self::syscall_getpgid(self)

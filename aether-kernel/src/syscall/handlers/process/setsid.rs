@@ -18,6 +18,9 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let pid = self.process.identity.pid;
         self.process.identity.process_group = pid;
         self.process.identity.session = pid;
+        // TODO: Linux also detaches the old controlling terminal from the full
+        // session. We currently clear only the caller's inherited association.
+        self.process.controlling_terminal = None;
         Ok(pid as u64)
     }
 }

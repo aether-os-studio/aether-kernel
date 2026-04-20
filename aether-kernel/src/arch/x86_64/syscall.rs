@@ -24,6 +24,7 @@ pub mod nr {
     pub const PWRITE64: u64 = 18;
     pub const READV: u64 = 19;
     pub const WRITEV: u64 = 20;
+    pub const MINCORE: u64 = 27;
     pub const MREMAP: u64 = 25;
     pub const SENDFILE: u64 = 40;
     pub const SOCKET: u64 = 41;
@@ -75,7 +76,9 @@ pub mod nr {
     pub const SETGID: u64 = 106;
     pub const GETEUID: u64 = 107;
     pub const GETEGID: u64 = 108;
+    pub const SETPGID: u64 = 109;
     pub const GETPPID: u64 = 110;
+    pub const GETPGRP: u64 = 111;
     pub const SETSID: u64 = 112;
     pub const SETRESUID: u64 = 117;
     pub const SETGROUPS: u64 = 116;
@@ -121,6 +124,7 @@ pub mod nr {
     pub const READLINKAT: u64 = 267;
     pub const FCHMODAT: u64 = 268;
     pub const FACCESSAT: u64 = 269;
+    pub const PSELECT6: u64 = 270;
     pub const PPOLL: u64 = 271;
     pub const SET_ROBUST_LIST: u64 = 273;
     pub const DUP3: u64 = 292;
