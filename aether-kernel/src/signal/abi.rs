@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::mem::size_of;
 
 pub type SigSet = u64;
 
@@ -45,6 +46,16 @@ pub const SIG_IGN: u64 = 1;
 
 pub const SA_NOCLDSTOP: u64 = 0x0000_0001;
 pub const SA_NOCLDWAIT: u64 = 0x0000_0002;
+pub const SA_SIGINFO: u64 = 0x0000_0004;
+pub const SA_ONSTACK: u64 = 0x0800_0000;
+pub const SA_RESTORER: u64 = 0x0400_0000;
+pub const SA_NODEFER: u64 = 0x4000_0000;
+
+pub const SS_ONSTACK: i32 = 1;
+pub const SS_DISABLE: i32 = 2;
+pub const SS_AUTODISARM: i32 = 0x8000_0000u32 as i32;
+
+pub const MINSIGSTKSZ: u64 = 2048;
 
 pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
@@ -139,6 +150,32 @@ pub fn sigbit(signal: u8) -> SigSet {
     }
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalStack {
+    pub ss_sp: u64,
+    pub ss_flags: i32,
+    pub _pad: i32,
+    pub ss_size: u64,
+}
+
+impl SignalStack {
+    pub const fn disabled() -> Self {
+        Self {
+            ss_sp: 0,
+            ss_flags: SS_DISABLE,
+            _pad: 0,
+            ss_size: 0,
+        }
+    }
+}
+
+impl Default for SignalStack {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
 pub fn parse_sigaction(bytes: &[u8]) -> Option<SignalAction> {
     if bytes.len() < 32 {
         return None;
@@ -161,9 +198,108 @@ pub fn serialize_sigaction(action: SignalAction) -> Vec<u8> {
     bytes
 }
 
+pub fn parse_signal_stack(bytes: &[u8]) -> Option<SignalStack> {
+    if bytes.len() < size_of::<SignalStack>() {
+        return None;
+    }
+
+    Some(SignalStack {
+        ss_sp: read_u64(bytes, 0)?,
+        ss_flags: read_i32(bytes, 8)?,
+        _pad: read_i32(bytes, 12)?,
+        ss_size: read_u64(bytes, 16)?,
+    })
+}
+
+pub fn serialize_signal_stack(stack: SignalStack) -> [u8; size_of::<SignalStack>()] {
+    let mut bytes = [0u8; size_of::<SignalStack>()];
+    bytes[0..8].copy_from_slice(&stack.ss_sp.to_ne_bytes());
+    bytes[8..12].copy_from_slice(&stack.ss_flags.to_ne_bytes());
+    bytes[12..16].copy_from_slice(&stack._pad.to_ne_bytes());
+    bytes[16..24].copy_from_slice(&stack.ss_size.to_ne_bytes());
+    bytes
+}
+
+pub fn signal_stack_base(stack: &SignalStack) -> u64 {
+    stack.ss_sp
+}
+
+pub fn signal_altstack_disable(stack: &mut SignalStack) {
+    *stack = SignalStack::disabled();
+}
+
+pub fn signal_altstack_config_enabled(stack: &SignalStack) -> bool {
+    (stack.ss_flags & SS_DISABLE) == 0 && stack.ss_size > 0
+}
+
+pub fn signal_altstack_contains_sp(stack: &SignalStack, sp: u64) -> bool {
+    if !signal_altstack_config_enabled(stack) {
+        return false;
+    }
+
+    let base = signal_stack_base(stack);
+    let Some(end) = base.checked_add(stack.ss_size) else {
+        return false;
+    };
+    sp >= base && sp < end
+}
+
+pub fn signal_altstack_status_flags(stack: &SignalStack, sp: u64) -> i32 {
+    if !signal_altstack_config_enabled(stack) {
+        return SS_DISABLE;
+    }
+
+    let mut flags = stack.ss_flags & SS_AUTODISARM;
+    if signal_altstack_contains_sp(stack, sp) {
+        flags |= SS_ONSTACK;
+    }
+    flags
+}
+
+pub fn signal_altstack_format_old(stack: &SignalStack, sp: u64) -> SignalStack {
+    let mut formatted = *stack;
+    formatted.ss_flags = signal_altstack_status_flags(stack, sp);
+    formatted
+}
+
+pub fn signal_altstack_validate_new(stack: &SignalStack) -> Result<(), crate::errno::SysErr> {
+    if (stack.ss_flags & SS_DISABLE) != 0 {
+        return Ok(());
+    }
+
+    let allowed_flags = SS_ONSTACK | SS_AUTODISARM;
+    if (stack.ss_flags & !allowed_flags) != 0 {
+        return Err(crate::errno::SysErr::Inval);
+    }
+
+    if stack.ss_size < MINSIGSTKSZ {
+        return Err(crate::errno::SysErr::NoMem);
+    }
+
+    Ok(())
+}
+
+pub fn signal_altstack_store(dst: &mut SignalStack, src: &SignalStack) {
+    if (src.ss_flags & SS_DISABLE) != 0 {
+        signal_altstack_disable(dst);
+        return;
+    }
+
+    *dst = *src;
+    dst.ss_flags &= !SS_ONSTACK;
+    dst.ss_flags &= SS_AUTODISARM;
+}
+
 fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     let raw = bytes.get(offset..offset + 8)?;
     let mut value = [0; 8];
     value.copy_from_slice(raw);
     Some(u64::from_ne_bytes(value))
+}
+
+fn read_i32(bytes: &[u8], offset: usize) -> Option<i32> {
+    let raw = bytes.get(offset..offset + 4)?;
+    let mut value = [0; 4];
+    value.copy_from_slice(raw);
+    Some(i32::from_ne_bytes(value))
 }

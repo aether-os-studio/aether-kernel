@@ -164,6 +164,12 @@ pub(crate) fn with_current_process<R>(
     result
 }
 
+pub(crate) fn resume_kernel_context(context: &KernelContext) {
+    let _ = PROCESSORS.with_mut(current_cpu(), |processor| {
+        aether_frame::process::resume_kernel_context(&mut processor.scheduler_context, context);
+    });
+}
+
 pub(crate) fn enqueue_runnable_pid(pid: Pid, cpu_index: usize) {
     let target_cpu = if PROCESSORS.get(cpu_index).is_ok() {
         cpu_index

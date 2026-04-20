@@ -972,7 +972,7 @@ impl<'ctx, 'proc, S: ProcessServices> DrmUserWriter<'ctx, 'proc, S> {
 }
 
 fn decode_u32_array(bytes: &[u8]) -> SysResult<alloc::vec::Vec<u32>> {
-    if bytes.len() % core::mem::size_of::<u32>() != 0 {
+    if !bytes.len().is_multiple_of(core::mem::size_of::<u32>()) {
         return Err(SysErr::Fault);
     }
     bytes
@@ -986,7 +986,7 @@ fn decode_u32_array(bytes: &[u8]) -> SysResult<alloc::vec::Vec<u32>> {
 }
 
 fn decode_u64_array(bytes: &[u8]) -> SysResult<alloc::vec::Vec<u64>> {
-    if bytes.len() % core::mem::size_of::<u64>() != 0 {
+    if !bytes.len().is_multiple_of(core::mem::size_of::<u64>()) {
         return Err(SysErr::Fault);
     }
     bytes

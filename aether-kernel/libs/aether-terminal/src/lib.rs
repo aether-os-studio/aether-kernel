@@ -328,6 +328,8 @@ pub trait TtyBackend: Send + Sync {
 
     fn deactivate(&self) {}
 
+    fn input_space_available(&self) {}
+
     fn poll_ready(&self, events: PollEvents) -> PollEvents {
         let mut ready = PollEvents::empty();
         if events.contains(PollEvents::WRITE) {
@@ -517,10 +519,19 @@ impl TtyEndpoint {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct TtyReceiveOutcome {
+    consumed: usize,
+    wake_read: bool,
+}
+
+fn tty_pending_input_len(state: &ConsoleTtyState) -> usize {
+    state.input_count as usize + state.canon_count as usize
+}
+
 fn tty_input_enqueue_byte(state: &mut ConsoleTtyState, byte: u8) -> bool {
     if state.input_count as usize >= TTY_INPUT_BUF_SIZE {
-        state.input_head = (state.input_head + 1) % TTY_INPUT_BUF_SIZE as u16;
-        state.input_count -= 1;
+        return false;
     }
 
     state.input_buf[state.input_tail as usize] = byte;
@@ -558,7 +569,10 @@ fn tty_echo_erase(endpoint: &TtyEndpoint, state: &ConsoleTtyState) {
 fn tty_input_commit_canon(state: &mut ConsoleTtyState) -> bool {
     let mut committed = false;
     for index in 0..state.canon_count as usize {
-        committed |= tty_input_enqueue_byte(state, state.canon_buf[index]);
+        if !tty_input_enqueue_byte(state, state.canon_buf[index]) {
+            break;
+        }
+        committed = true;
     }
     state.canon_count = 0;
     committed
@@ -968,13 +982,18 @@ fn write_escape(out: &mut [u8; 8], bytes: &[u8]) -> Option<usize> {
     Some(bytes.len())
 }
 
-fn tty_receive_bytes(endpoint: &TtyEndpoint, state: &mut ConsoleTtyState, bytes: &[u8]) -> bool {
-    let mut wake = false;
+fn tty_receive_bytes(
+    endpoint: &TtyEndpoint,
+    state: &mut ConsoleTtyState,
+    bytes: &[u8],
+) -> TtyReceiveOutcome {
+    let mut outcome = TtyReceiveOutcome::default();
     let canonical = (state.termios.c_lflag & ICANON) != 0;
     let eofc = state.termios.c_cc[VEOF];
 
     for mut byte in bytes.iter().copied() {
         if (state.termios.c_iflag & IGNCR) != 0 && byte == b'\r' {
+            outcome.consumed += 1;
             continue;
         }
         if (state.termios.c_iflag & ICRNL) != 0 && byte == b'\r' {
@@ -986,20 +1005,27 @@ fn tty_receive_bytes(endpoint: &TtyEndpoint, state: &mut ConsoleTtyState, bytes:
         if (state.termios.c_lflag & ISIG) != 0 && state.process_group != 0 {
             if byte == state.termios.c_cc[VINTR] {
                 send_process_group_signal(state.process_group, SIGINT);
+                outcome.consumed += 1;
                 continue;
             }
             if byte == state.termios.c_cc[VQUIT] {
                 send_process_group_signal(state.process_group, SIGQUIT);
+                outcome.consumed += 1;
                 continue;
             }
             if byte == state.termios.c_cc[VSUSP] {
                 send_process_group_signal(state.process_group, SIGTSTP);
+                outcome.consumed += 1;
                 continue;
             }
         }
 
         if !canonical {
-            wake |= tty_input_enqueue_byte(state, byte);
+            if !tty_input_enqueue_byte(state, byte) {
+                break;
+            }
+            outcome.consumed += 1;
+            outcome.wake_read = true;
             tty_echo_bytes(endpoint, state, &[byte]);
             continue;
         }
@@ -1009,6 +1035,7 @@ fn tty_receive_bytes(endpoint: &TtyEndpoint, state: &mut ConsoleTtyState, bytes:
                 state.canon_count -= 1;
                 tty_echo_erase(endpoint, state);
             }
+            outcome.consumed += 1;
             continue;
         }
 
@@ -1020,26 +1047,30 @@ fn tty_receive_bytes(endpoint: &TtyEndpoint, state: &mut ConsoleTtyState, bytes:
             if (state.termios.c_lflag & ECHOK) != 0 {
                 tty_echo_bytes(endpoint, state, b"\n");
             }
+            outcome.consumed += 1;
             continue;
         }
 
         if byte == eofc {
-            wake |= tty_input_commit_canon(state);
+            outcome.consumed += 1;
+            outcome.wake_read |= tty_input_commit_canon(state);
             continue;
         }
 
-        if (state.canon_count as usize) < TTY_INPUT_BUF_SIZE {
-            state.canon_buf[state.canon_count as usize] = byte;
-            state.canon_count += 1;
+        if tty_pending_input_len(state) >= TTY_INPUT_BUF_SIZE {
+            break;
         }
+        state.canon_buf[state.canon_count as usize] = byte;
+        state.canon_count += 1;
+        outcome.consumed += 1;
         tty_echo_bytes(endpoint, state, &[byte]);
 
         if byte == b'\n' || byte == state.termios.c_cc[VEOL] {
-            wake |= tty_input_commit_canon(state);
+            outcome.wake_read |= tty_input_commit_canon(state);
         }
     }
 
-    wake
+    outcome
 }
 
 pub struct VirtualTerminalGroup {
@@ -1189,20 +1220,25 @@ impl TtyFile {
     }
 
     pub fn receive_bytes(&self, bytes: &[u8]) {
+        let _ = self.try_receive_bytes(bytes);
+    }
+
+    pub fn try_receive_bytes(&self, bytes: &[u8]) -> usize {
         if bytes.is_empty() {
-            return;
+            return 0;
         }
 
         let endpoint = self.endpoint();
-        let wake = {
+        let outcome = {
             let mut state = endpoint.tty.lock();
             tty_receive_bytes(&endpoint, &mut state, bytes)
         };
 
-        if wake {
+        if outcome.wake_read {
             endpoint.bump_version();
             endpoint.waiters.notify(PollEvents::READ);
         }
+        outcome.consumed
     }
 
     pub fn notify_events(&self, events: PollEvents) {
@@ -1227,6 +1263,10 @@ impl TtyFile {
         self.with_state(|state| state.input_count as usize)
     }
 
+    pub fn input_writable(&self) -> bool {
+        self.with_state(|state| tty_pending_input_len(state) < TTY_INPUT_BUF_SIZE)
+    }
+
     pub fn flush_input(&self) {
         let endpoint = self.endpoint();
         {
@@ -1236,6 +1276,7 @@ impl TtyFile {
             state.input_count = 0;
             state.canon_count = 0;
         }
+        endpoint.backend.input_space_available();
         endpoint.bump_version();
         endpoint.waiters.notify(PollEvents::READ);
     }
@@ -1349,26 +1390,26 @@ impl TtyFile {
         }
 
         let endpoint = self.endpoint();
-        let wake = {
+        let outcome = {
             let mut state = endpoint.tty.lock();
             match event.code {
                 KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
                     state.key_shift = event.value != 0;
-                    false
+                    TtyReceiveOutcome::default()
                 }
                 KEY_LEFTCTRL | KEY_RIGHTCTRL => {
                     state.key_ctrl = event.value != 0;
-                    false
+                    TtyReceiveOutcome::default()
                 }
                 KEY_LEFTALT | KEY_RIGHTALT => {
                     state.key_alt = event.value != 0;
-                    false
+                    TtyReceiveOutcome::default()
                 }
                 KEY_CAPSLOCK => {
                     if event.value == 1 {
                         state.key_capslock = !state.key_capslock;
                     }
-                    false
+                    TtyReceiveOutcome::default()
                 }
                 _ => {
                     if event.value == 0 {
@@ -1383,7 +1424,7 @@ impl TtyFile {
             }
         };
 
-        if wake {
+        if outcome.wake_read {
             endpoint.bump_version();
             endpoint.waiters.notify(PollEvents::READ);
         }
@@ -1426,6 +1467,7 @@ impl FileOperations for TtyFile {
         }
 
         if read != 0 {
+            endpoint.backend.input_space_available();
             endpoint.bump_version();
         }
         Ok(read)

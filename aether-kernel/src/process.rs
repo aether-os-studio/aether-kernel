@@ -24,7 +24,7 @@ use crate::errno::SysResult;
 use crate::fs::{FdTable, FileSystemIdentity, LinuxStatFs, PidFdHandle};
 use crate::rootfs::ProcessFsContext;
 use crate::signal::SignalState;
-use crate::syscall::{BlockResult, SyscallArgs};
+use crate::syscall::{BlockResult, SyscallArgs, SyscallDisposition};
 
 pub type Pid = u32;
 pub type ProcessBox = Box<KernelProcess>;
@@ -129,6 +129,8 @@ pub struct KernelProcess {
     pub kernel_cpu: Option<usize>,
     pub pending_exec: Option<BuiltProcess>,
     pub pending_syscall: Option<PendingSyscall>,
+    pub completed_syscall: Option<CompletedSyscall>,
+    pub pending_block: Option<crate::syscall::BlockType>,
     pub pending_syscall_name: &'static str,
     pub pending_file_waits: Vec<PendingPollRegistration>,
     pub mmap_regions: Vec<MmapRegion>,
@@ -136,6 +138,7 @@ pub struct KernelProcess {
     pub set_child_tid: Option<u64>,
     pub robust_list_head: Option<u64>,
     pub robust_list_len: u64,
+    pub rseq: Option<RseqState>,
     pub clear_child_tid: Option<u64>,
     pub files: FdTable,
     pub fs: ProcessFsContext,
@@ -143,6 +146,14 @@ pub struct KernelProcess {
     pub signals: SignalState,
     pub wake_result: Option<BlockResult>,
     pub state: ProcessState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RseqState {
+    pub area: u64,
+    pub len: u64,
+    pub signature: u32,
+    pub cpu_id: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +180,8 @@ pub struct MmapRegion {
 }
 
 impl KernelProcess {
+    pub const RSEQ_AREA_LEN: u64 = 32;
+
     pub const fn is_thread(&self) -> bool {
         self.identity.thread_group != self.identity.pid
     }
@@ -250,10 +263,42 @@ impl KernelProcess {
         self.mmap_regions = merged;
     }
 
+    fn merge_mmap_region_neighbors_around(&mut self, mut index: usize) {
+        if self.mmap_regions.is_empty() {
+            return;
+        }
+
+        while index > 0
+            && Self::mmap_backing_is_mergeable(
+                &self.mmap_regions[index - 1],
+                &self.mmap_regions[index],
+            )
+        {
+            let end = self.mmap_regions[index].end;
+            self.mmap_regions[index - 1].end = end;
+            self.mmap_regions.remove(index);
+            index -= 1;
+        }
+
+        while index + 1 < self.mmap_regions.len()
+            && Self::mmap_backing_is_mergeable(
+                &self.mmap_regions[index],
+                &self.mmap_regions[index + 1],
+            )
+        {
+            let end = self.mmap_regions[index + 1].end;
+            self.mmap_regions[index].end = end;
+            self.mmap_regions.remove(index + 1);
+        }
+    }
+
     pub fn covering_mmap_region(&self, start: u64, end: u64) -> Option<&MmapRegion> {
-        self.mmap_regions
-            .iter()
-            .find(|region| start >= region.start && end <= region.end)
+        let index = self
+            .mmap_regions
+            .partition_point(|region| region.start <= start);
+        (index > 0)
+            .then_some(&self.mmap_regions[index - 1])
+            .filter(|region| end <= region.end)
     }
 
     pub fn slice_mmap_region(&self, start: u64, end: u64) -> Option<MmapRegion> {
@@ -294,7 +339,7 @@ impl KernelProcess {
             .binary_search_by_key(&region.start, |existing| existing.start)
             .unwrap_or_else(|index| index);
         self.mmap_regions.insert(index, region);
-        self.coalesce_mmap_regions();
+        self.merge_mmap_region_neighbors_around(index);
     }
 
     pub fn update_mmap_region_flags(&mut self, start: u64, end: u64, page_flags: MapFlags) {
@@ -460,6 +505,7 @@ pub enum DispatchWork {
     Idle,
     Event(ScheduleEvent),
     Process(ProcessBox),
+    KernelContinuation(ProcessBox),
     KernelSyscall(ProcessBox),
 }
 
@@ -467,6 +513,13 @@ pub enum DispatchWork {
 pub struct PendingSyscall {
     pub number: u64,
     pub args: SyscallArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletedSyscall {
+    pub number: u64,
+    pub name: &'static str,
+    pub disposition: SyscallDisposition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

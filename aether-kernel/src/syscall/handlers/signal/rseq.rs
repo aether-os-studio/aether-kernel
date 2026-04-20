@@ -17,14 +17,14 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         flags: u64,
         _signature: u64,
     ) -> SysResult<u64> {
-        const RSEQ_AREA_LEN: u64 = 32;
-
-        if flags != 0 || len != RSEQ_AREA_LEN {
+        if len != crate::process::KernelProcess::RSEQ_AREA_LEN {
             return Err(SysErr::Inval);
         }
 
-        // Proper rseq support needs per-thread registration plus scheduler-assisted CPU-id
-        // updates. Until that exists, advertise the feature as unavailable.
+        if flags != 0 {
+            return Err(SysErr::Inval);
+        }
+
         Err(SysErr::NoSys)
     }
 }

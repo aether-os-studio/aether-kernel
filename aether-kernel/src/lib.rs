@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 #![forbid(unsafe_code)]
 #![feature(alloc_error_handler)]
 

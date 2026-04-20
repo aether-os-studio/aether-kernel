@@ -24,6 +24,34 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             .clone();
         let segments =
             read_iovec_array(&self.process.task.address_space, iov, iovcnt.min(IOV_MAX))?;
+
+        if let Ok((_file_ref, socket)) = self.socket_from_fd(fd) {
+            let mut total = 0usize;
+            for segment in &segments {
+                if segment.len == 0 {
+                    continue;
+                }
+                let bytes = self.read_user_buffer(segment.base, segment.len)?;
+                match socket.send_to_socket(bytes.as_slice(), None, 0, None) {
+                    Ok(written) => {
+                        total = total.saturating_add(written);
+                        if written < bytes.len() {
+                            break;
+                        }
+                    }
+                    Err(SysErr::Again) if total != 0 => break,
+                    Err(error) => {
+                        return if total != 0 {
+                            Ok(total as u64)
+                        } else {
+                            Err(error)
+                        };
+                    }
+                }
+            }
+            return Ok(total as u64);
+        }
+
         let mut total = 0usize;
 
         for segment in segments {

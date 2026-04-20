@@ -1001,7 +1001,7 @@ fn validate_block_shape(
     if len == 0 {
         return Err("block length cannot be zero");
     }
-    if start % len != 0 {
+    if !start.is_multiple_of(len) {
         return Err("block is not aligned to its order");
     }
     if block_fits_usable_ranges(start, len, usable_ranges) {
@@ -1086,7 +1086,7 @@ const fn high_watermark(order: usize) -> usize {
 
 fn max_fit_order(start: usize, remaining: usize, max_order: usize) -> usize {
     let mut order = floor_log2(remaining).min(max_order);
-    while order > 0 && start % block_size(order) != 0 {
+    while order > 0 && !start.is_multiple_of(block_size(order)) {
         order -= 1;
     }
     order

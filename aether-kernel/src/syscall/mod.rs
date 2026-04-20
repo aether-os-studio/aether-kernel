@@ -90,7 +90,6 @@ pub enum BlockResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyscallDisposition {
     Return(SysResult<u64>),
-    Block(BlockType),
     Exit(i32),
     ExitGroup(i32),
 }
@@ -102,10 +101,6 @@ impl SyscallDisposition {
 
     pub fn err(error: SysErr) -> Self {
         Self::Return(Err(error))
-    }
-
-    pub fn block(block_type: BlockType) -> Self {
-        Self::Block(block_type)
     }
 }
 
@@ -415,6 +410,7 @@ pub trait KernelSyscallContext {
     fn rt_sigsuspend(&mut self, mask: u64, sigsetsize: u64) -> SysResult<u64>;
     fn rt_sigsuspend_blocking(&mut self, mask: u64, sigsetsize: u64) -> SyscallDisposition;
     fn rt_sigreturn(&mut self) -> SysResult<u64>;
+    fn sigaltstack(&mut self, uss: u64, uoss: u64) -> SysResult<u64>;
     fn fork(&mut self, flags: u64) -> SysResult<u64>;
     fn vfork_blocking(&mut self) -> SyscallDisposition;
     fn clone_process(&mut self, params: CloneParams) -> SysResult<u64>;
@@ -577,14 +573,13 @@ pub fn dispatch(
     args: SyscallArgs,
 ) -> SyscallDispatch {
     registry::dispatch(number, context, args)
-        .map(|dispatch| {
+        .inspect(|dispatch| {
             if matches!(
                 dispatch.disposition,
                 SyscallDisposition::Return(Err(SysErr::NoSys))
             ) {
                 context.log_unimplemented(number, dispatch.name, args);
             }
-            dispatch
         })
         .unwrap_or_else(|| {
             context.log_unimplemented(number, "unknown", args);

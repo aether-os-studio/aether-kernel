@@ -93,10 +93,6 @@ impl<S> ProcessSyscallContext<'_, S> {
             .ok_or(SysErr::BadFd)
     }
 
-    fn block_current_syscall(&mut self, block: BlockType) -> SyscallDisposition {
-        SyscallDisposition::block(block)
-    }
-
     fn take_wake_result_or_block(
         &mut self,
         block: BlockType,
@@ -104,7 +100,7 @@ impl<S> ProcessSyscallContext<'_, S> {
         if let Some(result) = self.process.wake_result.take() {
             return Ok(result);
         }
-        Err(self.block_current_syscall(block))
+        Ok(self.wait_with_kernel_continuation(block))
     }
 
     pub(crate) fn wait_file(
@@ -128,7 +124,9 @@ impl<S> ProcessSyscallContext<'_, S> {
         self.process
             .pending_file_waits
             .extend_from_slice(registrations);
-        Err(self.block_current_syscall(BlockType::Poll { deadline_nanos }))
+        let result = self.wait_with_kernel_continuation(BlockType::Poll { deadline_nanos });
+        self.process.pending_file_waits.clear();
+        Ok(result)
     }
 
     pub(crate) fn wait_timer(
@@ -182,6 +180,29 @@ impl<S> ProcessSyscallContext<'_, S> {
 
     pub(crate) fn wait_signal_suspend(&mut self) -> Result<BlockResult, SyscallDisposition> {
         self.take_wake_result_or_block(BlockType::SignalSuspend)
+    }
+
+    pub(crate) fn wait_with_kernel_continuation(&mut self, block: BlockType) -> BlockResult {
+        if let Some(result) = self.process.wake_result.take() {
+            return result;
+        }
+
+        let _ = self
+            .process
+            .pending_syscall
+            .expect("kernel continuation wait requires a pending syscall");
+        self.process.pending_block = Some(block);
+        let context = self
+            .process
+            .kernel_context
+            .as_mut()
+            .expect("kernel continuation wait requires an active kernel context");
+        aether_frame::process::switch_to_scheduler(context);
+
+        self.process
+            .wake_result
+            .take()
+            .unwrap_or(BlockResult::SignalInterrupted)
     }
 
     pub(crate) fn file_blocking_syscall<F>(
@@ -849,6 +870,9 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     }
     fn rt_sigreturn(&mut self) -> SysResult<u64> {
         Self::syscall_rt_sigreturn(self)
+    }
+    fn sigaltstack(&mut self, uss: u64, uoss: u64) -> SysResult<u64> {
+        Self::syscall_sigaltstack(self, uss, uoss)
     }
     fn fork(&mut self, flags: u64) -> SysResult<u64> {
         Self::syscall_fork(self, flags)

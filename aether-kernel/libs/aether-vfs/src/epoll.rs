@@ -5,8 +5,8 @@ use alloc::vec::Vec;
 use aether_frame::libs::spin::{LocalIrqDisabled, SpinLock};
 
 use crate::{
-    FileOperations, FsError, FsResult, NodeRef, PollEvents, SharedWaitListener, WaitListener,
-    WaitQueue,
+    FileOperations, FsError, FsResult, PollEvents, SharedOpenFile, SharedWaitListener,
+    WaitListener, WaitQueue,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -180,16 +180,16 @@ impl EpollEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EpollCtlOp {
     Add = 1,
-    Mod = 2,
-    Del = 3,
+    Del = 2,
+    Mod = 3,
 }
 
 impl EpollCtlOp {
     pub const fn from_raw(raw: i32) -> Option<Self> {
         match raw {
             1 => Some(Self::Add),
-            2 => Some(Self::Mod),
-            3 => Some(Self::Del),
+            2 => Some(Self::Del),
+            3 => Some(Self::Mod),
             _ => None,
         }
     }
@@ -258,7 +258,7 @@ impl WaitListener for EpollTargetListener {
 }
 
 struct EpollInterest {
-    node: NodeRef,
+    file: SharedOpenFile,
     event: EpollEvent,
     waiter_id: Option<u64>,
     last_ready: EpollEvents,
@@ -287,17 +287,17 @@ impl EpollInstance {
 
     fn poll_interest_state(interest: &EpollInterest) -> Option<(EpollEvents, u64)> {
         let poll_events = interest.event.events.to_poll_events() | PollEvents::ALWAYS;
-        let ready = interest.node.poll(poll_events).ok()?;
-        Some((
-            EpollEvents::from_poll_events(ready),
-            interest.node.wait_token(),
-        ))
+        let file = interest.file.lock();
+        let ready = file.poll(poll_events).ok()?;
+        let token = file.wait_token();
+        drop(file);
+        Some((EpollEvents::from_poll_events(ready), token))
     }
 
     fn register_interest_waiter(
         &self,
         fd: u64,
-        node: &NodeRef,
+        file: &SharedOpenFile,
         event: EpollEvent,
     ) -> FsResult<Option<u64>> {
         let poll_events = event.events.to_poll_events();
@@ -306,14 +306,16 @@ impl EpollInstance {
         }
         let wait_events = poll_events | PollEvents::ALWAYS;
 
-        let file = node.file().ok_or(FsError::NotFile)?;
         let listener: SharedWaitListener = Arc::new(EpollTargetListener {
             fd,
             notifier: self.notifier.clone(),
         });
-        let waiter_id = file.register_waiter(wait_events, listener)?;
+        let waiter_id = {
+            let file = file.lock();
+            file.register_waiter(wait_events, listener)?
+        };
 
-        if let Ok(ready) = node.poll(wait_events) {
+        if let Ok(ready) = file.lock().poll(wait_events) {
             let ready = EpollEvents::from_poll_events(ready);
             if ready.bits() != 0 {
                 self.notifier.mark_ready(fd, ready);
@@ -324,9 +326,8 @@ impl EpollInstance {
     }
 
     fn unregister_interest_waiter(interest: &EpollInterest) {
-        if let Some(waiter_id) = interest.waiter_id
-            && let Some(file) = interest.node.file()
-        {
+        if let Some(waiter_id) = interest.waiter_id {
+            let file = interest.file.lock();
             let _ = file.unregister_waiter(waiter_id);
         }
     }
@@ -386,7 +387,13 @@ impl EpollInstance {
         self.notifier.has_pending()
     }
 
-    pub fn ctl(&self, op: EpollCtlOp, fd: u64, node: NodeRef, event: EpollEvent) -> FsResult<()> {
+    pub fn ctl(
+        &self,
+        op: EpollCtlOp,
+        fd: u64,
+        file: SharedOpenFile,
+        event: EpollEvent,
+    ) -> FsResult<()> {
         let mut interests = self.interests.lock();
 
         match op {
@@ -394,11 +401,11 @@ impl EpollInstance {
                 if interests.contains_key(&fd) {
                     return Err(FsError::AlreadyExists);
                 }
-                let waiter_id = self.register_interest_waiter(fd, &node, event)?;
+                let waiter_id = self.register_interest_waiter(fd, &file, event)?;
                 interests.insert(
                     fd,
                     EpollInterest {
-                        node,
+                        file,
                         event,
                         waiter_id,
                         last_ready: EpollEvents::empty(),
@@ -411,11 +418,11 @@ impl EpollInstance {
                 let old = interests.remove(&fd).ok_or(FsError::NotFound)?;
                 Self::unregister_interest_waiter(&old);
                 let _ = self.notifier.ready.lock().remove(&fd);
-                let waiter_id = self.register_interest_waiter(fd, &node, event)?;
+                let waiter_id = self.register_interest_waiter(fd, &file, event)?;
                 interests.insert(
                     fd,
                     EpollInterest {
-                        node,
+                        file,
                         event,
                         waiter_id,
                         last_ready: EpollEvents::empty(),
@@ -510,6 +517,33 @@ impl EpollInstance {
 impl Default for EpollInstance {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EpollCtlOp, EpollData, EpollEvent, EpollEvents};
+
+    #[test]
+    fn epoll_ctl_op_numbers_match_linux() {
+        assert_eq!(EpollCtlOp::from_raw(1), Some(EpollCtlOp::Add));
+        assert_eq!(EpollCtlOp::from_raw(2), Some(EpollCtlOp::Del));
+        assert_eq!(EpollCtlOp::from_raw(3), Some(EpollCtlOp::Mod));
+        assert_eq!(EpollCtlOp::from_raw(4), None);
+    }
+
+    #[test]
+    fn epoll_event_bytes_roundtrip_preserves_user_data() {
+        let event = EpollEvent::new(
+            EpollEvents::from_bits(EpollEvents::IN | EpollEvents::ET | EpollEvents::ONESHOT),
+            EpollData::from_u64(0x0123_4567_89ab_cdef),
+        );
+
+        let encoded = event.to_bytes();
+        let decoded = EpollEvent::from_bytes(&encoded);
+
+        assert_eq!(decoded.events.bits(), event.events.bits());
+        assert_eq!(decoded.data.as_u64(), event.data.as_u64());
     }
 }
 

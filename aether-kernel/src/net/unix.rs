@@ -21,6 +21,7 @@ use crate::errno::{SysErr, SysResult};
 use crate::fs::FileDescriptor;
 
 const AF_UNIX: i32 = 1;
+const FIONREAD: u64 = 0x541b;
 const SOCK_STREAM: u32 = 1;
 const SOCK_DGRAM: u32 = 2;
 const SOCK_SEQPACKET: u32 = 5;
@@ -347,6 +348,17 @@ impl UnixSocket {
         Self::local_name_locked(&self.state.lock())
     }
 
+    fn queued_read_len_locked(&self, state: &UnixSocketState) -> usize {
+        if self.is_stream_like() {
+            state.recv_size
+        } else {
+            state
+                .recv_packets
+                .front()
+                .map_or(0, |packet| packet.data.len())
+        }
+    }
+
     fn peer_name_bytes(&self) -> SysResult<Vec<u8>> {
         let peer = self.peer().ok_or(SysErr::NotConn)?;
         Ok(Self::local_name_locked(&peer.state.lock()))
@@ -459,8 +471,12 @@ impl UnixSocket {
                 return true;
             }
             snapshot.recv_stream_nonempty || self.stream_peer_eof_snapshot(snapshot)
+        } else if snapshot.recv_packets_nonempty {
+            true
+        } else if snapshot.established {
+            Self::peer_from_snapshot(snapshot).is_none_or(|peer| peer.state.lock().shut_wr)
         } else {
-            snapshot.recv_packets_nonempty
+            false
         }
     }
 
@@ -469,7 +485,7 @@ impl UnixSocket {
             return false;
         }
         if snapshot.listening {
-            return false;
+            return snapshot.backlog_len < snapshot.backlog_limit;
         }
         if self.kind == SOCK_DGRAM && snapshot.peer.is_none() {
             return true;
@@ -725,6 +741,18 @@ impl UnixSocket {
             state.recv_packets.pop_front()
         };
         let Some(packet) = packet else {
+            if self.is_connection_oriented() {
+                let established = state.established;
+                let peer = state.peer.as_ref().and_then(Weak::upgrade);
+                drop(state);
+                if !established {
+                    return Err(SysErr::NotConn);
+                }
+                if peer.is_none_or(|peer| peer.state.lock().shut_wr) {
+                    return Ok(Self::receive_from_ancillary(None, None, 0, 0));
+                }
+                return Err(SysErr::Again);
+            }
             return Err(SysErr::Again);
         };
 
@@ -736,11 +764,10 @@ impl UnixSocket {
         }
         let peer = state.peer.as_ref().and_then(Weak::upgrade);
         drop(state);
-        if !peek
-            && was_full
-            && let Some(peer) = peer
-        {
-            peer.notify(PollEvents::WRITE);
+        if !peek && let Some(peer) = peer {
+            if was_full {
+                peer.notify(PollEvents::WRITE);
+            }
         }
 
         let ancillary = include_control.then_some(packet.ancillary).flatten();
@@ -768,10 +795,11 @@ impl UnixSocket {
 
 impl Drop for UnixSocket {
     fn drop(&mut self) {
-        let (bound_address, pending_connects) = {
+        let (bound_address, pending_connects, peer) = {
             let mut state = self.state.lock();
             let pending_connects = Self::collect_pending_connects_locked(&mut state);
-            (state.bound_address.clone(), pending_connects)
+            let peer = state.peer.as_ref().and_then(Weak::upgrade);
+            (state.bound_address.clone(), pending_connects, peer)
         };
         if let Some(address) = bound_address {
             let mut bound = BOUND_SOCKETS.lock();
@@ -788,7 +816,17 @@ impl Drop for UnixSocket {
             connector.notify(PollEvents::WRITE | PollEvents::ERROR | PollEvents::HUP);
         }
 
-        if let Some(peer) = self.state.lock().peer.as_ref().and_then(Weak::upgrade) {
+        if let Some(peer) = peer {
+            {
+                let mut peer_state = peer.state.lock();
+                if peer_state
+                    .peer
+                    .as_ref()
+                    .is_some_and(|weak| ptr::eq(weak.as_ptr(), self))
+                {
+                    peer_state.peer = None;
+                }
+            }
             peer.notify(
                 PollEvents::READ
                     | PollEvents::WRITE
@@ -818,7 +856,8 @@ impl KernelSocket for UnixSocket {
             .map(|received| received.bytes_read)
             .map_err(|error| match error {
                 SysErr::Again => FsError::WouldBlock,
-                SysErr::NotConn => FsError::WouldBlock,
+                SysErr::Pipe => FsError::BrokenPipe,
+                SysErr::NotConn => FsError::InvalidInput,
                 _ => FsError::Unsupported,
             })
     }
@@ -827,6 +866,7 @@ impl KernelSocket for UnixSocket {
         self.send_to(buffer, None, 0).map_err(|error| match error {
             SysErr::Again => FsError::WouldBlock,
             SysErr::Pipe => FsError::BrokenPipe,
+            SysErr::DestAddrReq | SysErr::NotConn => FsError::InvalidInput,
             _ => FsError::Unsupported,
         })
     }
@@ -994,10 +1034,17 @@ impl KernelSocket for UnixSocket {
         let peer = if let Some(address) = address {
             self.lookup_target(address, peer)?
         } else {
-            self.peer().ok_or(if self.kind == SOCK_DGRAM {
-                SysErr::DestAddrReq
-            } else {
-                SysErr::NotConn
+            self.peer().ok_or_else(|| {
+                let state = self.state.lock();
+                if self.kind == SOCK_DGRAM {
+                    SysErr::DestAddrReq
+                } else if state.established {
+                    // TODO: raise SIGPIPE for plain socket writes once the generic file write
+                    // path can request Linux-style `MSG_NOSIGNAL` handling.
+                    SysErr::Pipe
+                } else {
+                    SysErr::NotConn
+                }
             })?
         };
 
@@ -1030,10 +1077,17 @@ impl KernelSocket for UnixSocket {
         let peer = if let Some(address) = message.name.as_deref() {
             self.lookup_target(address, peer)?
         } else {
-            self.peer().ok_or(if self.kind == SOCK_DGRAM {
-                SysErr::DestAddrReq
-            } else {
-                SysErr::NotConn
+            self.peer().ok_or_else(|| {
+                let state = self.state.lock();
+                if self.kind == SOCK_DGRAM {
+                    SysErr::DestAddrReq
+                } else if state.established {
+                    // TODO: raise SIGPIPE for plain socket writes once the generic file write
+                    // path can request Linux-style `MSG_NOSIGNAL` handling.
+                    SysErr::Pipe
+                } else {
+                    SysErr::NotConn
+                }
             })?
         };
 
@@ -1159,6 +1213,19 @@ impl KernelSocket for UnixSocket {
         }
 
         Ok(ready)
+    }
+
+    fn ioctl(&self, command: u64, _argument: u64) -> SysResult<Option<aether_vfs::IoctlResponse>> {
+        match command {
+            FIONREAD => {
+                let state = self.state.lock();
+                let value = self.queued_read_len_locked(&state).min(i32::MAX as usize) as i32;
+                Ok(Some(aether_vfs::IoctlResponse::Data(
+                    value.to_ne_bytes().to_vec(),
+                )))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn wait_token(&self) -> u64 {

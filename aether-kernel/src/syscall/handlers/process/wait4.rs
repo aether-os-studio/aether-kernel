@@ -71,14 +71,6 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             Err(error) => return SyscallDisposition::err(error),
         };
         let _ = rusage;
-        if let Some(result) = self.process.wake_result.take() {
-            return match result {
-                BlockResult::CompletedValue { value } => SyscallDisposition::ok(value),
-                BlockResult::SignalInterrupted => SyscallDisposition::err(SysErr::Intr),
-                _ => SyscallDisposition::err(SysErr::Intr),
-            };
-        }
-
         match self.syscall_wait4(pid, status, options, rusage) {
             Ok(value) => {
                 // TODO: populate `rusage` with real child resource usage once the kernel tracks it.

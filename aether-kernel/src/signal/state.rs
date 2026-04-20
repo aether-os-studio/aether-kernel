@@ -7,16 +7,21 @@ use aether_frame::libs::spin::SpinLock;
 use aether_vfs::{PollEvents, SharedWaitListener, WaitQueue};
 
 use super::abi::{
-    SIG_BLOCK, SIG_DFL, SIG_SETMASK, SIG_UNBLOCK, SIGCONT, SIGKILL, SIGNAL_MAX, SIGSTOP, SIGTSTP,
-    SIGTTIN, SIGTTOU, SigSet, SignalAction, SignalInfo, sigbit,
+    SA_ONSTACK, SIG_BLOCK, SIG_DFL, SIG_SETMASK, SIG_UNBLOCK, SIGCONT, SIGKILL, SIGNAL_MAX,
+    SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SS_AUTODISARM, SS_ONSTACK, SigSet, SignalAction,
+    SignalInfo, SignalStack, sigbit, signal_altstack_config_enabled, signal_altstack_contains_sp,
+    signal_altstack_disable, signal_altstack_format_old, signal_altstack_store,
+    signal_altstack_validate_new, signal_stack_base,
 };
 use super::core::{SignalDelivery, delivery_for, sanitize_mask};
+use crate::errno::SysErr;
 
 #[derive(Debug, Clone)]
 struct SignalStateInner {
     blocked: SigSet,
     pending: [Option<SignalInfo>; SIGNAL_MAX + 1],
     suspend_mask: Option<SigSet>,
+    altstack: SignalStack,
 }
 
 #[derive(Clone)]
@@ -47,6 +52,7 @@ impl SignalState {
                 blocked: 0,
                 pending: [None; SIGNAL_MAX + 1],
                 suspend_mask: None,
+                altstack: SignalStack::disabled(),
             },
         )
     }
@@ -71,6 +77,7 @@ impl SignalState {
                 blocked: inner.blocked,
                 pending: [None; SIGNAL_MAX + 1],
                 suspend_mask: None,
+                altstack: inner.altstack,
             },
         )
     }
@@ -84,6 +91,7 @@ impl SignalState {
                 blocked: inner.blocked,
                 pending: [None; SIGNAL_MAX + 1],
                 suspend_mask: None,
+                altstack: inner.altstack,
             },
         )
     }
@@ -122,6 +130,7 @@ impl SignalState {
 
         let mut inner = self.inner.lock();
         inner.suspend_mask = None;
+        signal_altstack_disable(&mut inner.altstack);
     }
 
     pub fn set_mask(&mut self, how: u64, set: SigSet) {
@@ -257,6 +266,55 @@ impl SignalState {
             signal += 1;
         }
         None
+    }
+
+    pub fn altstack(&self, user_sp: u64) -> SignalStack {
+        let inner = self.inner.lock();
+        signal_altstack_format_old(&inner.altstack, user_sp)
+    }
+
+    pub fn set_altstack(
+        &mut self,
+        new_stack: Option<SignalStack>,
+        user_sp: u64,
+    ) -> Result<SignalStack, SysErr> {
+        let mut inner = self.inner.lock();
+        let old_stack = signal_altstack_format_old(&inner.altstack, user_sp);
+
+        if let Some(new_stack) = new_stack {
+            signal_altstack_validate_new(&new_stack)?;
+            if (old_stack.ss_flags & SS_ONSTACK) != 0 {
+                return Err(SysErr::Perm);
+            }
+            signal_altstack_store(&mut inner.altstack, &new_stack);
+        }
+
+        Ok(old_stack)
+    }
+
+    pub fn restore_after_sigreturn(&mut self, mask: SigSet, altstack: SignalStack) {
+        let mut inner = self.inner.lock();
+        inner.blocked = sanitize_mask(mask);
+        signal_altstack_store(&mut inner.altstack, &altstack);
+    }
+
+    pub fn should_use_altstack_for_signal(&self, action_flags: u64, user_sp: u64) -> bool {
+        let inner = self.inner.lock();
+        (action_flags & SA_ONSTACK) != 0
+            && signal_altstack_config_enabled(&inner.altstack)
+            && !signal_altstack_contains_sp(&inner.altstack, user_sp)
+    }
+
+    pub fn altstack_top_for_signal(&self) -> Option<u64> {
+        let inner = self.inner.lock();
+        signal_stack_base(&inner.altstack).checked_add(inner.altstack.ss_size)
+    }
+
+    pub fn arm_altstack_for_signal(&mut self) {
+        let mut inner = self.inner.lock();
+        if (inner.altstack.ss_flags & SS_AUTODISARM) != 0 {
+            signal_altstack_disable(&mut inner.altstack);
+        }
     }
 
     pub fn register_waiter(&self, listener: SharedWaitListener) -> u64 {

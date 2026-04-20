@@ -58,6 +58,14 @@ pub fn register_tick_handler(handler: fn()) {
     }
 }
 
+pub fn supports_deadline_wakeup() -> bool {
+    crate::arch::timer::supports_deadline_wakeup()
+}
+
+pub fn publish_wakeup_deadline(deadline_ns: Option<u64>) {
+    crate::arch::timer::publish_wakeup_deadline(deadline_ns);
+}
+
 pub fn disable() -> Result<(), &'static str> {
     crate::arch::interrupt::apic::disable_timer()
 }

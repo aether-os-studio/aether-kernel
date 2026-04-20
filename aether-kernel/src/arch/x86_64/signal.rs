@@ -7,11 +7,10 @@ use aether_frame::process::UserContext;
 
 use crate::errno::{SysErr, SysResult};
 use crate::process::KernelProcess;
-use crate::signal::{SignalAction, SignalInfo};
-
-const SA_NODEFER: u64 = 0x4000_0000;
-const SA_RESTORER: u64 = 0x0400_0000;
-const SA_SIGINFO: u64 = 0x0000_0004;
+use crate::signal::{
+    SA_NODEFER, SA_RESTORER, SA_SIGINFO, SS_ONSTACK, SignalAction, SignalInfo, SignalStack,
+    signal_altstack_validate_new,
+};
 const UC_SIGCONTEXT_SS: u64 = 0x2;
 const UC_STRICT_RESTORE_SS: u64 = 0x4;
 const X86_64_RED_ZONE_SIZE: u64 = 128;
@@ -51,35 +50,16 @@ pub enum SignalFrameError {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct LinuxStackT {
-    ss_sp: u64,
-    ss_flags: i32,
-    _pad: i32,
-    ss_size: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
 struct LinuxSigSet {
     bits: [u64; 16],
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 struct LinuxMContext {
     gregs: [u64; 23],
     fpregs: u64,
     reserved1: [u64; 8],
-}
-
-impl Default for LinuxMContext {
-    fn default() -> Self {
-        Self {
-            gregs: [0; 23],
-            fpregs: 0,
-            reserved1: [0; 8],
-        }
-    }
 }
 
 #[repr(C)]
@@ -87,7 +67,7 @@ impl Default for LinuxMContext {
 struct LinuxUContext {
     uc_flags: u64,
     uc_link: u64,
-    uc_stack: LinuxStackT,
+    uc_stack: SignalStack,
     uc_mcontext: LinuxMContext,
     uc_sigmask: LinuxSigSet,
     fpregs_mem: [u8; 512],
@@ -99,7 +79,7 @@ impl Default for LinuxUContext {
         Self {
             uc_flags: 0,
             uc_link: 0,
-            uc_stack: LinuxStackT::default(),
+            uc_stack: SignalStack::default(),
             uc_mcontext: LinuxMContext::default(),
             uc_sigmask: LinuxSigSet::default(),
             fpregs_mem: [0; 512],
@@ -157,12 +137,27 @@ pub fn deliver_signal_to_user(
 
     let saved = *process.task.process.context();
     let saved_mask = process.signals.blocked();
-    let layout = SignalFrameLayout::new(saved.general.rsp, action)?;
+    let frame_altstack = process.signals.altstack(saved.general.rsp);
+    let frame_stack_top = if process
+        .signals
+        .should_use_altstack_for_signal(action.flags, saved.general.rsp)
+    {
+        let top = process
+            .signals
+            .altstack_top_for_signal()
+            .ok_or(SignalFrameError::InvalidFrame)?;
+        process.signals.arm_altstack_for_signal();
+        top
+    } else {
+        saved.general.rsp
+    };
+    let layout = SignalFrameLayout::new(frame_stack_top, action)?;
     let siginfo = build_siginfo(signal);
     let ucontext = build_ucontext(
         &process.task.process,
         saved,
         saved_mask,
+        frame_altstack,
         layout.ucontext_addr,
     );
     let siginfo_bytes = serialize_siginfo(&siginfo);
@@ -230,7 +225,12 @@ pub fn restore_signal_from_user(process: &mut KernelProcess) -> SysResult<u64> {
     }
     let current = *process.task.process.context();
     let restored = restore_ucontext(current, &ucontext);
-    process.signals.restore_mask(ucontext.uc_sigmask.bits[0]);
+    let mut restore_altstack = ucontext.uc_stack;
+    restore_altstack.ss_flags &= !SS_ONSTACK;
+    signal_altstack_validate_new(&restore_altstack).map_err(|_| SysErr::Fault)?;
+    process
+        .signals
+        .restore_after_sigreturn(ucontext.uc_sigmask.bits[0], restore_altstack);
     *process.task.process.context_mut() = restored;
     Ok(restored.general.rax)
 }
@@ -307,10 +307,14 @@ fn build_ucontext(
     process: &aether_frame::process::Process,
     context: UserContext,
     mask: u64,
+    altstack: SignalStack,
     ucontext_addr: u64,
 ) -> LinuxUContext {
-    let mut ucontext = LinuxUContext::default();
-    ucontext.uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
+    let mut ucontext = LinuxUContext {
+        uc_flags: UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS,
+        ..Default::default()
+    };
+    ucontext.uc_stack = altstack;
     ucontext.uc_mcontext.fpregs = ucontext_addr + FPREGS_MEM_OFFSET;
     ucontext.uc_mcontext.gregs[X64_REG_R8] = context.general.r8;
     ucontext.uc_mcontext.gregs[X64_REG_R9] = context.general.r9;
@@ -470,7 +474,7 @@ fn decode_ucontext(bytes: &[u8]) -> Option<LinuxUContext> {
     Some(LinuxUContext {
         uc_flags,
         uc_link,
-        uc_stack: LinuxStackT {
+        uc_stack: SignalStack {
             ss_sp,
             ss_flags,
             _pad: ss_pad,

@@ -149,6 +149,7 @@ pub mod nr {
     pub const MEMFD_CREATE: u64 = 319;
     pub const EXECVEAT: u64 = 322;
     pub const STATX: u64 = 332;
+    pub const SIGALTSTACK: u64 = 131;
     pub const FSOPEN: u64 = 430;
     pub const CLOSE_RANGE: u64 = 436;
     pub const FACCESSAT2: u64 = 439;

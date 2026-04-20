@@ -218,6 +218,10 @@ impl TtyBackend for PtySlaveBackend {
         self.shared.enqueue_master_bytes(bytes);
     }
 
+    fn input_space_available(&self) {
+        self.shared.bump_master_waiters(PollEvents::WRITE);
+    }
+
     fn poll_ready(&self, events: PollEvents) -> PollEvents {
         let mut ready = PollEvents::empty();
         if events.contains(PollEvents::WRITE)
@@ -601,7 +605,10 @@ impl PtmxMasterFile {
                 let termios = self.slave.termios();
                 if (termios.c_iflag & IXON) != 0 {
                     let index = if action == TCIOFF { VSTOP } else { VSTART };
-                    self.slave.receive_bytes(&[termios.c_cc[index]]);
+                    let written = self.slave.try_receive_bytes(&[termios.c_cc[index]]);
+                    if written == 0 {
+                        return Err(FsError::WouldBlock);
+                    }
                 }
                 Ok(())
             }
@@ -652,8 +659,12 @@ impl FileOperations for PtmxMasterFile {
             return Err(FsError::Io);
         }
 
-        self.slave.receive_bytes(buffer);
-        Ok(buffer.len())
+        let written = self.slave.try_receive_bytes(buffer);
+        if written == 0 {
+            return Err(FsError::WouldBlock);
+        }
+
+        Ok(written)
     }
 
     fn release(&self) {
@@ -686,6 +697,7 @@ impl FileOperations for PtmxMasterFile {
         if events.contains(PollEvents::WRITE)
             && self.shared.slave_connected()
             && !self.shared.master_output_stopped()
+            && self.slave.input_writable()
         {
             ready = ready | PollEvents::WRITE;
         }

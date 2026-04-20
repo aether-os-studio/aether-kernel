@@ -297,6 +297,8 @@ mod rt_sigreturn;
 mod rt_sigsuspend;
 #[path = "signal/set_robust_list.rs"]
 mod set_robust_list;
+#[path = "signal/sigaltstack.rs"]
+mod sigaltstack;
 #[path = "signal/signalfd.rs"]
 mod signalfd;
 #[path = "signal/signalfd4.rs"]
@@ -424,6 +426,7 @@ pub fn init() {
             rt_sigprocmask::RtSigprocmaskSyscall,
             rt_sigreturn::RtSigreturnSyscall,
             rt_sigsuspend::RtSigsuspendSyscall,
+            sigaltstack::SigaltstackSyscall,
             set_tid_address::SetTidAddressSyscall,
             set_robust_list::SetRobustListSyscall,
             rseq::RseqSyscall,

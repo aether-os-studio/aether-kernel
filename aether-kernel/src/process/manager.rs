@@ -166,6 +166,20 @@ impl ProcessManager {
         };
         for info in signals {
             process.signals.enqueue(info);
+            Self::notify_process_signalfds(process, info);
+        }
+    }
+
+    fn notify_process_signalfds(process: &KernelProcess, info: SignalInfo) {
+        for (_, descriptor) in process.files.entries() {
+            let file = descriptor.file.lock();
+            let Some(signalfd) = file
+                .file_ops()
+                .and_then(|ops| ops.as_any().downcast_ref::<SignalFdFile>())
+            else {
+                continue;
+            };
+            signalfd.notify_signal(info);
         }
     }
 
@@ -898,6 +912,8 @@ impl ProcessManager {
                 kernel_cpu: None,
                 pending_exec: None,
                 pending_syscall: None,
+                completed_syscall: None,
+                pending_block: None,
                 pending_syscall_name: "",
                 pending_file_waits: Vec::new(),
                 mmap_regions: Vec::new(),
@@ -905,6 +921,7 @@ impl ProcessManager {
                 set_child_tid: None,
                 robust_list_head: None,
                 robust_list_len: 0,
+                rseq: None,
                 clear_child_tid: None,
                 files: self.initial_files.fork_copy(),
                 fs: self
@@ -953,7 +970,11 @@ impl ProcessManager {
                 let result = process.task.process.run();
                 self.finish_process(process, result, services)
             }
-            DispatchWork::KernelSyscall(process) => self.resume_pending_syscall(process, services),
+            DispatchWork::KernelContinuation(process) | DispatchWork::KernelSyscall(process) => {
+                crate::runtime::KernelRuntime::shared()
+                    .expect("kernel continuation dispatch requires the shared runtime")
+                    .run_kernel_syscall_process(process)
+            }
         }
     }
 
@@ -985,7 +1006,7 @@ impl ProcessManager {
             return Some(DispatchWork::Event(ScheduleEvent::Exited { pid, status }));
         }
 
-        if process.pending_syscall.is_none() {
+        if process.pending_syscall.is_none() && process.kernel_context.is_none() {
             match process
                 .signals
                 .take_next_delivery(crate::arch::supports_user_handlers())
@@ -1069,6 +1090,11 @@ impl ProcessManager {
             return Some(DispatchWork::Event(ScheduleEvent::Exited { pid, status }));
         }
 
+        if process.kernel_context.is_some() {
+            process.state = ProcessState::Running;
+            return Some(DispatchWork::KernelContinuation(process));
+        }
+
         if process.pending_syscall.is_some() {
             process.state = ProcessState::Running;
             return Some(DispatchWork::KernelSyscall(process));
@@ -1091,6 +1117,38 @@ impl ProcessManager {
         services: S,
     ) -> ScheduleEvent {
         let pid = process.identity.pid;
+        if let RunReason::Exception {
+            vector,
+            error_code,
+            fault_address,
+        } = &result.reason
+        {
+            let details = UserExceptionDetails {
+                vector: *vector,
+                error_code: *error_code,
+                fault_address: *fault_address,
+                instruction_pointer: process.task.process.context().instruction_pointer(),
+            };
+
+            if let UserExceptionClass::PageFault(page_fault) = classify_user_exception(details)
+                && process
+                    .task
+                    .address_space
+                    .handle_page_fault(page_fault.address, page_fault.error_code)
+                    .unwrap_or(false)
+            {
+                // Fast page-fault fixups do not need queued-signal merging here; queued signals
+                // are still drained before the task is dispatched back to userspace.
+                process.state = ProcessState::Runnable;
+                let event = ScheduleEvent::Interrupted {
+                    pid,
+                    vector: *vector,
+                };
+                self.requeue_process(process);
+                return event;
+            }
+        }
+
         self.drain_queued_signals(&mut process);
         let event = match result.reason {
             RunReason::Syscall => {
@@ -1120,16 +1178,6 @@ impl ProcessManager {
                 };
 
                 match classify_user_exception(details) {
-                    UserExceptionClass::PageFault(page_fault)
-                        if process
-                            .task
-                            .address_space
-                            .handle_page_fault(page_fault.address, page_fault.error_code)
-                            .unwrap_or(false) =>
-                    {
-                        process.state = ProcessState::Runnable;
-                        ScheduleEvent::Interrupted { pid, vector }
-                    }
                     UserExceptionClass::PageFault(page_fault) => {
                         let access = match page_fault.access {
                             PageFaultAccessType::Read => "read",
@@ -1243,6 +1291,8 @@ impl ProcessManager {
                 if matches!(process.state, ProcessState::Running) {
                     let replaced_image = self.commit_pending_exec(&mut process);
                     process.pending_syscall = None;
+                    process.completed_syscall = None;
+                    process.pending_block = None;
                     process.wake_result = None;
                     if !replaced_image {
                         process
@@ -1265,29 +1315,46 @@ impl ProcessManager {
             SyscallDisposition::Exit(status) => {
                 self.disarm_futex_wait(pid);
                 process.pending_syscall = None;
+                process.completed_syscall = None;
+                process.pending_block = None;
                 process.state = ProcessState::Exited(status);
                 ScheduleEvent::Exited { pid, status }
             }
             SyscallDisposition::ExitGroup(status) => {
                 self.disarm_futex_wait(pid);
                 process.pending_syscall = None;
+                process.completed_syscall = None;
+                process.pending_block = None;
                 self.begin_thread_group_exit(process.identity.thread_group, pid, status);
                 process.state = ProcessState::Exited(status);
                 ScheduleEvent::Exited { pid, status }
             }
-            SyscallDisposition::Block(block) => {
-                if !matches!(block, BlockType::Futex { .. }) {
-                    self.disarm_futex_wait(pid);
-                }
-                self.block_from_disposition(pid, &mut process, block);
-                ScheduleEvent::Syscall {
-                    pid,
-                    number,
-                    name: dispatch.name,
-                }
-            }
         };
 
+        self.requeue_process(process);
+        event
+    }
+
+    pub(crate) fn finish_kernel_block(
+        &mut self,
+        mut process: ProcessBox,
+        block: BlockType,
+    ) -> ScheduleEvent {
+        let pid = process.identity.pid;
+        if !matches!(block, BlockType::Futex { .. }) {
+            self.disarm_futex_wait(pid);
+        }
+        process.completed_syscall = None;
+        process.pending_block = None;
+        self.block_from_disposition(pid, &mut process, block);
+        let pending = process
+            .pending_syscall
+            .expect("kernel block completion requires a pending syscall");
+        let event = ScheduleEvent::Syscall {
+            pid,
+            number: pending.number,
+            name: process.pending_syscall_name,
+        };
         self.requeue_process(process);
         event
     }
@@ -1298,6 +1365,7 @@ impl ProcessManager {
         };
         process.task = new_task;
         process.mmap_regions.clear();
+        process.rseq = None;
         process.signals.prepare_for_exec();
         process.wake_result = None;
         true
@@ -1618,6 +1686,7 @@ impl ProcessManager {
                 return;
             };
             process.signals.enqueue(info);
+            Self::notify_process_signalfds(process, info);
             let signal_deliverable = process
                 .signals
                 .has_deliverable(crate::arch::supports_user_handlers());
@@ -1716,10 +1785,8 @@ impl ProcessManager {
         if self.processes.contains_key(&pid) {
             self.notify_signal(pid, info);
             true
-        } else if self.queue_signal_for_running(pid, info) {
-            true
         } else {
-            false
+            self.queue_signal_for_running(pid, info)
         }
     }
 

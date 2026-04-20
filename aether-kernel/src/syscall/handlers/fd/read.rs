@@ -26,6 +26,13 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
     }
 
     pub(crate) fn syscall_read_fd(&mut self, fd: u64, address: u64, len: usize) -> SysResult<u64> {
+        if let Ok((_file_ref, socket)) = self.socket_from_fd(fd) {
+            let mut bytes = vec![0; len];
+            let received = socket.recv_from(bytes.as_mut_slice(), 0)?;
+            self.write_user_buffer(address, &bytes[..received.bytes_read])?;
+            return Ok(received.bytes_read as u64);
+        }
+
         let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
         let file_ref = descriptor.file.clone();
         let nonblock = file_ref.lock().flags().nonblock();

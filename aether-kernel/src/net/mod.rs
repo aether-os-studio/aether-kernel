@@ -143,6 +143,10 @@ pub trait KernelSocket: Any + Send + Sync {
         Err(FsError::Unsupported)
     }
 
+    fn ioctl(&self, _command: u64, _argument: u64) -> SysResult<Option<IoctlResponse>> {
+        Ok(None)
+    }
+
     fn recv_from(&self, buffer: &mut [u8], _flags: u64) -> SysResult<SocketReceive> {
         let bytes_read = self.read(buffer).map_err(SysErr::from)?;
         Ok(SocketReceive {
@@ -315,7 +319,15 @@ impl FileOperations for SocketFile {
     }
 
     fn ioctl(&self, _command: u64, _argument: u64) -> FsResult<IoctlResponse> {
-        Err(FsError::Unsupported)
+        match self.socket.ioctl(_command, _argument) {
+            Ok(Some(response)) => Ok(response),
+            Ok(None) => Err(FsError::Unsupported),
+            Err(SysErr::Inval) => Err(FsError::InvalidInput),
+            Err(SysErr::Fault) => Err(FsError::InvalidInput),
+            Err(SysErr::Again) => Err(FsError::WouldBlock),
+            Err(SysErr::Pipe) => Err(FsError::BrokenPipe),
+            Err(_) => Err(FsError::Unsupported),
+        }
     }
 
     fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {

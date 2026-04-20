@@ -10,7 +10,7 @@ use aether_frame::interrupt::timer;
 use aether_frame::libs::spin::SpinLock;
 use aether_frame::mm::{
     AddressSpace, ArchitecturePageTable, FrameAllocator, MapFlags, MapSize, MappingError,
-    PAGE_SIZE, PhysAddr, PhysFrame, VirtAddr, frame_allocator, new_user_root,
+    PAGE_SIZE, PhysAddr, PhysFrame, VirtAddr, frame_allocator, new_user_root, release_frames,
 };
 use aether_frame::process::{Process, ProcessBuildError, ProcessBuilder};
 
@@ -343,9 +343,17 @@ impl<'a, S: ProgramImageSource + ?Sized> ElfProgramBuilder<'a, S> {
         self
     }
 
-    pub fn build(self) -> Result<BuiltProcess, BuildError> {
+    pub fn build(self) -> Result<BuiltProcess, BuildError>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
         let executable = ElfImage::parse(self.executable)?;
         let interpreter = self.interpreter.map(ElfImage::parse).transpose()?;
+        let executable_source: Arc<dyn ProgramImageSource + Send + Sync> =
+            Arc::new(self.executable.clone());
+        let interpreter_source = self.interpreter.map(|interpreter| {
+            Arc::new(interpreter.clone()) as Arc<dyn ProgramImageSource + Send + Sync>
+        });
 
         let stack_pages = self.stack_pages.max(1);
         let mut address_space = UserAddressSpace::new()?;
@@ -356,20 +364,16 @@ impl<'a, S: ProgramImageSource + ?Sized> ElfProgramBuilder<'a, S> {
         let layout = address_space.layout();
 
         let executable_bias = executable.load_bias(layout.pie_base);
-        address_space.load_elf_image(
-            self.executable,
-            &executable,
-            executable_bias,
-            UserVmaKind::Program,
-        )?;
+        address_space.load_elf_image(executable_source, &executable, executable_bias)?;
 
         let interpreter_bias = if let Some(interpreter) = interpreter.as_ref() {
             let bias = interpreter.load_bias(layout.interpreter_base);
             address_space.load_elf_image(
-                self.interpreter.expect("interpreter bytes must exist"),
+                interpreter_source
+                    .clone()
+                    .expect("interpreter bytes must exist"),
                 interpreter,
                 bias,
-                UserVmaKind::Interpreter,
             )?;
             Some(bias)
         } else {
@@ -616,28 +620,25 @@ impl UserAddressSpace {
         self.inner.lock().map_stack(stack_base, stack_pages)
     }
 
-    fn load_elf_image<S: ProgramImageSource + ?Sized>(
+    fn load_elf_image(
         &mut self,
-        source: &S,
+        source: Arc<dyn ProgramImageSource + Send + Sync>,
         image: &ElfImage,
         load_bias: u64,
-        kind: UserVmaKind,
     ) -> Result<(), BuildError> {
-        self.inner
-            .lock()
-            .load_elf_image(source, image, load_bias, kind)
+        self.inner.lock().load_elf_image(source, image, load_bias)
     }
 
     pub fn handle_page_fault(&self, address: u64, error_code: u64) -> Result<bool, BuildError> {
         let mut inner = self.inner.lock();
-        if inner.handle_page_fault(address, error_code)? {
-            return Ok(true);
+        match inner.handle_page_fault(address, error_code)? {
+            PageFaultHandling::Resolved => Ok(true),
+            PageFaultHandling::InvalidateTlb => {
+                inner.invalidate_page(address);
+                Ok(true)
+            }
+            PageFaultHandling::Unhandled => Ok(false),
         }
-        if inner.fault_access_allowed_now(address, error_code) {
-            inner.invalidate_page(address);
-            return Ok(true);
-        }
-        Ok(false)
     }
 }
 
@@ -650,6 +651,12 @@ struct UserAddressSpaceInner {
     brk_start: u64,
     brk_current: u64,
     brk_limit: u64,
+}
+
+enum PageFaultHandling {
+    Resolved,
+    InvalidateTlb,
+    Unhandled,
 }
 
 impl UserAddressSpaceInner {
@@ -1009,23 +1016,28 @@ impl UserAddressSpaceInner {
         }
 
         let aligned_len = align_up(len, PAGE_SIZE);
-        let mut changed = false;
-        let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
-        for page in (0..aligned_len).step_by(PAGE_SIZE as usize) {
-            let page_addr = addr + page;
-            if let Some(mapping) = self.mapping_mut(page_addr) {
-                mapper.protect(VirtAddr::new(page_addr), flags)?;
+        let end = addr
+            .checked_add(aligned_len)
+            .ok_or(BuildError::AddressOverflow)?;
+        let start_index = self
+            .mappings
+            .partition_point(|mapping| mapping.virt.as_u64() < addr);
+        let end_index = self
+            .mappings
+            .partition_point(|mapping| mapping.virt.as_u64() < end);
+        let changed = start_index != end_index || self.vma_range_overlaps(addr, end);
+        if start_index != end_index {
+            let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
+            for mapping in &mut self.mappings[start_index..end_index] {
+                mapper.protect(mapping.virt, flags)?;
                 mapping.flags = flags;
                 mapping.cow = false;
-                changed = true;
-            } else if self.vma_for_address(page_addr).is_some() {
-                changed = true;
             }
         }
         if !changed {
             return Err(BuildError::Map(MappingError::NotMapped));
         }
-        self.update_vma_flags(addr, addr + aligned_len, flags);
+        self.update_vma_flags(addr, end, flags);
         Ok(())
     }
 
@@ -1121,17 +1133,20 @@ impl UserAddressSpaceInner {
     ) -> Result<(), BuildError> {
         let flags = MapFlags::READ | MapFlags::EXECUTE | MapFlags::USER;
         let aligned_len = align_up(image.len() as u64, PAGE_SIZE);
-        let mut page_buffer = vec![0u8; PAGE_SIZE as usize];
         for page_offset in (0..aligned_len).step_by(PAGE_SIZE as usize) {
             let offset = page_offset as usize;
             let len = core::cmp::min(PAGE_SIZE as usize, image.len().saturating_sub(offset));
-            let slice = if len == 0 {
-                &[]
-            } else {
-                image.read_exact_at(offset, &mut page_buffer[..len])?;
-                &page_buffer[..len]
-            };
-            self.map_page(base + page_offset, flags, 0, slice)?;
+            if len == 0 {
+                self.map_zeroed_page(base + page_offset, flags)?;
+                continue;
+            }
+
+            let frame = self.allocate_zeroed_owned_frame()?;
+            if let Err(error) = image.read_exact_at(offset, &mut frame_bytes_mut(frame)[..len]) {
+                release_frames(frame, 1);
+                return Err(BuildError::from(error));
+            }
+            self.map_owned_frame(base + page_offset, frame, flags)?;
         }
         self.record_vma(base, base + aligned_len, flags, UserVmaKind::Program, false);
         Ok(())
@@ -1150,15 +1165,13 @@ impl UserAddressSpaceInner {
         Ok(())
     }
 
-    fn load_elf_image<S: ProgramImageSource + ?Sized>(
+    fn load_elf_image(
         &mut self,
-        source: &S,
+        source: Arc<dyn ProgramImageSource + Send + Sync>,
         image: &ElfImage,
         load_bias: u64,
-        kind: UserVmaKind,
     ) -> Result<(), BuildError> {
-        let mut page_buffer = vec![0u8; PAGE_SIZE as usize];
-        for header in image.program_headers() {
+        for (order, header) in image.program_headers().iter().enumerate() {
             if header.kind != ElfSegmentType::Load {
                 continue;
             }
@@ -1167,57 +1180,54 @@ impl UserAddressSpaceInner {
             let map_base = align_down(segment_base, PAGE_SIZE);
             let map_end = align_up(segment_base + header.mem_size, PAGE_SIZE);
             let flags = map_program_flags(header.flags);
-            for page_base in (map_base..map_end).step_by(PAGE_SIZE as usize) {
-                self.ensure_page_flags(page_base, flags)?;
-                let page_end = page_base
-                    .checked_add(PAGE_SIZE)
-                    .ok_or(BuildError::AddressOverflow)?;
-                let file_segment_end = segment_base
-                    .checked_add(header.file_size)
-                    .ok_or(BuildError::AddressOverflow)?;
-                let copy_start = page_base.max(segment_base);
-                let copy_end = page_end.min(file_segment_end);
-                if copy_start >= copy_end {
-                    continue;
-                }
-
-                let dest_offset = (copy_start - page_base) as usize;
-                let source_offset = header
-                    .offset
-                    .checked_add(copy_start - segment_base)
-                    .ok_or(BuildError::AddressOverflow)?;
-                let len = (copy_end - copy_start) as usize;
-                source.read_exact_at(source_offset as usize, &mut page_buffer[..len])?;
-                self.write_mapped_page(page_base, dest_offset, &page_buffer[..len])?;
-            }
-            self.record_vma(map_base, map_end, flags, kind.clone(), false);
+            self.record_vma(
+                map_base,
+                map_end,
+                flags,
+                UserVmaKind::ElfSegmentImage {
+                    source: source.clone(),
+                    segment_start: segment_base,
+                    image_offset: header.offset,
+                    image_len: header.file_size,
+                    order,
+                },
+                true,
+            );
         }
         Ok(())
     }
 
-    fn handle_page_fault(&mut self, address: u64, error_code: u64) -> Result<bool, BuildError> {
+    fn handle_page_fault(
+        &mut self,
+        address: u64,
+        error_code: u64,
+    ) -> Result<PageFaultHandling, BuildError> {
         let page_base = align_down(address, PAGE_SIZE);
         let write_fault = (error_code & 0x2) != 0;
 
         if let Some(mapping) = self.mapping(page_base) {
             if write_fault && mapping.cow {
                 self.resolve_cow_fault(page_base)?;
-                return Ok(true);
+                return Ok(PageFaultHandling::Resolved);
             }
-            return Ok(false);
+            return Ok(if self.fault_access_allowed(mapping, error_code) {
+                PageFaultHandling::InvalidateTlb
+            } else {
+                PageFaultHandling::Unhandled
+            });
         }
 
-        self.map_lazy_page(page_base, write_fault)
+        Ok(if self.map_lazy_page(page_base, write_fault)? {
+            PageFaultHandling::Resolved
+        } else {
+            PageFaultHandling::Unhandled
+        })
     }
 
-    fn fault_access_allowed_now(&self, address: u64, error_code: u64) -> bool {
+    fn fault_access_allowed(&self, mapping: &UserMapping, error_code: u64) -> bool {
         const PF_WRITE: u64 = 1 << 1;
         const PF_USER: u64 = 1 << 2;
         const PF_INSTR: u64 = 1 << 4;
-
-        let Some(mapping) = self.mapping(address) else {
-            return false;
-        };
 
         if (error_code & PF_WRITE) != 0 && !mapping.flags.contains(MapFlags::WRITE) {
             return false;
@@ -1261,40 +1271,170 @@ impl UserAddressSpaceInner {
     }
 
     fn map_lazy_page(&mut self, page_base: u64, write: bool) -> Result<bool, BuildError> {
-        let Some(vma) = self.vma_for_address(page_base).cloned() else {
+        let page_end = page_base
+            .checked_add(PAGE_SIZE)
+            .ok_or(BuildError::AddressOverflow)?;
+        let Some((start_index, end_index)) = self.lazy_vma_window(page_base, page_end) else {
             return Ok(false);
         };
-        if !vma.lazy {
-            return Ok(false);
-        }
-        if write && !vma.flags.contains(MapFlags::WRITE) {
-            return Ok(false);
-        }
-        match &vma.kind {
-            UserVmaKind::Anonymous | UserVmaKind::Heap | UserVmaKind::Stack => {
-                self.map_zeroed_page(page_base, vma.flags)?;
+
+        let mut contributor_count = 0usize;
+        let mut write_allowed = false;
+        let mut monotonic_order = true;
+        let mut last_order = 0usize;
+
+        for index in start_index..end_index {
+            let vma = &self.vmas[index];
+            if !vma.lazy || page_base >= vma.end {
+                continue;
             }
+
+            if contributor_count != 0 {
+                let order = vma.lazy_order();
+                monotonic_order &= last_order <= order;
+                last_order = order;
+            } else {
+                last_order = vma.lazy_order();
+            }
+
+            contributor_count += 1;
+            write_allowed |= vma.flags.contains(MapFlags::WRITE);
+        }
+
+        if contributor_count == 0 {
+            return Ok(false);
+        }
+        if write && !write_allowed {
+            return Ok(false);
+        }
+
+        if contributor_count == 1 || monotonic_order {
+            self.map_lazy_page_from_window(page_base, page_end, start_index, end_index)?;
+            return Ok(true);
+        }
+
+        let mut contributors = Vec::with_capacity(contributor_count);
+        for index in start_index..end_index {
+            let vma = &self.vmas[index];
+            if vma.lazy && page_base < vma.end {
+                contributors.push(index);
+            }
+        }
+        contributors.sort_by_key(|index| self.vmas[*index].lazy_order());
+        self.map_lazy_page_from_indices(page_base, page_end, &contributors)?;
+        Ok(true)
+    }
+
+    fn map_lazy_page_from_window(
+        &mut self,
+        page_base: u64,
+        page_end: u64,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<(), BuildError> {
+        let frame = self.allocate_zeroed_owned_frame()?;
+        let mut merged_flags = MapFlags::empty();
+
+        for index in start_index..end_index {
+            let vma = &self.vmas[index];
+            if !vma.lazy || page_base >= vma.end {
+                continue;
+            }
+
+            merged_flags = merged_flags | vma.flags;
+            if let Err(error) = self.fill_lazy_page_from_vma(frame, page_base, page_end, vma) {
+                release_frames(frame, 1);
+                return Err(error);
+            }
+        }
+
+        self.map_owned_frame(page_base, frame, merged_flags)?;
+        Ok(())
+    }
+
+    fn map_lazy_page_from_indices(
+        &mut self,
+        page_base: u64,
+        page_end: u64,
+        contributors: &[usize],
+    ) -> Result<(), BuildError> {
+        let frame = self.allocate_zeroed_owned_frame()?;
+        let mut merged_flags = MapFlags::empty();
+
+        for index in contributors {
+            let vma = &self.vmas[*index];
+            merged_flags = merged_flags | vma.flags;
+            if let Err(error) = self.fill_lazy_page_from_vma(frame, page_base, page_end, vma) {
+                release_frames(frame, 1);
+                return Err(error);
+            }
+        }
+
+        self.map_owned_frame(page_base, frame, merged_flags)?;
+        Ok(())
+    }
+
+    fn fill_lazy_page_from_vma(
+        &self,
+        frame: PhysFrame,
+        page_base: u64,
+        page_end: u64,
+        vma: &UserVma,
+    ) -> Result<(), BuildError> {
+        match &vma.kind {
+            UserVmaKind::Anonymous | UserVmaKind::Heap | UserVmaKind::Stack => Ok(()),
             UserVmaKind::PagedImage {
                 source,
                 image_offset,
                 image_len,
             } => {
+                // TODO: file-backed lazy faults still pull data synchronously via ProgramImageSource.
+                // A page-cache backed path would remove a large part of first-fault latency.
                 let page_offset = page_base.saturating_sub(vma.start);
                 if page_offset >= *image_len {
-                    self.map_zeroed_page(page_base, vma.flags)?;
-                } else {
-                    let copy_len = core::cmp::min(PAGE_SIZE, image_len.saturating_sub(page_offset));
-                    let source_offset = image_offset
-                        .checked_add(page_offset)
-                        .ok_or(BuildError::AddressOverflow)?;
-                    let mut page_buffer = vec![0u8; copy_len as usize];
-                    source.read_exact_at(source_offset as usize, &mut page_buffer)?;
-                    self.map_page(page_base, vma.flags, 0, &page_buffer)?;
+                    return Ok(());
                 }
+                let copy_len = core::cmp::min(PAGE_SIZE, image_len.saturating_sub(page_offset));
+                let source_offset = image_offset
+                    .checked_add(page_offset)
+                    .ok_or(BuildError::AddressOverflow)?;
+                source
+                    .read_exact_at(
+                        source_offset as usize,
+                        &mut frame_bytes_mut(frame)[..copy_len as usize],
+                    )
+                    .map_err(BuildError::from)
             }
-            _ => return Ok(false),
+            UserVmaKind::ElfSegmentImage {
+                source,
+                segment_start,
+                image_offset,
+                image_len,
+                ..
+            } => {
+                let file_segment_end = segment_start
+                    .checked_add(*image_len)
+                    .ok_or(BuildError::AddressOverflow)?;
+                let copy_start = page_base.max(*segment_start);
+                let copy_end = page_end.min(file_segment_end);
+                if copy_start >= copy_end {
+                    return Ok(());
+                }
+
+                let dest_offset = (copy_start - page_base) as usize;
+                let source_offset = image_offset
+                    .checked_add(copy_start - segment_start)
+                    .ok_or(BuildError::AddressOverflow)?;
+                let len = (copy_end - copy_start) as usize;
+                source
+                    .read_exact_at(
+                        source_offset as usize,
+                        &mut frame_bytes_mut(frame)[dest_offset..dest_offset + len],
+                    )
+                    .map_err(BuildError::from)
+            }
+            _ => Ok(()),
         }
-        Ok(true)
     }
 
     fn resolve_cow_fault(&mut self, page_base: u64) -> Result<(), BuildError> {
@@ -1329,12 +1469,30 @@ impl UserAddressSpaceInner {
     }
 
     fn map_zeroed_page(&mut self, addr: u64, flags: MapFlags) -> Result<(), BuildError> {
-        let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
+        let frame = self.allocate_zeroed_owned_frame()?;
+        self.map_owned_frame(addr, frame, flags)
+    }
+
+    fn allocate_zeroed_owned_frame(&self) -> Result<PhysFrame, BuildError> {
         let mut allocator = frame_allocator().lock();
         let frame = allocator.alloc(1)?;
         zero_frame(frame);
+        Ok(frame)
+    }
+
+    fn map_owned_frame(
+        &mut self,
+        addr: u64,
+        frame: PhysFrame,
+        flags: MapFlags,
+    ) -> Result<(), BuildError> {
+        let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
+        let mut allocator = frame_allocator().lock();
         let virt = VirtAddr::new(addr);
-        mapper.map(virt, frame, MapSize::Size4KiB, flags, &mut *allocator)?;
+        if let Err(error) = mapper.map(virt, frame, MapSize::Size4KiB, flags, &mut *allocator) {
+            let _ = allocator.release(frame, 1);
+            return Err(BuildError::from(error));
+        }
         self.insert_mapping(UserMapping {
             virt,
             frame,
@@ -1343,37 +1501,6 @@ impl UserAddressSpaceInner {
             owned: true,
             shared: false,
         });
-        Ok(())
-    }
-
-    fn ensure_page_flags(&mut self, addr: u64, flags: MapFlags) -> Result<(), BuildError> {
-        if let Some(current_flags) = self.mapping(addr).map(|mapping| mapping.flags) {
-            let merged_flags = current_flags | flags;
-            if merged_flags != current_flags {
-                let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
-                mapper.protect(VirtAddr::new(addr), merged_flags)?;
-                if let Some(mapping) = self.mapping_mut(addr) {
-                    mapping.flags = merged_flags;
-                    mapping.cow = false;
-                }
-            }
-            return Ok(());
-        }
-
-        self.map_zeroed_page(addr, flags)
-    }
-
-    fn write_mapped_page(
-        &mut self,
-        addr: u64,
-        dest_offset: usize,
-        bytes: &[u8],
-    ) -> Result<(), BuildError> {
-        let frame = self
-            .mapping(addr)
-            .map(|mapping| mapping.frame)
-            .ok_or(BuildError::Map(MappingError::NotMapped))?;
-        write_frame_partial(frame, dest_offset, bytes);
         Ok(())
     }
 
@@ -1384,24 +1511,11 @@ impl UserAddressSpaceInner {
         dest_offset: usize,
         bytes: &[u8],
     ) -> Result<(), BuildError> {
-        let mut mapper = AddressSpace::<ArchitecturePageTable>::from_root(self.root);
-        let mut allocator = frame_allocator().lock();
-        let frame = allocator.alloc(1)?;
-        zero_frame(frame);
+        let frame = self.allocate_zeroed_owned_frame()?;
         if !bytes.is_empty() {
             write_frame_partial(frame, dest_offset, bytes);
         }
-        let virt = VirtAddr::new(addr);
-        mapper.map(virt, frame, MapSize::Size4KiB, flags, &mut *allocator)?;
-        self.insert_mapping(UserMapping {
-            virt,
-            frame,
-            flags,
-            cow: false,
-            owned: true,
-            shared: false,
-        });
-        Ok(())
+        self.map_owned_frame(addr, frame, flags)
     }
 
     fn map_physical_page(
@@ -1586,11 +1700,6 @@ impl UserAddressSpaceInner {
             .map(|index| &self.mappings[index])
     }
 
-    fn mapping_mut(&mut self, address: u64) -> Option<&mut UserMapping> {
-        self.mapping_index(address)
-            .map(|index| &mut self.mappings[index])
-    }
-
     fn mapping_index(&self, address: u64) -> Option<usize> {
         let page_base = align_down(address, PAGE_SIZE);
         self.mappings
@@ -1605,6 +1714,36 @@ impl UserAddressSpaceInner {
             .binary_search_by_key(&addr, |existing| existing.virt.as_u64())
             .unwrap_or_else(|index| index);
         self.mappings.insert(index, mapping);
+    }
+
+    fn vmas_mergeable(lhs: &UserVma, rhs: &UserVma) -> bool {
+        lhs.end == rhs.start
+            && lhs.flags == rhs.flags
+            && lhs.lazy == rhs.lazy
+            && lhs
+                .kind
+                .can_merge_with(&rhs.kind, lhs.end.saturating_sub(lhs.start))
+    }
+
+    fn merge_vma_neighbors_around(&mut self, mut index: usize) {
+        if self.vmas.is_empty() {
+            return;
+        }
+
+        while index > 0 && Self::vmas_mergeable(&self.vmas[index - 1], &self.vmas[index]) {
+            let end = self.vmas[index].end;
+            self.vmas[index - 1].end = end;
+            self.vmas.remove(index);
+            index -= 1;
+        }
+
+        while index + 1 < self.vmas.len()
+            && Self::vmas_mergeable(&self.vmas[index], &self.vmas[index + 1])
+        {
+            let end = self.vmas[index + 1].end;
+            self.vmas[index].end = end;
+            self.vmas.remove(index + 1);
+        }
     }
 
     fn coalesce_vmas(&mut self) {
@@ -1643,13 +1782,22 @@ impl UserAddressSpaceInner {
             .binary_search_by_key(&start, |existing| existing.start)
             .unwrap_or_else(|index| index);
         self.vmas.insert(index, vma);
-        self.coalesce_vmas();
+        self.merge_vma_neighbors_around(index);
     }
 
-    fn vma_for_address(&self, address: u64) -> Option<&UserVma> {
+    fn vma_range_overlaps(&self, start: u64, end: u64) -> bool {
         self.vmas
             .iter()
-            .find(|vma| address >= vma.start && address < vma.end)
+            .any(|vma| vma.start < end && start < vma.end)
+    }
+
+    fn lazy_vma_window(&self, page_base: u64, page_end: u64) -> Option<(usize, usize)> {
+        let end_index = self.vmas.partition_point(|vma| vma.start < page_end);
+        let mut start_index = end_index;
+        while start_index > 0 && self.vmas[start_index - 1].end > page_base {
+            start_index -= 1;
+        }
+        (start_index != end_index).then_some((start_index, end_index))
     }
 
     fn update_heap_vma_end(&mut self, end: u64) {
@@ -1773,7 +1921,6 @@ struct UserMapping {
 #[derive(Clone)]
 enum UserVmaKind {
     Program,
-    Interpreter,
     Heap,
     Stack,
     Anonymous,
@@ -1781,6 +1928,13 @@ enum UserVmaKind {
         source: Arc<dyn ProgramImageSource + Send + Sync>,
         image_offset: u64,
         image_len: u64,
+    },
+    ElfSegmentImage {
+        source: Arc<dyn ProgramImageSource + Send + Sync>,
+        segment_start: u64,
+        image_offset: u64,
+        image_len: u64,
+        order: usize,
     },
     Shared,
     Device,
@@ -1807,6 +1961,19 @@ impl UserVmaKind {
                 image_offset: image_offset.saturating_add(delta),
                 image_len: image_len.saturating_sub(delta),
             },
+            Self::ElfSegmentImage {
+                source,
+                segment_start,
+                image_offset,
+                image_len,
+                order,
+            } => Self::ElfSegmentImage {
+                source: source.clone(),
+                segment_start: *segment_start,
+                image_offset: *image_offset,
+                image_len: *image_len,
+                order: *order,
+            },
             other => other.clone(),
         }
     }
@@ -1814,13 +1981,13 @@ impl UserVmaKind {
     fn can_merge_with(&self, other: &Self, span: u64) -> bool {
         match (self, other) {
             (Self::Program, Self::Program)
-            | (Self::Interpreter, Self::Interpreter)
             | (Self::Heap, Self::Heap)
             | (Self::Stack, Self::Stack)
             | (Self::Anonymous, Self::Anonymous)
             | (Self::Shared, Self::Shared)
             | (Self::Device, Self::Device) => true,
-            (Self::PagedImage { .. }, Self::PagedImage { .. }) => {
+            (Self::PagedImage { .. }, Self::PagedImage { .. })
+            | (Self::ElfSegmentImage { .. }, Self::ElfSegmentImage { .. }) => {
                 let _ = span;
                 false
             }
@@ -1837,6 +2004,13 @@ impl UserVma {
             flags: self.flags,
             kind: self.kind.adjusted(start.saturating_sub(self.start)),
             lazy: self.lazy,
+        }
+    }
+
+    fn lazy_order(&self) -> usize {
+        match &self.kind {
+            UserVmaKind::ElfSegmentImage { order, .. } => *order,
+            _ => 0,
         }
     }
 }
@@ -2117,6 +2291,15 @@ fn write_frame_partial(frame: PhysFrame, offset: usize, data: &[u8]) {
             (phys_to_virt(frame.start_address().as_u64()) as *mut u8).add(offset),
             data.len(),
         );
+    }
+}
+
+fn frame_bytes_mut(frame: PhysFrame) -> &'static mut [u8] {
+    unsafe {
+        core::slice::from_raw_parts_mut(
+            phys_to_virt(frame.start_address().as_u64()) as *mut u8,
+            PAGE_SIZE as usize,
+        )
     }
 }
 

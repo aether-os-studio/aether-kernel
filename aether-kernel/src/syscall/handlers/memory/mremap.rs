@@ -1,4 +1,7 @@
+extern crate alloc;
+
 use aether_frame::mm::{MapFlags, PAGE_SIZE};
+use alloc::vec;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
@@ -72,22 +75,26 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
     }
 
     fn copy_user_range(&mut self, src: u64, dst: u64, len: u64) -> SysResult<()> {
+        let mut buffer = vec![0u8; COPY_CHUNK];
         let mut copied = 0u64;
         while copied < len {
             let chunk = (len - copied).min(COPY_CHUNK as u64) as usize;
-            let buffer = self
+            let read = self
                 .process
                 .task
                 .address_space
-                .read_user_exact(src.saturating_add(copied), chunk)
+                .read(src.saturating_add(copied), &mut buffer[..chunk])
                 .map_err(SysErr::from)?;
+            if read != chunk {
+                return Err(SysErr::Fault);
+            }
             let written = self
                 .process
                 .task
                 .address_space
-                .write(dst.saturating_add(copied), &buffer)
+                .write(dst.saturating_add(copied), &buffer[..chunk])
                 .map_err(SysErr::from)?;
-            if written != buffer.len() {
+            if written != chunk {
                 return Err(SysErr::Fault);
             }
             copied = copied.saturating_add(chunk as u64);

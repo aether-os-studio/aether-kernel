@@ -42,22 +42,35 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         address: u64,
         limit: usize,
     ) -> SysResult<Vec<u64>> {
+        const POINTERS_PER_CHUNK: usize = 16;
+        const POINTER_SIZE: usize = core::mem::size_of::<u64>();
         let mut pointers = Vec::with_capacity(limit);
-        for index in 0..limit {
+        let mut chunk = [0u8; POINTERS_PER_CHUNK * POINTER_SIZE];
+
+        let mut index = 0usize;
+        while index < limit {
+            let remaining = limit - index;
+            let chunk_len = remaining.min(POINTERS_PER_CHUNK);
+            let byte_len = chunk_len * POINTER_SIZE;
             let element_addr = address
-                .checked_add((index * core::mem::size_of::<u64>()) as u64)
+                .checked_add((index * POINTER_SIZE) as u64)
                 .ok_or(SysErr::Fault)?;
             let bytes = self
                 .process
                 .task
                 .address_space
-                .read_user_exact(element_addr, core::mem::size_of::<u64>())
+                .read_user_exact(element_addr, byte_len)
                 .map_err(|_| SysErr::Fault)?;
-            let value = u64::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| SysErr::Fault)?);
-            if value == 0 {
-                break;
+            chunk[..byte_len].copy_from_slice(bytes.as_slice());
+
+            for entry in chunk[..byte_len].chunks_exact(POINTER_SIZE) {
+                let value = u64::from_ne_bytes(entry.try_into().map_err(|_| SysErr::Fault)?);
+                if value == 0 {
+                    return Ok(pointers);
+                }
+                pointers.push(value);
             }
-            pointers.push(value);
+            index += chunk_len;
         }
         Ok(pointers)
     }

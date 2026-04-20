@@ -25,7 +25,7 @@ use crate::errno::{SysErr, SysResult};
 use crate::fs::{FdTable, NodeImageSource, PidFdHandle, create_pidfd_node};
 use crate::log_sinks;
 use crate::process::{
-    ChildEvent, CloneParams, DispatchWork, KernelProcess, Pid, ProcFsProcessSnapshot,
+    ChildEvent, CloneParams, DispatchWork, KernelProcess, Pid, ProcFsProcessSnapshot, ProcessBox,
     ProcessManager, ProcessServices, ProcessState, ScheduleEvent, anonymous_filesystem_identity,
 };
 use crate::rootfs::{ExecFormat, ProcessFsContext, RootfsError, RootfsManager};
@@ -123,26 +123,22 @@ fn runtime_send_process_group_signal(process_group: i32, signal: i32) {
 impl KernelRuntime {
     fn drain_pending_runtime_events(&self) {
         let current_nanos = time::monotonic_nanos();
-        if aether_frame::arch::cpu::current_cpu_index() == 0
+        let drm_pending = aether_frame::arch::cpu::current_cpu_index() == 0
             && (DRM_VBLANK_PENDING.swap(false, Ordering::AcqRel)
-                || aether_drivers::drm::next_vblank_wakeup_deadline().is_some())
-        {
+                || aether_drivers::drm::next_vblank_wakeup_deadline().is_some());
+        if drm_pending {
             aether_drivers::drm::handle_vblank_tick();
         }
 
         let timer_tick_pending = TIMER_TICK_PENDING.swap(false, Ordering::AcqRel);
-        let mut processes = self.processes.lock();
-
-        if timer_tick_pending
-            || crate::fs::next_timerfd_wakeup_deadline().is_some()
-            || processes.next_timer_deadline_nanos().is_some()
-        {
+        if timer_tick_pending {
             crate::fs::wake_expired_timerfds();
-            if processes.timer_deadline_due(current_nanos) {
-                processes.wake_expired_timers(current_nanos);
-            }
         }
 
+        let mut processes = self.processes.lock();
+        if timer_tick_pending && processes.timer_deadline_due(current_nanos) {
+            processes.wake_expired_timers(current_nanos);
+        }
         processes.wake_ready_file_blocks();
     }
 
@@ -327,25 +323,7 @@ impl KernelRuntime {
             if aether_frame::preempt::take_need_resched() {
                 continue;
             }
-            let work = {
-                if let Some(work) = {
-                    let mut processes = self.processes.lock();
-                    crate::processor::try_take_current_cpu_work(&mut processes)
-                } {
-                    work
-                } else {
-                    {
-                        let mut processes = self.processes.lock();
-                        if let Some(work) =
-                            crate::processor::try_take_current_cpu_work(&mut processes)
-                        {
-                            work
-                        } else {
-                            DispatchWork::Idle
-                        }
-                    }
-                }
-            };
+            let work = self.processes.lock().take_next_process();
             match work {
                 DispatchWork::Idle => {
                     if aether_frame::preempt::take_need_resched() {
@@ -362,6 +340,13 @@ impl KernelRuntime {
                             .flatten()
                             .min()
                     };
+
+                    aether_frame::interrupt::timer::publish_wakeup_deadline(next_deadline);
+
+                    if aether_frame::interrupt::timer::supports_deadline_wakeup() {
+                        aether_frame::arch::cpu::wait_for_interrupt();
+                        continue;
+                    }
 
                     if let Some(deadline) = next_deadline {
                         let now = time::monotonic_nanos();
@@ -408,21 +393,10 @@ impl KernelRuntime {
                                             number: syscall_number,
                                             args: syscall_args,
                                         });
+                                    process.completed_syscall = None;
+                                    process.pending_block = None;
                                     process.pending_syscall_name = "";
-                                    let services = RuntimeServices {
-                                        rootfs: &self.rootfs,
-                                        processes: &self.processes,
-                                    };
-                                    let dispatch = ProcessManager::dispatch_pending_syscall(
-                                        &mut process,
-                                        services,
-                                    );
-                                    let mut processes = self.processes.lock();
-                                    processes.finish_syscall_dispatch(
-                                        process,
-                                        syscall_number,
-                                        dispatch,
-                                    )
+                                    self.run_kernel_syscall_process(process)
                                 }
                                 _ => {
                                     let services = RuntimeServices {
@@ -433,6 +407,13 @@ impl KernelRuntime {
                                     processes.finish_process(process, result, services)
                                 }
                             }
+                        });
+                    self.handle_event(event);
+                }
+                DispatchWork::KernelContinuation(process) => {
+                    let event =
+                        crate::processor::with_current_process(process.running_snapshot(), || {
+                            self.run_kernel_syscall_process(process)
                         });
                     self.handle_event(event);
                 }
@@ -455,6 +436,46 @@ impl KernelRuntime {
                     self.handle_event(event);
                 }
             }
+        }
+    }
+
+    fn ensure_kernel_syscall_context(process: &mut KernelProcess) {
+        if process.kernel_context.is_some() {
+            return;
+        }
+
+        let stack_top = process.task.process.kernel_stack_top();
+        process.kernel_context = Some(aether_frame::process::initialize_typed_kernel_context(
+            stack_top,
+            process,
+            kernel_syscall_entry,
+        ));
+    }
+
+    pub(crate) fn run_kernel_syscall_process(&self, mut process: ProcessBox) -> ScheduleEvent {
+        Self::ensure_kernel_syscall_context(&mut process);
+        let context = *process
+            .kernel_context
+            .as_ref()
+            .expect("kernel syscall continuation missing context");
+        crate::processor::resume_kernel_context(&context);
+
+        let completed = process.completed_syscall.take();
+        let pending_block = process.pending_block.take();
+        let mut processes = self.processes.lock();
+        if let Some(completed) = completed {
+            processes.finish_syscall_dispatch(
+                process,
+                completed.number,
+                crate::syscall::SyscallDispatch {
+                    disposition: completed.disposition,
+                    name: completed.name,
+                },
+            )
+        } else if let Some(block) = pending_block {
+            processes.finish_kernel_block(process, block)
+        } else {
+            panic!("kernel syscall continuation yielded without a completion")
         }
     }
 
@@ -506,6 +527,29 @@ impl KernelRuntime {
             let _ = processes.send_signal_process_group(process_group as u32, info);
         }
     }
+}
+
+fn kernel_syscall_entry(process: &mut KernelProcess) -> ! {
+    let runtime = KernelRuntime::shared().expect("kernel syscall continuation requires runtime");
+    let pending = process
+        .pending_syscall
+        .expect("kernel syscall continuation missing pending syscall");
+    let services = RuntimeServices {
+        rootfs: &runtime.rootfs,
+        processes: &runtime.processes,
+    };
+    let dispatch = ProcessManager::dispatch_pending_syscall_direct(process, services);
+    process.completed_syscall = Some(crate::process::CompletedSyscall {
+        number: pending.number,
+        name: dispatch.name,
+        disposition: dispatch.disposition,
+    });
+    process.pending_block = None;
+    process.kernel_context = None;
+
+    let mut completed_context = aether_frame::process::KernelContext::default();
+    aether_frame::process::switch_to_scheduler(&mut completed_context);
+    panic!("completed kernel syscall continuation resumed unexpectedly");
 }
 
 struct RuntimeServices<'a> {
@@ -802,6 +846,8 @@ impl ProcessServices for RuntimeServices<'_> {
             kernel_cpu: None,
             pending_exec: None,
             pending_syscall: None,
+            completed_syscall: None,
+            pending_block: None,
             pending_syscall_name: "",
             pending_file_waits: Vec::new(),
             mmap_regions: parent.mmap_regions.clone(),
@@ -809,6 +855,7 @@ impl ProcessServices for RuntimeServices<'_> {
             set_child_tid: None,
             robust_list_head: None,
             robust_list_len: 0,
+            rseq: None,
             clear_child_tid: params
                 .clear_child_tid()
                 .then_some(params.child_tid)

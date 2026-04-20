@@ -26,6 +26,20 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             .clone();
         let segments =
             read_iovec_array(&self.process.task.address_space, iov, iovcnt.min(IOV_MAX))?;
+
+        if let Ok((_file_ref, socket)) = self.socket_from_fd(fd) {
+            let total_len = segments.iter().try_fold(0usize, |total, segment| {
+                total
+                    .checked_add(segment.len)
+                    .filter(|next| *next <= isize::MAX as usize)
+                    .ok_or(SysErr::Inval)
+            })?;
+            let mut bytes = vec![0u8; total_len];
+            let received = socket.recv_from(bytes.as_mut_slice(), 0)?;
+            self.write_iovec_bytes(&segments, &bytes[..received.bytes_read])?;
+            return Ok(received.bytes_read as u64);
+        }
+
         let mut file = file_ref.lock();
         let mut total = 0usize;
 

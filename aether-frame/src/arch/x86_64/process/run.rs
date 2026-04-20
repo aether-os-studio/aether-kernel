@@ -180,7 +180,6 @@ impl ProcessBuilder {
         self
     }
 
-    #[must_use]
     pub fn build(self) -> Result<Process, ProcessBuildError> {
         Process::new(&self)
     }
@@ -238,7 +237,6 @@ impl Process {
         self.kernel_stack_top - USER_ENTRY_STACK_RESERVE as u64
     }
 
-    #[must_use]
     pub fn fork_with_root(&self, address_space_root: PhysFrame) -> Result<Self, ProcessBuildError> {
         let mut process = ProcessBuilder::new(self.context.general.rip, self.context.general.rsp)
             .address_space_root(address_space_root)

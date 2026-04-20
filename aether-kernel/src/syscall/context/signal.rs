@@ -37,4 +37,5 @@ pub trait SignalSyscallContext {
     fn rt_sigsuspend(&mut self, mask: u64, sigsetsize: u64) -> SysResult<u64>;
     fn rt_sigsuspend_blocking(&mut self, mask: u64, sigsetsize: u64) -> SyscallDisposition;
     fn rt_sigreturn(&mut self) -> SysResult<u64>;
+    fn sigaltstack(&mut self, uss: u64, uoss: u64) -> SysResult<u64>;
 }

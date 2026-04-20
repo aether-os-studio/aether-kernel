@@ -114,6 +114,10 @@ pub struct AddressSpace<A: PageTableArch> {
 }
 
 impl<A: PageTableArch> AddressSpace<A> {
+    fn is_active_root(&self) -> bool {
+        self.root == A::root_frame()
+    }
+
     #[must_use]
     pub fn current() -> Self {
         Self {
@@ -136,11 +140,15 @@ impl<A: PageTableArch> AddressSpace<A> {
     }
 
     pub fn invalidate(&self, virt: VirtAddr) {
-        A::invalidate(virt);
+        if self.is_active_root() {
+            A::invalidate(virt);
+        }
     }
 
     pub fn invalidate_all(&self) {
-        A::invalidate_all();
+        if self.is_active_root() {
+            A::invalidate_all();
+        }
     }
 
     pub fn new_root<F: FrameAllocator>(allocator: &mut F) -> Result<Self, MappingError> {
@@ -196,7 +204,7 @@ impl<A: PageTableArch> AddressSpace<A> {
         unsafe {
             ptr::write_volatile(entry_ptr, A::make_leaf(frame, leaf_level, flags));
         }
-        A::invalidate(virt);
+        self.invalidate(virt);
         Ok(())
     }
 
@@ -207,10 +215,14 @@ impl<A: PageTableArch> AddressSpace<A> {
         flags: MapFlags,
         allocator: &mut F,
     ) -> Result<(), MappingError> {
+        let count = frame_count_for_size(size);
         let frame = allocator
-            .alloc(frame_count_for_size(size))
+            .alloc(count)
             .map_err(|_| MappingError::OutOfMemory)?;
-        self.map(virt, frame, size, flags, allocator)
+        self.map(virt, frame, size, flags, allocator).map_err(|e| {
+            let _ = allocator.release(frame, count);
+            e
+        })
     }
 
     pub fn unmap<F: FrameAllocator>(
@@ -252,7 +264,7 @@ impl<A: PageTableArch> AddressSpace<A> {
                 unsafe {
                     ptr::write_volatile(entry_ptr, 0);
                 }
-                A::invalidate(virt);
+                self.invalidate(virt);
 
                 let frame = A::entry_frame(entry);
                 let remaining_refs = if release_frame {
@@ -291,7 +303,7 @@ impl<A: PageTableArch> AddressSpace<A> {
                 unsafe {
                     ptr::write_volatile(entry_ptr, A::make_leaf(frame, level, flags));
                 }
-                A::invalidate(virt);
+                self.invalidate(virt);
                 return Ok(());
             }
 

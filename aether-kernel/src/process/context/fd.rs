@@ -409,22 +409,22 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                     return SyscallDisposition::err(error);
                 }
             };
-            if let Err(error) = self.write_select_fd_sets(
-                readfds_address,
-                writefds_address,
-                exceptfds_address,
-                &current_read_set,
-                &current_write_set,
-                &current_except_set,
-            ) {
-                self.restore_poll_wait_state(
-                    options.restore_sigmask,
-                    options.timeout_address,
-                    options,
-                );
-                return SyscallDisposition::err(error);
-            }
             if ready != 0 {
+                if let Err(error) = self.write_select_fd_sets(
+                    readfds_address,
+                    writefds_address,
+                    exceptfds_address,
+                    &current_read_set,
+                    &current_write_set,
+                    &current_except_set,
+                ) {
+                    self.restore_poll_wait_state(
+                        options.restore_sigmask,
+                        options.timeout_address,
+                        options,
+                    );
+                    return SyscallDisposition::err(error);
+                }
                 self.restore_poll_wait_state(
                     options.restore_sigmask,
                     options.timeout_address,
@@ -433,6 +433,21 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 return SyscallDisposition::ok(ready as u64);
             }
             if options.timeout_nanos == Some(0) {
+                if let Err(error) = self.write_select_fd_sets(
+                    readfds_address,
+                    writefds_address,
+                    exceptfds_address,
+                    &current_read_set,
+                    &current_write_set,
+                    &current_except_set,
+                ) {
+                    self.restore_poll_wait_state(
+                        options.restore_sigmask,
+                        options.timeout_address,
+                        options,
+                    );
+                    return SyscallDisposition::err(error);
+                }
                 self.restore_poll_wait_state(
                     options.restore_sigmask,
                     options.timeout_address,
@@ -456,11 +471,14 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             match self.wait_poll(options.deadline_nanos, &registrations) {
                 Ok(BlockResult::Poll { timed_out: false }) => {}
                 Ok(BlockResult::Poll { timed_out: true }) => {
+                    let mut timeout_read_set = read_set.clone();
+                    let mut timeout_write_set = write_set.clone();
+                    let mut timeout_except_set = except_set.clone();
                     let ready = match self.evaluate_select_fd_sets(
                         nfds,
-                        current_read_set.as_mut_slice(),
-                        current_write_set.as_mut_slice(),
-                        current_except_set.as_mut_slice(),
+                        timeout_read_set.as_mut_slice(),
+                        timeout_write_set.as_mut_slice(),
+                        timeout_except_set.as_mut_slice(),
                     ) {
                         Ok(ready) => ready,
                         Err(error) => {
@@ -476,9 +494,9 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                         readfds_address,
                         writefds_address,
                         exceptfds_address,
-                        &current_read_set,
-                        &current_write_set,
-                        &current_except_set,
+                        &timeout_read_set,
+                        &timeout_write_set,
+                        &timeout_except_set,
                     ) {
                         self.restore_poll_wait_state(
                             options.restore_sigmask,
@@ -881,7 +899,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             .ok_or(SysErr::Inval)?;
 
         let target_descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
-        let target_node = target_descriptor.file.lock().node();
+        let target_file = target_descriptor.file.clone();
 
         let epoll_event = if event != 0 {
             let event_bytes = self.syscall_read_user_exact_buffer(event, 12)?;
@@ -890,7 +908,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             aether_vfs::EpollEvent::default()
         };
 
-        epoll_file.ctl(epoll_op, fd, target_node, epoll_event)?;
+        epoll_file.ctl(epoll_op, fd, target_file, epoll_event)?;
         Ok(0)
     }
 
@@ -1308,7 +1326,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 && (ready.contains(PollEvents::WRITE) || ready.intersects(exceptional_mask));
             // TODO: Linux exceptfds is driven by POLLPRI-style out-of-band readiness.
             // PollEvents does not expose that signal yet, so we conservatively clear exceptfds.
-            let except_ready = false && want_except;
+            let except_ready = false;
 
             fd_set_assign(read_set, fd, read_ready);
             fd_set_assign(write_set, fd, write_ready);
@@ -1496,7 +1514,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         })
     }
 
-    fn write_iovec_bytes(
+    pub(crate) fn write_iovec_bytes(
         &mut self,
         segments: &[super::super::util::UserIoVec],
         bytes: &[u8],
