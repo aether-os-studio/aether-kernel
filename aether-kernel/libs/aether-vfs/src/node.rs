@@ -94,6 +94,10 @@ pub trait FileOperations: Any + Send + Sync {
     fn mmap(&self, _request: MmapRequest) -> FsResult<MmapResponse> {
         Ok(MmapResponse::buffered())
     }
+
+    fn page_cache_enabled(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

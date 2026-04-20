@@ -273,6 +273,12 @@ impl FileOperations for SharedInodeFile {
     fn mmap(&self, request: MmapRequest) -> FsResult<MmapResponse> {
         self.inode.mmap(request)
     }
+
+    fn page_cache_enabled(&self) -> bool {
+        self.inode
+            .file()
+            .is_some_and(|file| file.page_cache_enabled())
+    }
 }
 
 impl VfsFile {
@@ -346,7 +352,8 @@ impl VfsFile {
             return Err(FsError::InvalidInput);
         }
         let operations = self.operations.as_ref().ok_or(FsError::NotFile)?;
-        match operations.read(self.position, buffer) {
+        let metadata = self.inode().metadata();
+        match crate::page_cache::read(metadata, operations.as_ref(), self.position, buffer) {
             Ok(read) => {
                 self.position = self.position.saturating_add(read);
                 Ok(read)
@@ -362,9 +369,17 @@ impl VfsFile {
         if self.flags.append() {
             self.position = self.inode().size();
         }
+        let write_offset = self.position;
+        let metadata = self.inode().metadata();
         let operations = self.operations.as_ref().ok_or(FsError::NotFile)?;
-        match operations.write(self.position, buffer) {
+        match operations.write(write_offset, buffer) {
             Ok(written) => {
+                crate::page_cache::invalidate_write(
+                    metadata,
+                    operations.as_ref(),
+                    write_offset,
+                    written,
+                );
                 self.position = self.position.saturating_add(written);
                 Ok(written)
             }
@@ -380,17 +395,23 @@ impl VfsFile {
     }
 
     pub fn advise(&self, offset: u64, len: u64, advice: FileAdvice) -> FsResult<()> {
-        self.operations
-            .as_ref()
-            .ok_or(FsError::NotFile)?
-            .advise(offset, len, advice)
+        let metadata = self.inode().metadata();
+        let operations = self.operations.as_ref().ok_or(FsError::NotFile)?;
+        let result = operations.advise(offset, len, advice);
+        if result.is_ok() {
+            crate::page_cache::handle_advice(metadata, operations.as_ref(), offset, len, advice);
+        }
+        result
     }
 
     pub fn fallocate(&self, mode: u32, offset: u64, len: u64) -> FsResult<()> {
-        self.operations
-            .as_ref()
-            .ok_or(FsError::NotFile)?
-            .fallocate(mode, offset, len)
+        let metadata = self.inode().metadata();
+        let operations = self.operations.as_ref().ok_or(FsError::NotFile)?;
+        let result = operations.fallocate(mode, offset, len);
+        if result.is_ok() {
+            crate::page_cache::invalidate_all(metadata, operations.as_ref());
+        }
+        result
     }
 
     pub fn poll(&self, events: PollEvents) -> FsResult<PollEvents> {

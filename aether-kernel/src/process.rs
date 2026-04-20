@@ -21,7 +21,7 @@ use aether_vfs::{NodeRef, PollEvents, SharedOpenFile};
 
 use crate::credentials::Credentials;
 use crate::errno::SysResult;
-use crate::fs::{FdTable, FileSystemIdentity, LinuxStatFs};
+use crate::fs::{FdTable, FileSystemIdentity, LinuxStatFs, PidFdHandle};
 use crate::rootfs::ProcessFsContext;
 use crate::signal::SignalState;
 use crate::syscall::{BlockResult, SyscallArgs};
@@ -116,6 +116,7 @@ pub enum ProcessBlock {
 
 pub struct KernelProcess {
     pub identity: ProcessIdentity,
+    pub pidfd: Arc<PidFdHandle>,
     pub exit_signal: u8,
     pub task: BuiltProcess,
     pub credentials: Credentials,
@@ -478,9 +479,10 @@ pub struct ChildEvent {
     pub kind: ChildEventKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 struct ZombieProcess {
     parent: Option<Pid>,
+    pidfd: Arc<PidFdHandle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

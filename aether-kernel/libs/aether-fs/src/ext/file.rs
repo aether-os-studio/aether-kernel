@@ -75,4 +75,8 @@ impl FileOperations for ExtInodeNode {
             block_on_future(file.truncate(size as u64)).map_err(map_ext_error)
         })
     }
+
+    fn page_cache_enabled(&self) -> bool {
+        self.kind == NodeKind::File
+    }
 }

@@ -6,6 +6,7 @@ mod mapper;
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
+use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use good_memory_allocator::Allocator;
@@ -76,6 +77,7 @@ impl DerefMut for FrameAllocatorGuard<'_> {
 }
 
 static FRAME_ALLOCATOR: FrameAllocatorSlot = FrameAllocatorSlot::uninit();
+static OOM_RECOVERY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub struct LockedHeap(SpinLock<Allocator, LocalIrqDisabled>);
 
@@ -90,7 +92,14 @@ impl LockedHeap {
 }
 unsafe impl GlobalAlloc for LockedHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.0.lock().alloc(layout)
+        let ptr = self.0.lock().alloc(layout);
+        if !ptr.is_null() {
+            return ptr;
+        }
+        if try_recover_from_oom() {
+            return self.0.lock().alloc(layout);
+        }
+        ptr::null_mut()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
@@ -131,4 +140,38 @@ pub fn init() -> Result<(), FrameAllocError> {
 
 pub fn frame_allocator() -> &'static FrameAllocatorSlot {
     &FRAME_ALLOCATOR
+}
+
+pub fn zero_frame(frame: PhysFrame) {
+    unsafe {
+        ptr::write_bytes(
+            boot::phys_to_virt(frame.start_address().as_u64()) as *mut u8,
+            0,
+            PAGE_SIZE as usize,
+        );
+    }
+}
+
+pub fn release_frames(frame: PhysFrame, count: usize) {
+    let _ = frame_allocator().lock().release(frame, count);
+}
+
+pub(crate) fn try_recover_from_oom() -> bool {
+    if OOM_RECOVERY_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+
+    unsafe {
+        aether_registered_oom_handler();
+    }
+
+    OOM_RECOVERY_ACTIVE.store(false, Ordering::Release);
+    true
+}
+
+unsafe extern "Rust" {
+    fn aether_registered_oom_handler();
 }

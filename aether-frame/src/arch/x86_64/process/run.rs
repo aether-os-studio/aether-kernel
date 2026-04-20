@@ -1,6 +1,3 @@
-use alloc::boxed::Box;
-use alloc::vec;
-use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::mem::MaybeUninit;
 use core::mem::offset_of;
@@ -9,9 +6,12 @@ use core::ptr;
 use x86_64::registers::model_specific::Msr;
 
 use crate::boot::MAX_CPUS;
+use crate::boot::phys_to_virt;
 use crate::interrupt::{PrivilegeLevel, Trap, TrapKind};
 use crate::libs::percpu::PerCpu;
-use crate::mm::{PageTableArch, PhysFrame};
+use crate::mm::{
+    FrameAllocError, FrameAllocator, PAGE_SIZE, PageTableArch, PhysFrame, frame_allocator,
+};
 use crate::process::{RunFuture, RunReason, RunResult};
 
 use super::super::fpu::FpuState;
@@ -106,6 +106,48 @@ enum ResumeMode {
     Sysret,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessBuildError {
+    KernelStack(FrameAllocError),
+}
+
+impl From<FrameAllocError> for ProcessBuildError {
+    fn from(value: FrameAllocError) -> Self {
+        Self::KernelStack(value)
+    }
+}
+
+struct KernelStackAllocation {
+    frame: PhysFrame,
+    pages: usize,
+    top: u64,
+}
+
+impl KernelStackAllocation {
+    fn new(size: usize) -> Result<Self, ProcessBuildError> {
+        let pages = size.div_ceil(PAGE_SIZE as usize).max(1);
+        let frame = frame_allocator().lock().alloc(pages)?;
+        let base = phys_to_virt(frame.start_address().as_u64());
+        let top = align_down(base + pages as u64 * PAGE_SIZE, 16);
+
+        Ok(Self { frame, pages, top })
+    }
+
+    const fn top(&self) -> u64 {
+        self.top
+    }
+
+    const fn byte_len(&self) -> usize {
+        self.pages * PAGE_SIZE as usize
+    }
+}
+
+impl Drop for KernelStackAllocation {
+    fn drop(&mut self) {
+        let _ = frame_allocator().lock().release(self.frame, self.pages);
+    }
+}
+
 pub struct ProcessBuilder {
     entry: u64,
     user_stack_top: u64,
@@ -139,39 +181,33 @@ impl ProcessBuilder {
     }
 
     #[must_use]
-    pub fn build(self) -> Process {
+    pub fn build(self) -> Result<Process, ProcessBuildError> {
         Process::new(&self)
     }
 }
 
 pub struct Process {
     context: UserContext,
-    fpu_state: Box<FpuState>,
+    fpu_state: alloc::boxed::Box<FpuState>,
     address_space_root: PhysFrame,
-    _kernel_stack: Box<[u64]>,
+    _kernel_stack: KernelStackAllocation,
     kernel_stack_top: u64,
     last_reason: Option<RunReason>,
 }
 
 impl Process {
-    fn new(builder: &ProcessBuilder) -> Self {
-        let words = builder
-            .kernel_stack_size
-            .div_ceil(core::mem::size_of::<u64>());
-        let mut kernel_stack: Vec<u64> = vec![0; words];
-        let stack_top = align_down(
-            kernel_stack.as_mut_ptr() as u64 + kernel_stack.len() as u64 * 8,
-            16,
-        );
+    fn new(builder: &ProcessBuilder) -> Result<Self, ProcessBuildError> {
+        let kernel_stack = KernelStackAllocation::new(builder.kernel_stack_size)?;
+        let stack_top = kernel_stack.top();
 
-        Self {
+        Ok(Self {
             context: UserContext::new(builder.entry, builder.user_stack_top),
-            fpu_state: Box::default(),
+            fpu_state: alloc::boxed::Box::default(),
             address_space_root: builder.address_space_root,
-            _kernel_stack: kernel_stack.into_boxed_slice(),
+            _kernel_stack: kernel_stack,
             kernel_stack_top: stack_top,
             last_reason: None,
-        }
+        })
     }
 
     #[must_use]
@@ -195,15 +231,15 @@ impl Process {
     }
 
     #[must_use]
-    pub fn fork_with_root(&self, address_space_root: PhysFrame) -> Self {
+    pub fn fork_with_root(&self, address_space_root: PhysFrame) -> Result<Self, ProcessBuildError> {
         let mut process = ProcessBuilder::new(self.context.general.rip, self.context.general.rsp)
             .address_space_root(address_space_root)
-            .kernel_stack_size(self._kernel_stack.len() * core::mem::size_of::<u64>())
-            .build();
+            .kernel_stack_size(self._kernel_stack.byte_len())
+            .build()?;
         process.context = self.context;
         process.context.general.rax = 0;
         process.fpu_state.copy_from(&self.fpu_state);
-        process
+        Ok(process)
     }
 
     #[must_use]

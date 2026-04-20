@@ -21,7 +21,8 @@ use crate::arch::{
     exception_signal,
 };
 use crate::credentials::Credentials;
-use crate::fs::{FdTable, FileDescriptor};
+use crate::errno::SysResult;
+use crate::fs::{FdTable, FileDescriptor, PidFdHandle};
 use crate::rootfs::ProcessFsContext;
 use crate::signal::{
     SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_DFL, SIG_IGN, SIGCHLD, SignalAction, SignalDelivery,
@@ -310,6 +311,7 @@ impl ProcessManager {
         let pid = process.identity.pid;
         let tgid = process.identity.thread_group;
         self.queued_signals.remove(&pid);
+        process.pidfd.mark_exited();
         self.finish_process_exit(process);
         if let Some(parent) = process.vfork_parent.take() {
             self.wake_vfork_parent(parent, pid);
@@ -317,6 +319,7 @@ impl ProcessManager {
         self.untrack_thread_group(tgid, pid);
 
         if process.is_thread() {
+            process.pidfd.mark_reaped();
             return;
         }
 
@@ -336,11 +339,18 @@ impl ProcessManager {
         }
 
         if parent.is_none() || ignore_sigchld || no_cldwait {
+            process.pidfd.mark_reaped();
             self.untrack_child_link(parent, pid);
             return;
         }
 
-        self.zombies.insert(pid, ZombieProcess { parent });
+        self.zombies.insert(
+            pid,
+            ZombieProcess {
+                parent,
+                pidfd: process.pidfd.clone(),
+            },
+        );
         self.notify_child_event(
             parent,
             ChildEvent {
@@ -519,31 +529,35 @@ impl ProcessManager {
         parent: &FdTable,
         child_signals: &SignalState,
     ) -> FdTable {
-        let table = FdTable::empty();
-        for (fd, descriptor) in parent.entries() {
-            let (flags, child_signalfd) = {
-                let file = descriptor.file.lock();
-                let flags = file.flags();
-                let child_signalfd = file
-                    .file_ops()
-                    .and_then(|ops| ops.as_any().downcast_ref::<SignalFdFile>())
-                    .map(|signalfd| signalfd.with_signal_state(child_signals.clone()));
-                (flags, child_signalfd)
-            };
-            let cloned = if let Some(signalfd) = child_signalfd {
-                let node = aether_vfs::FileNode::new("signalfd", signalfd);
-                FileDescriptor {
-                    file: Arc::new(SpinLock::new(OpenFileDescription::new(node, flags))),
-                    filesystem: descriptor.filesystem,
-                    location: descriptor.location.clone(),
-                    cloexec: descriptor.cloexec,
-                }
-            } else {
-                descriptor.clone()
-            };
-            table.insert_at(fd, cloned);
-        }
-        table
+        let entries = parent.with_entries(|parent_entries| {
+            let mut child_entries = alloc::collections::BTreeMap::new();
+            for (&fd, descriptor) in parent_entries {
+                let (flags, child_signalfd) = {
+                    let file = descriptor.file.lock();
+                    let flags = file.flags();
+                    let child_signalfd = file
+                        .file_ops()
+                        .and_then(|ops| ops.as_any().downcast_ref::<SignalFdFile>())
+                        .map(|signalfd| signalfd.with_signal_state(child_signals.clone()));
+                    (flags, child_signalfd)
+                };
+                let cloned = if let Some(signalfd) = child_signalfd {
+                    let node = aether_vfs::FileNode::new("signalfd", signalfd);
+                    FileDescriptor {
+                        file: Arc::new(SpinLock::new(OpenFileDescription::new(node, flags))),
+                        filesystem: descriptor.filesystem,
+                        location: descriptor.location.clone(),
+                        cloexec: descriptor.cloexec,
+                    }
+                } else {
+                    descriptor.clone()
+                };
+                child_entries.insert(fd, cloned);
+            }
+            child_entries
+        });
+
+        FdTable::from_entries(entries)
     }
 
     fn track_child_link(&mut self, parent: Option<Pid>, child: Pid) {
@@ -849,6 +863,7 @@ impl ProcessManager {
             pid,
             Box::new(KernelProcess {
                 identity,
+                pidfd: PidFdHandle::new(pid),
                 exit_signal: crate::signal::SIGCHLD,
                 task,
                 credentials: Credentials::root(),
@@ -882,10 +897,26 @@ impl ProcessManager {
         Ok(pid)
     }
 
-    pub(crate) fn allocate_pid(&mut self) -> Pid {
+    pub(crate) fn allocate_pid(&mut self, requested: Option<Pid>) -> SysResult<Pid> {
+        if let Some(pid) = requested {
+            if pid == 0 {
+                return Err(crate::errno::SysErr::Inval);
+            }
+            if self.processes.contains_key(&pid)
+                || self.zombies.contains_key(&pid)
+                || crate::processor::running_cpu_of(pid).is_some()
+            {
+                return Err(crate::errno::SysErr::Exists);
+            }
+            if pid >= self.next_pid {
+                self.next_pid = pid.saturating_add(1);
+            }
+            return Ok(pid);
+        }
+
         let pid = self.next_pid;
         self.next_pid = self.next_pid.saturating_add(1);
-        pid
+        Ok(pid)
     }
 
     #[allow(dead_code)]
@@ -1410,10 +1441,11 @@ impl ProcessManager {
             event
         };
         if matches!(event.kind, ChildEventKind::Exited(_)) {
-            let parent = self
-                .zombies
-                .remove(&event.pid)
-                .and_then(|zombie| zombie.parent);
+            let zombie = self.zombies.remove(&event.pid);
+            if let Some(zombie) = zombie.as_ref() {
+                zombie.pidfd.mark_reaped();
+            }
+            let parent = zombie.and_then(|zombie| zombie.parent);
             self.untrack_child_link(parent, event.pid);
         }
         Some(event)

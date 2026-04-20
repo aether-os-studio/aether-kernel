@@ -10,6 +10,27 @@ crate::declare_syscall!(
 );
 
 impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
+    fn parse_clone3_set_tid(&self, clone_args: LinuxCloneArgs) -> SysResult<Option<u32>> {
+        if clone_args.set_tid_size == 0 {
+            return Ok(None);
+        }
+        if clone_args.set_tid_size > 1 {
+            // TODO: extend this once nested PID namespaces exist.
+            return Err(SysErr::Inval);
+        }
+        if !self.process.credentials.is_superuser() {
+            // TODO: replace this with capability checks once user namespaces exist.
+            return Err(SysErr::Perm);
+        }
+
+        let bytes = self.syscall_read_user_exact_buffer(clone_args.set_tid, 4)?;
+        let requested = i32::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| SysErr::Fault)?);
+        if requested <= 0 {
+            return Err(SysErr::Inval);
+        }
+        Ok(Some(requested as u32))
+    }
+
     pub(crate) fn syscall_clone3(&mut self, args: u64, size: usize) -> SysResult<u64> {
         let disposition = self.syscall_clone3_blocking(args, size);
         match disposition {
@@ -19,12 +40,11 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
     }
 
     pub(crate) fn syscall_clone3_blocking(&mut self, args: u64, size: usize) -> SyscallDisposition {
-        let header = self
-            .process
-            .task
-            .address_space
-            .read_user_exact(args, LinuxCloneArgs::SIZE)
-            .map_err(|_| SysErr::Fault);
+        if size < LinuxCloneArgs::SIZE_VER0 {
+            return SyscallDisposition::err(SysErr::Inval);
+        }
+
+        let header = self.syscall_read_user_exact_buffer(args, size.min(LinuxCloneArgs::SIZE));
         let Ok(header) = header else {
             return SyscallDisposition::err(SysErr::Fault);
         };
@@ -53,6 +73,11 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             }
         }
 
-        self.syscall_clone_process_blocking(CloneParams::from_clone3(clone_args))
+        let requested_pid = match self.parse_clone3_set_tid(clone_args) {
+            Ok(requested_pid) => requested_pid,
+            Err(error) => return SyscallDisposition::err(error),
+        };
+
+        self.syscall_clone_process_blocking(CloneParams::from_clone3(clone_args, requested_pid))
     }
 }

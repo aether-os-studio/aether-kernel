@@ -79,3 +79,41 @@ pub fn frame_entry(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     output.into()
 }
+
+#[proc_macro_attribute]
+pub fn oom_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input_fn = parse_macro_input!(item as ItemFn);
+    let fn_attrs = &input_fn.attrs;
+    let fn_vis = &input_fn.vis;
+    let fn_name = &input_fn.sig.ident;
+    let fn_block = &input_fn.block;
+
+    if !input_fn.sig.inputs.is_empty() {
+        return quote! {
+            compile_error!("Functions marked with #[oom_handler] must not take arguments");
+        }
+        .into();
+    }
+
+    if !matches!(input_fn.sig.output, ReturnType::Default) {
+        return quote! {
+            compile_error!("Functions marked with #[oom_handler] must return ()");
+        }
+        .into();
+    }
+
+    let output = quote! {
+        #(#fn_attrs)*
+        #fn_vis fn #fn_name() {
+            #fn_block
+        }
+
+        #[unsafe(no_mangle)]
+        #[doc(hidden)]
+        pub extern "Rust" fn aether_registered_oom_handler() {
+            #fn_name()
+        }
+    };
+
+    output.into()
+}

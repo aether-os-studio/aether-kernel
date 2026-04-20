@@ -88,6 +88,11 @@ impl FdTable {
         self.entries.lock().get(&fd).cloned()
     }
 
+    pub fn with_entries<R>(&self, f: impl FnOnce(&BTreeMap<u32, FileDescriptor>) -> R) -> R {
+        let entries = self.entries.lock();
+        f(&entries)
+    }
+
     pub fn with_descriptor_mut<R>(
         &self,
         fd: u32,
@@ -107,6 +112,12 @@ impl FdTable {
 
     pub fn insert_at(&self, fd: u32, descriptor: FileDescriptor) {
         self.entries.lock().insert(fd, descriptor);
+    }
+
+    pub(crate) fn from_entries(entries: BTreeMap<u32, FileDescriptor>) -> Self {
+        Self {
+            entries: Arc::new(SpinLock::new(entries)),
+        }
     }
 
     pub fn close(&self, fd: u32) -> bool {

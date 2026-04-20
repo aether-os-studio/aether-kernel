@@ -1,3 +1,4 @@
+use super::Pid;
 use crate::errno::{SysErr, SysResult};
 
 pub(crate) const CLONE_VM: u64 = 0x0000_0100;
@@ -34,9 +35,12 @@ pub struct CloneParams {
     pub flags: u64,
     pub exit_signal: u64,
     pub child_stack_pointer: Option<u64>,
+    pub pidfd_address: Option<u64>,
+    pidfd_in_parent_tid: bool,
     pub parent_tid: Option<u64>,
     pub child_tid: Option<u64>,
     pub tls: Option<u64>,
+    pub requested_pid: Option<Pid>,
 }
 
 impl CloneParams {
@@ -45,9 +49,12 @@ impl CloneParams {
             flags: 0,
             exit_signal: 17,
             child_stack_pointer: None,
+            pidfd_address: None,
+            pidfd_in_parent_tid: false,
             parent_tid: None,
             child_tid: None,
             tls: None,
+            requested_pid: None,
         }
     }
 
@@ -56,9 +63,12 @@ impl CloneParams {
             flags: CLONE_VM | CLONE_VFORK,
             exit_signal: 17,
             child_stack_pointer: None,
+            pidfd_address: None,
+            pidfd_in_parent_tid: false,
             parent_tid: None,
             child_tid: None,
             tls: None,
+            requested_pid: None,
         }
     }
 
@@ -75,14 +85,17 @@ impl CloneParams {
             flags,
             exit_signal,
             child_stack_pointer: (child_stack != 0).then_some(child_stack),
+            pidfd_address: ((flags & CLONE_PIDFD) != 0).then_some(parent_tid),
+            pidfd_in_parent_tid: (flags & CLONE_PIDFD) != 0,
             parent_tid: ((flags & CLONE_PARENT_SETTID) != 0).then_some(parent_tid),
             child_tid: ((flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) != 0)
                 .then_some(child_tid),
             tls: ((flags & CLONE_SETTLS) != 0).then_some(tls),
+            requested_pid: None,
         }
     }
 
-    pub(crate) fn from_clone3(args: LinuxCloneArgs) -> Self {
+    pub(crate) fn from_clone3(args: LinuxCloneArgs, requested_pid: Option<Pid>) -> Self {
         let child_stack_pointer = if args.stack != 0 {
             let top = if args.stack_size != 0 {
                 args.stack.saturating_add(args.stack_size)
@@ -98,16 +111,18 @@ impl CloneParams {
             flags: args.flags,
             exit_signal: args.exit_signal & CSIGNAL_MASK,
             child_stack_pointer,
+            pidfd_address: ((args.flags & CLONE_PIDFD) != 0).then_some(args.pidfd),
+            pidfd_in_parent_tid: false,
             parent_tid: ((args.flags & CLONE_PARENT_SETTID) != 0).then_some(args.parent_tid),
             child_tid: ((args.flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) != 0)
                 .then_some(args.child_tid),
             tls: ((args.flags & CLONE_SETTLS) != 0).then_some(args.tls),
+            requested_pid,
         }
     }
 
     pub(crate) fn validate(self) -> SysResult<()> {
-        let unsupported_flags = CLONE_PIDFD
-            | CLONE_PTRACE
+        let unsupported_flags = CLONE_PTRACE
             | CLONE_NEWNS
             | CLONE_DETACHED
             | CLONE_UNTRACED
@@ -123,7 +138,7 @@ impl CloneParams {
 
         if (self.flags & unsupported_flags) != 0 {
             // These require kernel subsystems that do not exist yet:
-            // shared fs/fd tables, thread groups, namespaces, pidfd, cgroup placement, ptrace.
+            // shared fs/fd tables, thread groups, namespaces, cgroup placement, ptrace.
             return Err(SysErr::Inval);
         }
         if (self.flags & CLONE_THREAD) != 0
@@ -143,6 +158,16 @@ impl CloneParams {
         if (self.flags & CLONE_PARENT_SETTID) != 0 && self.parent_tid.is_none() {
             return Err(SysErr::Fault);
         }
+        if (self.flags & CLONE_PIDFD) != 0 && self.pidfd_address.is_none() {
+            return Err(SysErr::Fault);
+        }
+        if self.pidfd_in_parent_tid
+            && (self.flags & (CLONE_PIDFD | CLONE_PARENT_SETTID))
+                == (CLONE_PIDFD | CLONE_PARENT_SETTID)
+        {
+            // Legacy clone(2) reuses parent_tid for pidfd storage.
+            return Err(SysErr::Inval);
+        }
         if (self.flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) != 0
             && self.child_tid.is_none()
         {
@@ -152,6 +177,9 @@ impl CloneParams {
             return Err(SysErr::Fault);
         }
         if self.exit_signal > CSIGNAL_MASK {
+            return Err(SysErr::Inval);
+        }
+        if self.requested_pid == Some(0) {
             return Err(SysErr::Inval);
         }
         Ok(())
@@ -223,15 +251,18 @@ pub(crate) struct LinuxCloneArgs {
 }
 
 impl LinuxCloneArgs {
+    pub(crate) const SIZE_VER0: usize = 64;
+    pub(crate) const SIZE_VER1: usize = 80;
+    pub(crate) const SIZE_VER2: usize = core::mem::size_of::<Self>();
     pub(crate) const SIZE: usize = core::mem::size_of::<Self>();
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < Self::SIZE {
+        if bytes.len() < Self::SIZE_VER0 {
             return None;
         }
 
         let mut words = [0u64; 11];
-        for (index, chunk) in bytes[..Self::SIZE].chunks_exact(8).enumerate() {
+        for (index, chunk) in bytes.chunks_exact(8).take(words.len()).enumerate() {
             let mut raw = [0u8; 8];
             raw.copy_from_slice(chunk);
             words[index] = u64::from_ne_bytes(raw);
@@ -253,11 +284,28 @@ impl LinuxCloneArgs {
     }
 
     pub(crate) fn validate(self, size: usize) -> SysResult<()> {
-        if size < Self::SIZE {
+        if size < Self::SIZE_VER0 {
             return Err(SysErr::Inval);
         }
-        if self.pidfd != 0 || self.set_tid != 0 || self.set_tid_size != 0 || self.cgroup != 0 {
-            // pidfd, set_tid and cgroup targeting need dedicated kernel infrastructure.
+        if size < Self::SIZE_VER1 && (self.set_tid != 0 || self.set_tid_size != 0) {
+            return Err(SysErr::Inval);
+        }
+        if size < Self::SIZE_VER2 && self.cgroup != 0 {
+            return Err(SysErr::Inval);
+        }
+        // glibc's pthread_create path may leave pidfd populated even when
+        // CLONE_PIDFD is not requested. Linux ignores the field in that case.
+        if (self.flags & CLONE_PIDFD) != 0 && self.pidfd == 0 {
+            return Err(SysErr::Fault);
+        }
+        if self.set_tid_size != 0 && self.set_tid == 0 {
+            return Err(SysErr::Fault);
+        }
+        if self.cgroup != 0 {
+            // TODO: wire clone3 cgroup targeting once cgroup support exists.
+            return Err(SysErr::Inval);
+        }
+        if (self.flags & (CLONE_THREAD | CLONE_PARENT)) != 0 && self.exit_signal != 0 {
             return Err(SysErr::Inval);
         }
         if self.stack == 0 && self.stack_size != 0 {

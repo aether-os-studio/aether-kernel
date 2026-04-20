@@ -932,7 +932,13 @@ impl<const MAX_USABLE_RANGES: usize, const MAX_CPUS: usize, const MAX_BLOCK_NODE
     FrameAllocator for BuddyAllocator<MAX_USABLE_RANGES, MAX_CPUS, MAX_BLOCK_NODES>
 {
     fn alloc(&mut self, count: usize) -> Result<PhysFrame, FrameAllocError> {
-        let addr = self.alloc_frame_4k(count)?;
+        let addr = match self.alloc_frame_4k(count) {
+            Ok(addr) => addr,
+            Err(FrameAllocError::OutOfMemory) if super::try_recover_from_oom() => {
+                self.alloc_frame_4k(count)?
+            }
+            Err(error) => return Err(error),
+        };
         Ok(Self::frame_from_addr(addr))
     }
 

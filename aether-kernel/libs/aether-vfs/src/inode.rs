@@ -243,7 +243,11 @@ impl Inode {
 
     pub fn truncate(&self, size: usize) -> FsResult<()> {
         let file = self.file().ok_or(FsError::NotFile)?;
-        file.truncate(size)
+        let result = file.truncate(size);
+        if result.is_ok() {
+            crate::page_cache::invalidate_all(self.metadata(), file);
+        }
+        result
     }
 
     pub fn advise(&self, offset: u64, len: u64, advice: FileAdvice) -> FsResult<()> {

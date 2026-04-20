@@ -7,6 +7,7 @@ mod epoll;
 mod file;
 mod inode;
 mod node;
+mod page_cache;
 mod path;
 mod superblock;
 mod vfs;
@@ -27,6 +28,7 @@ pub use self::node::{
     MemfdOptions, MemoryFile, MutableMemoryFile, NodeKind, NodeMetadata, NodeTimestamp,
     SharedMemoryFile, SymlinkNode,
 };
+pub use self::page_cache::reclaim_page_cache;
 pub use self::path::{
     VfsPath, display_path_from_root, is_within, leaf_name, normalize_absolute_path, parent_path,
     remap_mount_path, resolve_namespace_path, resolve_symlink_path, resolve_view_path,

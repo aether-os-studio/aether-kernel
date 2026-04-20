@@ -17,16 +17,16 @@ use aether_framebuffer::{FramebufferDevice, FramebufferError, FramebufferSurface
 use aether_kmsg::KmsgBuffer;
 use aether_process::{BuildError, ElfProgramBuilder, UserProgramBuilder, elf_interpreter_path};
 use aether_terminal::{FramebufferConsole, register_process_group_signal_hook};
-use aether_vfs::{FileNode, FsError, NodeRef};
+use aether_vfs::{FileNode, FsError, NodeRef, OpenFlags};
 use spin::Once;
 
 use crate::arch::ArchContext;
 use crate::errno::{SysErr, SysResult};
-use crate::fs::{FdTable, NodeImageSource};
+use crate::fs::{FdTable, NodeImageSource, PidFdHandle, create_pidfd_node};
 use crate::log_sinks;
 use crate::process::{
     ChildEvent, CloneParams, DispatchWork, KernelProcess, Pid, ProcFsProcessSnapshot,
-    ProcessManager, ProcessServices, ProcessState, ScheduleEvent,
+    ProcessManager, ProcessServices, ProcessState, ScheduleEvent, anonymous_filesystem_identity,
 };
 use crate::rootfs::{ExecFormat, ProcessFsContext, RootfsError, RootfsManager};
 use crate::syscall::SyscallArgs;
@@ -678,7 +678,8 @@ impl ProcessServices for RuntimeServices<'_> {
     fn clone_process(&mut self, parent: &mut KernelProcess, params: CloneParams) -> SysResult<Pid> {
         params.validate()?;
         let _ = params.share_sysvsem();
-        let pid = self.processes.lock().allocate_pid();
+        let pid = self.processes.lock().allocate_pid(params.requested_pid)?;
+        let pidfd = PidFdHandle::new(pid);
         let child_parent = if params.thread() || params.inherit_parent() {
             parent.identity.parent
         } else {
@@ -753,6 +754,26 @@ impl ProcessServices for RuntimeServices<'_> {
                 return Err(SysErr::Fault);
             }
         }
+        if let Some(pidfd_address) = params.pidfd_address {
+            let pidfd_node = create_pidfd_node(pidfd.clone());
+            let pidfd_number = parent.files.insert_node(
+                pidfd_node,
+                OpenFlags::from_bits(OpenFlags::READ),
+                anonymous_filesystem_identity(),
+                None,
+                true,
+            );
+            let raw = (pidfd_number as i32).to_ne_bytes();
+            let written = parent
+                .task
+                .address_space
+                .write(pidfd_address, &raw)
+                .map_err(SysErr::from)?;
+            if written != raw.len() {
+                let _ = parent.files.close(pidfd_number);
+                return Err(SysErr::Fault);
+            }
+        }
 
         let child = KernelProcess {
             identity: crate::process::ProcessIdentity {
@@ -766,6 +787,7 @@ impl ProcessServices for RuntimeServices<'_> {
                 process_group: parent.identity.process_group,
                 session: parent.identity.session,
             },
+            pidfd,
             exit_signal: if params.thread() {
                 0
             } else {

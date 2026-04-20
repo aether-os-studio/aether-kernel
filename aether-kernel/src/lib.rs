@@ -8,7 +8,7 @@ use core::alloc::Layout;
 use core::panic::PanicInfo;
 
 use aether_frame::{boot, interrupt};
-use aether_macros::frame_entry;
+use aether_macros::{frame_entry, oom_handler};
 
 extern crate aether_frame;
 
@@ -81,6 +81,11 @@ fn secondary_cpu_main(cpu_index: usize) -> ! {
         interrupt::current_lapic_id()
     );
     runtime::KernelRuntime::run_secondary(cpu_index)
+}
+
+#[oom_handler]
+fn reclaim_oom_memory() {
+    let _ = aether_vfs::reclaim_page_cache();
 }
 
 #[alloc_error_handler]

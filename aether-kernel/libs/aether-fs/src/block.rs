@@ -440,6 +440,10 @@ impl FileOperations for BlockDeviceFile {
     fn size(&self) -> usize {
         self.device.size_bytes().min(usize::MAX as u64) as usize
     }
+
+    fn page_cache_enabled(&self) -> bool {
+        true
+    }
 }
 
 fn validate_geometry(geometry: BlockGeometry) -> FsResult<BlockGeometry> {

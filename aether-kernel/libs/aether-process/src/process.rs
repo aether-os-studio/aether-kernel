@@ -12,7 +12,7 @@ use aether_frame::mm::{
     AddressSpace, ArchitecturePageTable, FrameAllocator, MapFlags, MapSize, MappingError,
     PAGE_SIZE, PhysAddr, PhysFrame, VirtAddr, frame_allocator, new_user_root,
 };
-use aether_frame::process::{Process, ProcessBuilder};
+use aether_frame::process::{Process, ProcessBuildError, ProcessBuilder};
 
 use crate::image::{ElfImage, ElfSegmentFlags, ElfSegmentType, ImageError, ProgramImageSource};
 use crate::layout::UserAddressSpaceLayout;
@@ -69,6 +69,14 @@ impl From<MappingError> for BuildError {
 impl From<aether_frame::mm::FrameAllocError> for BuildError {
     fn from(value: aether_frame::mm::FrameAllocError) -> Self {
         Self::Frame(value)
+    }
+}
+
+impl From<ProcessBuildError> for BuildError {
+    fn from(value: ProcessBuildError) -> Self {
+        match value {
+            ProcessBuildError::KernelStack(error) => Self::Frame(error),
+        }
     }
 }
 
@@ -166,7 +174,7 @@ pub struct BuiltProcess {
 impl BuiltProcess {
     pub fn fork_cow(&self) -> Result<Self, BuildError> {
         let address_space = self.address_space.fork_cow()?;
-        let process = self.process.fork_with_root(address_space.root());
+        let process = self.process.fork_with_root(address_space.root())?;
 
         Ok(Self {
             process,
@@ -177,7 +185,7 @@ impl BuiltProcess {
 
     pub fn fork_copy(&self) -> Result<Self, BuildError> {
         let address_space = self.address_space.fork_copy()?;
-        let process = self.process.fork_with_root(address_space.root());
+        let process = self.process.fork_with_root(address_space.root())?;
 
         Ok(Self {
             process,
@@ -188,7 +196,7 @@ impl BuiltProcess {
 
     pub fn fork_shared_vm(&self) -> Result<Self, BuildError> {
         let address_space = self.address_space.share();
-        let process = self.process.fork_with_root(address_space.root());
+        let process = self.process.fork_with_root(address_space.root())?;
 
         Ok(Self {
             process,
@@ -289,7 +297,7 @@ impl<'a, S: ProgramImageSource + ?Sized> UserProgramBuilder<'a, S> {
 
         let process = ProcessBuilder::new(code_base, stack.stack_pointer)
             .address_space_root(address_space.root())
-            .build();
+            .build()?;
         Ok(BuiltProcess {
             process,
             address_space,
@@ -395,7 +403,7 @@ impl<'a, S: ProgramImageSource + ?Sized> ElfProgramBuilder<'a, S> {
             .unwrap_or(executable.entry() + executable_bias);
         let process = ProcessBuilder::new(entry, stack.stack_pointer)
             .address_space_root(address_space.root())
-            .build();
+            .build()?;
         Ok(BuiltProcess {
             process,
             address_space,
@@ -679,6 +687,7 @@ impl UserAddressSpaceInner {
         copy.layout = self.layout;
         copy.stack_base = self.stack_base;
         copy.vmas = self.vmas.clone();
+        copy.mappings = Vec::with_capacity(self.mappings.len());
         copy.brk_start = self.brk_start;
         copy.brk_current = self.brk_current;
         copy.brk_limit = self.brk_limit;
@@ -751,6 +760,7 @@ impl UserAddressSpaceInner {
         copy.layout = self.layout;
         copy.stack_base = self.stack_base;
         copy.vmas = self.vmas.clone();
+        copy.mappings = Vec::with_capacity(self.mappings.len());
         copy.brk_start = self.brk_start;
         copy.brk_current = self.brk_current;
         copy.brk_limit = self.brk_limit;
