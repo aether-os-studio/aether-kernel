@@ -1,4 +1,4 @@
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -196,8 +196,14 @@ impl EpollCtlOp {
 }
 
 struct EpollNotifier {
-    ready: SpinLock<BTreeMap<u64, EpollEvents>, LocalIrqDisabled>,
+    ready: SpinLock<EpollReadyState, LocalIrqDisabled>,
     waiters: WaitQueue,
+}
+
+#[derive(Default)]
+struct EpollReadyState {
+    events: BTreeMap<u64, EpollEvents>,
+    queue: VecDeque<u64>,
 }
 
 impl EpollNotifier {
@@ -208,14 +214,15 @@ impl EpollNotifier {
 
         let should_notify = {
             let mut ready = self.ready.lock();
-            match ready.get_mut(&fd) {
+            match ready.events.get_mut(&fd) {
                 Some(stored) => {
                     let previous = stored.bits();
                     stored.insert(events.bits());
                     stored.bits() != previous
                 }
                 None => {
-                    ready.insert(fd, events);
+                    ready.events.insert(fd, events);
+                    ready.queue.push_back(fd);
                     true
                 }
             }
@@ -227,12 +234,12 @@ impl EpollNotifier {
 
     fn take_ready(&self, max_events: usize) -> Vec<(u64, EpollEvents)> {
         let mut ready = self.ready.lock();
-        let mut events = Vec::with_capacity(max_events.min(ready.len()));
+        let mut events = Vec::with_capacity(max_events.min(ready.events.len()));
         while events.len() < max_events {
-            let Some((&fd, _)) = ready.first_key_value() else {
+            let Some(fd) = ready.queue.pop_front() else {
                 break;
             };
-            let Some(bits) = ready.remove(&fd) else {
+            let Some(bits) = ready.events.remove(&fd) else {
                 continue;
             };
             events.push((fd, bits));
@@ -241,7 +248,7 @@ impl EpollNotifier {
     }
 
     fn has_pending(&self) -> bool {
-        !self.ready.lock().is_empty()
+        !self.ready.lock().events.is_empty()
     }
 }
 
@@ -272,13 +279,10 @@ pub struct EpollInstance {
 }
 
 impl EpollInstance {
-    const ALWAYS_EVENT_BITS: u32 =
-        EpollEvents::ERR | EpollEvents::HUP | EpollEvents::NVAL | EpollEvents::RDHUP;
-
     pub fn new() -> Self {
         Self {
             notifier: Arc::new(EpollNotifier {
-                ready: SpinLock::new(BTreeMap::new()),
+                ready: SpinLock::new(EpollReadyState::default()),
                 waiters: WaitQueue::new(),
             }),
             interests: SpinLock::new(BTreeMap::new()),
@@ -332,59 +336,9 @@ impl EpollInstance {
         }
     }
 
-    fn collect_interest_ready(&self, fd: u64, interest: &mut EpollInterest) {
-        if interest.disabled {
-            return;
-        }
-
-        let Some((ready_events, token)) = Self::poll_interest_state(interest) else {
-            return;
-        };
-
-        if ready_events.bits() == 0 {
-            interest.last_ready = EpollEvents::empty();
-            interest.last_token = token;
-            return;
-        }
-
-        let should_emit = if interest.event.events.contains(EpollEvents::ET) {
-            let previous_ready = interest
-                .last_ready
-                .intersection_bits(!Self::ALWAYS_EVENT_BITS)
-                .bits();
-            let current_ready = ready_events
-                .intersection_bits(!Self::ALWAYS_EVENT_BITS)
-                .bits();
-            let always_ready = ready_events
-                .intersection_bits(Self::ALWAYS_EVENT_BITS)
-                .bits();
-            let raised = current_ready & !previous_ready;
-            raised != 0 || always_ready != 0 || token != interest.last_token
-        } else {
-            ready_events.bits() != 0
-        };
-
-        interest.last_ready = ready_events;
-        interest.last_token = token;
-
-        if should_emit {
-            self.notifier.mark_ready(fd, ready_events);
-        }
-    }
-
-    fn collect_ready_interests(&self) {
-        let mut interests = self.interests.lock();
-        for (fd, interest) in interests.iter_mut() {
-            self.collect_interest_ready(*fd, interest);
-        }
-    }
-
-    fn ensure_pending_events(&self) -> bool {
-        if self.notifier.has_pending() {
-            return true;
-        }
-        self.collect_ready_interests();
-        self.notifier.has_pending()
+    fn should_requeue_level_triggered(interest: &EpollInterest) -> bool {
+        !interest.event.events.contains(EpollEvents::ONESHOT)
+            && !interest.event.events.contains(EpollEvents::ET)
     }
 
     pub fn ctl(
@@ -417,7 +371,7 @@ impl EpollInstance {
             EpollCtlOp::Mod => {
                 let old = interests.remove(&fd).ok_or(FsError::NotFound)?;
                 Self::unregister_interest_waiter(&old);
-                let _ = self.notifier.ready.lock().remove(&fd);
+                let _ = self.notifier.ready.lock().events.remove(&fd);
                 let waiter_id = self.register_interest_waiter(fd, &file, event)?;
                 interests.insert(
                     fd,
@@ -434,7 +388,7 @@ impl EpollInstance {
             EpollCtlOp::Del => {
                 let old = interests.remove(&fd).ok_or(FsError::NotFound)?;
                 Self::unregister_interest_waiter(&old);
-                let _ = self.notifier.ready.lock().remove(&fd);
+                let _ = self.notifier.ready.lock().events.remove(&fd);
             }
         }
 
@@ -446,11 +400,12 @@ impl EpollInstance {
             return Err(FsError::InvalidInput);
         }
 
-        if !self.ensure_pending_events() {
+        if !self.notifier.has_pending() {
             return Ok(Vec::new());
         }
 
         let mut result = Vec::with_capacity(max_events);
+        let mut requeue = Vec::new();
         while result.len() < max_events {
             let ready = self.notifier.take_ready(max_events - result.len());
             if ready.is_empty() {
@@ -488,13 +443,8 @@ impl EpollInstance {
                 }
                 result.push(EpollEvent::new(final_events, interest.event.data));
 
-                if interest.event.events.contains(EpollEvents::ONESHOT)
-                    || interest.event.events.contains(EpollEvents::ET)
-                {
-                    if result.len() >= max_events {
-                        break;
-                    }
-                    continue;
+                if Self::should_requeue_level_triggered(interest) {
+                    requeue.push((fd, current_ready));
                 }
                 if result.len() >= max_events {
                     break;
@@ -502,11 +452,15 @@ impl EpollInstance {
             }
         }
 
+        for (fd, ready) in requeue {
+            self.notifier.mark_ready(fd, ready);
+        }
+
         Ok(result)
     }
 
     pub fn has_pending_events(&self) -> bool {
-        self.ensure_pending_events()
+        self.notifier.has_pending()
     }
 
     pub fn interest_count(&self) -> usize {

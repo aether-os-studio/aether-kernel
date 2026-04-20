@@ -224,6 +224,7 @@ pub trait KernelSyscallContext {
     fn fallocate(&mut self, fd: u64, mode: u64, offset: i64, len: i64) -> SysResult<u64>;
     fn ftruncate(&mut self, fd: u64, length: u64) -> SysResult<u64>;
     fn ioctl_fd(&mut self, fd: u64, command: u64, argument: u64) -> SysResult<u64>;
+    fn ioctl_fd_blocking(&mut self, fd: u64, command: u64, argument: u64) -> SyscallDisposition;
     fn flock(&mut self, fd: u64, operation: u64) -> SysResult<u64>;
     fn flock_blocking(&mut self, fd: u64, operation: u64) -> SyscallDisposition;
     fn fcntl(&mut self, fd: u64, command: u64, arg: u64) -> SysResult<u64>;

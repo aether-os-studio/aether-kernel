@@ -2,10 +2,13 @@ use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
 use crate::fs::{DevPtsSlaveFile, FileSystemIdentity, PtmxMasterFile};
 use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::syscall::BlockResult;
 use crate::syscall::KernelSyscallContext;
 use crate::syscall::SyscallDisposition;
+use crate::syscall::abi::TIMER_ABSTIME;
 use aether_drivers::drm::{DrmDevice, DrmModeInfo, ioctl as drm_abi};
 use aether_drivers::{DrmFile, EvdevFile};
+use aether_frame::time;
 use aether_terminal::{ConsoleCore, LinuxTermios, LinuxTermios2, LinuxVtMode, LinuxWinSize};
 use aether_vfs::{FsError, IoctlResponse};
 
@@ -46,11 +49,41 @@ const N_TTY: i32 = 0;
 
 crate::declare_syscall!(
     pub struct IoctlSyscall => nr::IOCTL, "ioctl", |ctx, args| {
-        SyscallDisposition::Return(ctx.ioctl_fd(args.get(0), args.get(1), args.get(2)))
+        ctx.ioctl_fd_blocking(args.get(0), args.get(1), args.get(2))
     }
 );
 
 impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
+    pub(crate) fn syscall_ioctl_fd_blocking(
+        &mut self,
+        fd: u64,
+        command: u64,
+        argument: u64,
+    ) -> SyscallDisposition {
+        if command != drm_abi::DRM_IOCTL_WAIT_VBLANK {
+            return SyscallDisposition::Return(self.syscall_ioctl_fd(fd, command, argument));
+        }
+
+        let descriptor = match self.process.files.get(fd as u32) {
+            Some(descriptor) => descriptor,
+            None => return SyscallDisposition::err(SysErr::BadFd),
+        };
+        let (device, nonblock) = {
+            let file = descriptor.file.lock();
+            let device = file.file_ops_arc().and_then(|ops| {
+                ops.as_any()
+                    .downcast_ref::<DrmFile>()
+                    .map(|drm| drm.device().clone())
+            });
+            (device, file.flags().nonblock())
+        };
+        let Some(device) = device else {
+            return SyscallDisposition::Return(self.syscall_ioctl_fd(fd, command, argument));
+        };
+
+        self.syscall_drm_wait_vblank_blocking(fd as u32, device.as_ref(), argument, nonblock)
+    }
+
     pub(crate) fn syscall_ioctl_fd(
         &mut self,
         fd: u64,
@@ -120,6 +153,63 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             IoctlResponse::DataValue(bytes, value) => {
                 self.write_user_buffer(argument, &bytes)?;
                 Ok(value)
+            }
+        }
+    }
+
+    fn syscall_drm_wait_vblank_blocking(
+        &mut self,
+        _fd: u32,
+        device: &DrmDevice,
+        argument: u64,
+        nonblock: bool,
+    ) -> SyscallDisposition {
+        if argument == 0 {
+            return SyscallDisposition::err(SysErr::Fault);
+        }
+
+        let mut bytes =
+            match self.syscall_read_user_exact_buffer(argument, drm_abi::DrmWaitVBlank::SIZE) {
+                Ok(bytes) => bytes,
+                Err(error) => return SyscallDisposition::err(error),
+            };
+        let request = match drm_abi::DrmWaitVBlank::from_bytes(&bytes) {
+            Some(request) => request,
+            None => return SyscallDisposition::err(SysErr::Fault),
+        };
+
+        let mut target_sequence = None;
+        loop {
+            match device.wait_vblank(request, target_sequence) {
+                Ok(aether_drivers::drm::WaitVBlankResult::Complete(reply)) => {
+                    if !reply.write_to_bytes(&mut bytes) {
+                        return SyscallDisposition::err(SysErr::Fault);
+                    }
+                    if let Err(error) = self.write_user_buffer(argument, &bytes) {
+                        return SyscallDisposition::err(error);
+                    }
+                    return SyscallDisposition::ok(0);
+                }
+                Ok(aether_drivers::drm::WaitVBlankResult::Pending {
+                    target_sequence: target,
+                    next_wakeup_ns,
+                }) => {
+                    if nonblock {
+                        return SyscallDisposition::err(SysErr::Again);
+                    }
+
+                    target_sequence = Some(target);
+                    let request_nanos = next_wakeup_ns.saturating_sub(time::monotonic_nanos());
+                    match self.wait_timer(next_wakeup_ns, request_nanos, 0, TIMER_ABSTIME) {
+                        Ok(BlockResult::Timer { .. }) => {}
+                        Ok(BlockResult::SignalInterrupted) => {
+                            return SyscallDisposition::err(SysErr::Intr);
+                        }
+                        Ok(_) => return SyscallDisposition::err(SysErr::Intr),
+                        Err(disposition) => return disposition,
+                    }
+                }
+                Err(error) => return SyscallDisposition::err(SysErr::from(error)),
             }
         }
     }
@@ -836,7 +926,12 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             }
             drm_abi::DRM_IOCTL_WAIT_VBLANK => {
                 let request = drm_abi::DrmWaitVBlank::from_bytes(&bytes).ok_or(SysErr::Fault)?;
-                let reply = device.wait_vblank(request).map_err(SysErr::from)?;
+                let reply = match device.wait_vblank(request, None).map_err(SysErr::from)? {
+                    aether_drivers::drm::WaitVBlankResult::Complete(reply) => reply,
+                    aether_drivers::drm::WaitVBlankResult::Pending { .. } => {
+                        return Err(SysErr::Again);
+                    }
+                };
                 if !reply.write_to_bytes(&mut bytes) {
                     return Err(SysErr::Fault);
                 }

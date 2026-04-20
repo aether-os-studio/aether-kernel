@@ -592,15 +592,15 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                     return SyscallDisposition::err(error);
                 }
             };
-            if let Err(error) = self.write_poll_fds(user_fds, &poll_fds) {
-                self.restore_poll_wait_state(
-                    options.restore_sigmask,
-                    options.timeout_address,
-                    options,
-                );
-                return SyscallDisposition::err(error);
-            }
             if ready != 0 {
+                if let Err(error) = self.write_poll_fds(user_fds, &poll_fds) {
+                    self.restore_poll_wait_state(
+                        options.restore_sigmask,
+                        options.timeout_address,
+                        options,
+                    );
+                    return SyscallDisposition::err(error);
+                }
                 self.restore_poll_wait_state(
                     options.restore_sigmask,
                     options.timeout_address,
@@ -609,6 +609,14 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 return SyscallDisposition::ok(ready as u64);
             }
             if options.timeout_nanos == Some(0) {
+                if let Err(error) = self.write_poll_fds(user_fds, &poll_fds) {
+                    self.restore_poll_wait_state(
+                        options.restore_sigmask,
+                        options.timeout_address,
+                        options,
+                    );
+                    return SyscallDisposition::err(error);
+                }
                 self.restore_poll_wait_state(
                     options.restore_sigmask,
                     options.timeout_address,

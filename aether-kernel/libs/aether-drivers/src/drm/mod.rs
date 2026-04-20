@@ -25,5 +25,5 @@ pub use self::core::{
     DrmCrtcSnapshot, DrmDevice, DrmDriverInfo, DrmEncoderSnapshot, DrmFile, DrmFramebufferCreate,
     DrmFramebufferSnapshot, DrmIoctlError, DrmModeInfo, DrmObjectPropertiesSnapshot,
     DrmPlaneSnapshot, DrmPropertyEnumValue, DrmPropertyInfo, DrmResourcesSnapshot,
-    handle_vblank_tick, next_vblank_wakeup_deadline, probe, vblank_deadline_due,
+    WaitVBlankResult, handle_vblank_tick, next_vblank_wakeup_deadline, probe, vblank_deadline_due,
 };

@@ -89,8 +89,7 @@ static PROCESS_GROUP_SIGNAL_PENDING: AtomicBool = AtomicBool::new(false);
 static PENDING_PROCESS_GROUP_SIGNALS: SpinLock<VecDeque<(i32, i32)>, LocalIrqDisabled> =
     SpinLock::new(VecDeque::new());
 
-const PRECISE_WAIT_THRESHOLD_NS: u64 = 10_000_000;
-const IDLE_POLL_INTERVAL_NS: u64 = 1_000_000;
+const PRECISE_WAIT_THRESHOLD_NS: u64 = 100_000;
 
 pub(crate) fn publish_next_timer_deadline(deadline_nanos: Option<u64>) {
     NEXT_TIMER_DEADLINE_NANOS.store(deadline_nanos.unwrap_or(u64::MAX), Ordering::Release);
@@ -128,7 +127,7 @@ impl KernelRuntime {
         let current_nanos = time::monotonic_nanos();
         let drm_pending = aether_frame::arch::cpu::current_cpu_index() == 0
             && (DRM_VBLANK_PENDING.swap(false, Ordering::AcqRel)
-                || aether_drivers::drm::next_vblank_wakeup_deadline().is_some());
+                || aether_drivers::drm::vblank_deadline_due());
         if drm_pending {
             aether_drivers::drm::handle_vblank_tick();
         }
@@ -387,13 +386,6 @@ impl KernelRuntime {
                         }
                     }
 
-                    let wait_ns = next_deadline
-                        .map(|deadline| deadline.saturating_sub(time::monotonic_nanos()))
-                        .map(|remaining| remaining.min(IDLE_POLL_INTERVAL_NS))
-                        .unwrap_or(IDLE_POLL_INTERVAL_NS);
-                    if wait_ns != 0 && time::spin_delay_nanos(wait_ns).is_ok() {
-                        continue;
-                    }
                     aether_frame::arch::cpu::wait_for_interrupt();
                 }
                 DispatchWork::Event(event) => self.handle_event(event),

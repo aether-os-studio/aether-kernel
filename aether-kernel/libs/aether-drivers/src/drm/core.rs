@@ -135,6 +135,15 @@ pub enum DrmIoctlError {
     NoMemory,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitVBlankResult {
+    Complete(super::ioctl::DrmWaitVBlank),
+    Pending {
+        target_sequence: u64,
+        next_wakeup_ns: u64,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrmDriverInfo {
     pub name: String,
@@ -1477,7 +1486,8 @@ impl DrmDevice {
     pub fn wait_vblank(
         &self,
         request: super::ioctl::DrmWaitVBlank,
-    ) -> Result<super::ioctl::DrmWaitVBlank, DrmIoctlError> {
+        target_sequence: Option<u64>,
+    ) -> Result<WaitVBlankResult, DrmIoctlError> {
         let supported = super::ioctl::DRM_VBLANK_TYPES_MASK
             | super::ioctl::DRM_VBLANK_FLAGS_MASK
             | super::ioctl::DRM_VBLANK_HIGH_CRTC_MASK;
@@ -1500,85 +1510,77 @@ impl DrmDevice {
             return Err(DrmIoctlError::NotSupported);
         }
 
-        let mut target_set = false;
-        let mut target_seq = 0u64;
+        let now_ns = time::monotonic_nanos();
+        let (sequence, next_vblank_ns, vblank_period_ns) = {
+            let mut state = self.state.lock();
+            Self::advance_vblank_state_locked(&mut state, now_ns);
+            (
+                state.vblank_sequence,
+                state.next_vblank_ns,
+                state.vblank_period_ns,
+            )
+        };
 
-        loop {
-            let now_ns = time::monotonic_nanos();
-            let (sequence, next_vblank_ns) = {
+        let target_seq = target_sequence.unwrap_or_else(|| {
+            let mut target = if (request.type_ & super::ioctl::DRM_VBLANK_RELATIVE) != 0 {
+                sequence.saturating_add(request.sequence as u64)
+            } else {
+                request.sequence as u64
+            };
+            if (request.type_ & super::ioctl::DRM_VBLANK_NEXTONMISS) != 0 && sequence >= target {
+                target = sequence.saturating_add(1);
+            }
+            target
+        });
+
+        if (request.type_ & super::ioctl::DRM_VBLANK_EVENT) != 0 {
+            let notify_now = {
                 let mut state = self.state.lock();
                 Self::advance_vblank_state_locked(&mut state, now_ns);
-                (state.vblank_sequence, state.next_vblank_ns)
-            };
-
-            if !target_set {
-                target_seq = if (request.type_ & super::ioctl::DRM_VBLANK_RELATIVE) != 0 {
-                    sequence.saturating_add(request.sequence as u64)
+                if state.vblank_sequence >= target_seq || state.vblank_period_ns == 0 {
+                    let sequence = state.vblank_sequence as u32;
+                    self.queue_ready_event_locked(
+                        &mut state,
+                        DRM_EVENT_VBLANK,
+                        request.signal,
+                        now_ns,
+                        sequence,
+                    );
+                    true
                 } else {
-                    request.sequence as u64
-                };
-                if (request.type_ & super::ioctl::DRM_VBLANK_NEXTONMISS) != 0
-                    && sequence >= target_seq
-                {
-                    target_seq = sequence.saturating_add(1);
-                }
-                target_set = true;
-            }
-
-            if (request.type_ & super::ioctl::DRM_VBLANK_EVENT) != 0 {
-                let notify_now = {
-                    let mut state = self.state.lock();
-                    Self::advance_vblank_state_locked(&mut state, now_ns);
-                    if state.vblank_sequence >= target_seq || state.vblank_period_ns == 0 {
-                        let sequence = state.vblank_sequence as u32;
-                        self.queue_ready_event_locked(
-                            &mut state,
-                            DRM_EVENT_VBLANK,
-                            request.signal,
-                            now_ns,
-                            sequence,
-                        );
-                        true
-                    } else {
-                        if state.pending_events.len() >= MAX_PENDING_DRM_EVENTS {
-                            let _ = state.pending_events.pop_front();
-                        }
-                        state.pending_events.push_back(PendingDrmEvent {
-                            type_: DRM_EVENT_VBLANK,
-                            user_data: request.signal,
-                            target_sequence: target_seq,
-                        });
-                        false
+                    if state.pending_events.len() >= MAX_PENDING_DRM_EVENTS {
+                        let _ = state.pending_events.pop_front();
                     }
-                };
-                self.bump();
-                refresh_next_vblank_deadline();
-                if notify_now {
-                    self.waiters.notify(PollEvents::READ);
+                    state.pending_events.push_back(PendingDrmEvent {
+                        type_: DRM_EVENT_VBLANK,
+                        user_data: request.signal,
+                        target_sequence: target_seq,
+                    });
+                    false
                 }
-                return Ok(request);
-            }
-
-            if sequence >= target_seq {
-                return Ok(super::ioctl::DrmWaitVBlank {
-                    type_: request.type_,
-                    sequence: sequence as u32,
-                    signal: 0,
-                    tval_sec: (now_ns / 1_000_000_000) as i64,
-                    tval_usec: ((now_ns % 1_000_000_000) / 1_000) as i64,
-                });
-            }
-
-            let wait_ns = if next_vblank_ns > now_ns {
-                (next_vblank_ns - now_ns).min(10_000_000)
-            } else {
-                1_000_000
             };
-            if wait_ns == 0 {
-                continue;
+            self.bump();
+            refresh_next_vblank_deadline();
+            if notify_now {
+                self.waiters.notify(PollEvents::READ);
             }
-            let _ = time::spin_delay_nanos(wait_ns);
+            return Ok(WaitVBlankResult::Complete(request));
         }
+
+        if sequence >= target_seq || vblank_period_ns == 0 {
+            return Ok(WaitVBlankResult::Complete(super::ioctl::DrmWaitVBlank {
+                type_: request.type_,
+                sequence: sequence as u32,
+                signal: 0,
+                tval_sec: (now_ns / 1_000_000_000) as i64,
+                tval_usec: ((now_ns % 1_000_000_000) / 1_000) as i64,
+            }));
+        }
+
+        Ok(WaitVBlankResult::Pending {
+            target_sequence: target_seq,
+            next_wakeup_ns: next_vblank_ns,
+        })
     }
 
     fn drop_oldest_ready_event_locked(state: &mut DrmState) {

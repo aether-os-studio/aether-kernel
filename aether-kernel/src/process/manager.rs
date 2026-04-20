@@ -1599,12 +1599,12 @@ impl ProcessManager {
             return;
         }
 
-        let mut ready = alloc::collections::BTreeSet::new();
+        let mut ready = Vec::new();
         let mut queue = self.file_wait_queue.lock();
         let mut enqueued = self.file_wait_enqueued.lock();
         while let Some(pid) = queue.pop_front() {
             enqueued.remove(&pid);
-            ready.insert(pid);
+            ready.push(pid);
         }
         drop(enqueued);
         drop(queue);

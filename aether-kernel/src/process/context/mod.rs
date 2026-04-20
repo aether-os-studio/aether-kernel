@@ -490,6 +490,14 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
     fn ioctl_fd(&mut self, fd: u64, command: u64, argument: u64) -> SysResult<u64> {
         Self::syscall_ioctl_fd(self, fd, command, argument)
     }
+    fn ioctl_fd_blocking(
+        &mut self,
+        fd: u64,
+        command: u64,
+        argument: u64,
+    ) -> crate::syscall::SyscallDisposition {
+        Self::syscall_ioctl_fd_blocking(self, fd, command, argument)
+    }
     fn flock(&mut self, fd: u64, operation: u64) -> SysResult<u64> {
         Self::syscall_flock(self, fd, operation)
     }

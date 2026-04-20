@@ -66,6 +66,7 @@ pub mod nr {
     pub const FCHDIR: u64 = 81;
     pub const RENAME: u64 = 82;
     pub const MKDIR: u64 = 83;
+    pub const RMDIR: u64 = 84;
     pub const UNLINK: u64 = 87;
     pub const LINK: u64 = 86;
     pub const SYMLINK: u64 = 88;

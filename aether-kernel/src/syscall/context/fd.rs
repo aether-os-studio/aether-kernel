@@ -65,6 +65,7 @@ pub trait FdSyscallContext {
     fn pwritev64(&mut self, fd: u64, iov: u64, iovcnt: usize, offset: u64) -> SysResult<u64>;
     fn fadvise64(&mut self, fd: u64, offset: u64, len: u64, advice: u64) -> SysResult<u64>;
     fn ioctl_fd(&mut self, fd: u64, command: u64, argument: u64) -> SysResult<u64>;
+    fn ioctl_fd_blocking(&mut self, fd: u64, command: u64, argument: u64) -> SyscallDisposition;
     fn fcntl(&mut self, fd: u64, command: u64, arg: u64) -> SysResult<u64>;
     fn fstat(&mut self, fd: u64, address: u64) -> SysResult<u64>;
     fn fstatfs(&mut self, fd: u64, address: u64) -> SysResult<u64>;

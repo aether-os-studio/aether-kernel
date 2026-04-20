@@ -134,6 +134,8 @@ mod readlinkat;
 mod rename;
 #[path = "fs/renameat.rs"]
 mod renameat;
+#[path = "fs/rmdir.rs"]
+mod rmdir;
 #[path = "fs/stat.rs"]
 mod stat;
 #[path = "fs/statfs.rs"]
@@ -429,6 +431,7 @@ pub fn init() {
             fchmodat::FchmodatSyscall,
             lchown::LchownSyscall,
             mkdir::MkdirSyscall,
+            rmdir::RmdirSyscall,
             mmap::MmapSyscall,
             mprotect::MprotectSyscall,
             mremap::MremapSyscall,
