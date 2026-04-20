@@ -35,6 +35,22 @@ pub trait ProcessSyscallOps {
         options: u64,
         rusage: u64,
     ) -> SyscallDisposition;
+    fn waitid(
+        &mut self,
+        idtype: i32,
+        id: u64,
+        infop: u64,
+        options: u64,
+        rusage: u64,
+    ) -> SysResult<u64>;
+    fn waitid_blocking(
+        &mut self,
+        idtype: i32,
+        id: u64,
+        infop: u64,
+        options: u64,
+        rusage: u64,
+    ) -> SyscallDisposition;
     fn send_signal(&mut self, pid: i32, signal: u64) -> SysResult<u64>;
     fn tkill(&mut self, pid: i32, signal: u64) -> SysResult<u64>;
     fn tgkill(&mut self, tgid: i32, pid: i32, signal: u64) -> SysResult<u64>;

@@ -143,6 +143,7 @@ pub mod nr {
     pub const SIGNALFD4: u64 = 289;
     pub const EVENTFD2: u64 = 290;
     pub const EPOLL_CREATE1: u64 = 291;
+    pub const WAITID: u64 = 247;
     pub const PRLIMIT64: u64 = 302;
     pub const GETRANDOM: u64 = 318;
     pub const MEMFD_CREATE: u64 = 319;

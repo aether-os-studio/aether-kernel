@@ -97,6 +97,17 @@ impl PtyShared {
         read
     }
 
+    fn master_buffer_len(&self) -> usize {
+        self.master_buffer.lock().len()
+    }
+
+    fn clear_master_buffer(&self) -> bool {
+        let mut queue = self.master_buffer.lock();
+        let had_data = !queue.is_empty();
+        queue.clear();
+        had_data
+    }
+
     fn master_readable(&self) -> bool {
         !self.master_buffer.lock().is_empty()
     }
@@ -595,6 +606,16 @@ impl PtmxMasterFile {
                 Ok(())
             }
             _ => Err(FsError::InvalidInput),
+        }
+    }
+
+    pub fn readable_len(&self) -> usize {
+        self.shared.master_buffer_len()
+    }
+
+    pub fn flush_readable(&self) {
+        if self.shared.clear_master_buffer() {
+            self.shared.bump_master_waiters(PollEvents::READ);
         }
     }
 }

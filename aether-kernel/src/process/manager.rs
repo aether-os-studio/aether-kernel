@@ -13,7 +13,8 @@ use aether_vfs::{OpenFileDescription, PollEvents, SharedWaitListener, WaitListen
 use super::{
     ChildEvent, ChildEventKind, DispatchWork, FileWaitRegistration, KernelProcess,
     PendingPollRegistration, Pid, ProcessBlock, ProcessBox, ProcessIdentity, ProcessManager,
-    ProcessServices, ProcessState, ProcessStateSnapshot, ScheduleEvent, ZombieProcess,
+    ProcessServices, ProcessState, ProcessStateSnapshot, ScheduleEvent, WaitChildApi,
+    WaitChildSelector, ZombieProcess,
 };
 use crate::arch::ArchContext;
 use crate::arch::{
@@ -191,7 +192,7 @@ impl ProcessManager {
         None
     }
 
-    fn process_group_session(&self, process_group: Pid) -> Option<Pid> {
+    pub(crate) fn process_group_session(&self, process_group: Pid) -> Option<Pid> {
         self.thread_groups.keys().copied().find_map(|tgid| {
             (self.thread_group_process_group(tgid) == Some(process_group))
                 .then(|| self.thread_group_session(tgid))
@@ -366,6 +367,7 @@ impl ProcessManager {
             pid,
             ZombieProcess {
                 parent,
+                process_group: process.identity.process_group,
                 pidfd: process.pidfd.clone(),
             },
         );
@@ -685,12 +687,16 @@ impl ProcessManager {
             BlockType::SignalSuspend => ProcessBlock::SignalSuspend,
             BlockType::Vfork { child } => ProcessBlock::Vfork { child },
             BlockType::WaitChild {
-                pid,
+                selector,
+                api,
                 status_ptr,
+                info_ptr,
                 options,
             } => ProcessBlock::WaitChild {
-                pid,
+                selector,
+                api,
                 status_ptr,
+                info_ptr,
                 options,
             },
         });
@@ -1441,25 +1447,50 @@ impl ProcessManager {
         }
     }
 
-    pub(crate) fn reap_child_event(
+    fn child_process_group(&self, pid: Pid) -> Option<Pid> {
+        self.processes
+            .get(&pid)
+            .map(|process| process.identity.process_group)
+            .or_else(|| self.zombies.get(&pid).map(|zombie| zombie.process_group))
+            .or_else(|| crate::processor::running_process_group_of(pid))
+    }
+
+    fn child_matches_wait_selector(&self, selector: WaitChildSelector, child_pid: Pid) -> bool {
+        match selector {
+            WaitChildSelector::Any => true,
+            WaitChildSelector::Pid(pid) => child_pid == pid,
+            WaitChildSelector::ProcessGroup(process_group) => {
+                self.child_process_group(child_pid) == Some(process_group)
+            }
+        }
+    }
+
+    pub(crate) fn wait_child_event(
         &mut self,
         parent_pid: Pid,
-        requested: i32,
+        selector: WaitChildSelector,
         options: u64,
+        consume: bool,
     ) -> Option<ChildEvent> {
-        let event = {
-            let events = self.child_events.get_mut(&parent_pid)?;
-            let index = events.iter().position(|event| {
-                (requested == -1 || event.pid == requested as u32)
+        let index = {
+            let events = self.child_events.get(&parent_pid)?;
+            events.iter().position(|event| {
+                self.child_matches_wait_selector(selector, event.pid)
                     && super::util::child_event_matches_options(event.kind, options)
-            })?;
+            })?
+        };
+        let event = if consume {
+            let events = self.child_events.get_mut(&parent_pid)?;
             let event = events.remove(index)?;
             if events.is_empty() {
                 self.child_events.remove(&parent_pid);
             }
             event
+        } else {
+            let events = self.child_events.get(&parent_pid)?;
+            *events.get(index)?
         };
-        if matches!(event.kind, ChildEventKind::Exited(_)) {
+        if consume && matches!(event.kind, ChildEventKind::Exited(_)) {
             let zombie = self.zombies.remove(&event.pid);
             if let Some(zombie) = zombie.as_ref() {
                 zombie.pidfd.mark_reaped();
@@ -1470,11 +1501,14 @@ impl ProcessManager {
         Some(event)
     }
 
-    pub(crate) fn has_child(&self, parent_pid: Pid, requested: i32) -> bool {
+    pub(crate) fn has_waitable_child(&self, parent_pid: Pid, selector: WaitChildSelector) -> bool {
         let Some(children) = self.parent_children.get(&parent_pid) else {
             return false;
         };
-        requested == -1 || children.contains(&(requested as u32))
+        children
+            .iter()
+            .copied()
+            .any(|child_pid| self.child_matches_wait_selector(selector, child_pid))
     }
 
     pub(crate) fn wake_ready_file_blocks(&mut self) {
@@ -1584,23 +1618,29 @@ impl ProcessManager {
                 return;
             };
             process.signals.enqueue(info);
+            let signal_deliverable = process
+                .signals
+                .has_deliverable(crate::arch::supports_user_handlers());
 
-            if matches!(
-                process.state,
-                ProcessState::Blocked(ProcessBlock::SignalSuspend)
-            ) {
+            if signal_deliverable
+                && matches!(
+                    process.state,
+                    ProcessState::Blocked(ProcessBlock::SignalSuspend)
+                )
+            {
                 process.signals.leave_sigsuspend();
                 process.wake_result = Some(BlockResult::SignalInterrupted);
                 process.state = ProcessState::Runnable;
                 queue_assigned_cpu = Some(process.assigned_cpu);
             }
 
-            if let ProcessState::Blocked(ProcessBlock::Timer {
-                target_nanos,
-                request_nanos,
-                rmtp,
-                flags,
-            }) = process.state
+            if signal_deliverable
+                && let ProcessState::Blocked(ProcessBlock::Timer {
+                    target_nanos,
+                    request_nanos,
+                    rmtp,
+                    flags,
+                }) = process.state
             {
                 let _ = request_nanos;
                 let current_nanos = time::monotonic_nanos();
@@ -1624,14 +1664,18 @@ impl ProcessManager {
                 queue_assigned_cpu = Some(process.assigned_cpu);
             }
 
-            if let ProcessState::Blocked(ProcessBlock::Poll { .. }) = process.state {
+            if signal_deliverable
+                && let ProcessState::Blocked(ProcessBlock::Poll { .. }) = process.state
+            {
                 process.wake_result = Some(BlockResult::SignalInterrupted);
                 unblock_block = Some(process.state);
                 process.state = ProcessState::Runnable;
                 queue_assigned_cpu = Some(process.assigned_cpu);
             }
 
-            if let ProcessState::Blocked(ProcessBlock::Futex { .. }) = process.state {
+            if signal_deliverable
+                && let ProcessState::Blocked(ProcessBlock::Futex { .. }) = process.state
+            {
                 process.wake_result = Some(BlockResult::SignalInterrupted);
                 unblock_block = Some(process.state);
                 process.state = ProcessState::Runnable;
@@ -1941,29 +1985,48 @@ impl ProcessManager {
         };
 
         let mut woke_waiter = false;
-        if let Some(parent_process) = self.processes.get_mut(&parent_pid)
-            && let ProcessState::Blocked(ProcessBlock::WaitChild {
-                pid: waited_pid,
+        let mut preserve_event = false;
+        let blocked_wait = self.processes.get(&parent_pid).and_then(|parent_process| {
+            let ProcessState::Blocked(ProcessBlock::WaitChild {
+                selector,
+                api,
                 status_ptr,
+                info_ptr: _,
                 options,
             }) = parent_process.state
-            && (waited_pid == -1 || waited_pid == event.pid as i32)
+            else {
+                return None;
+            };
+            Some((selector, api, status_ptr, options))
+        });
+        if let Some((selector, api, status_ptr, options)) = blocked_wait
+            && self.child_matches_wait_selector(selector, event.pid)
             && super::util::child_event_matches_options(event.kind, options)
         {
             let nohang = (options & 1) != 0;
             if !nohang {
-                if status_ptr != 0 {
+                let Some(parent_process) = self.processes.get_mut(&parent_pid) else {
+                    return;
+                };
+                preserve_event = matches!(api, WaitChildApi::WaitId);
+                if matches!(api, WaitChildApi::Wait4) && status_ptr != 0 {
                     let raw = super::util::wait_status(event.kind).to_ne_bytes();
                     let _ = parent_process.task.address_space.write(status_ptr, &raw);
                 }
                 parent_process.wake_result = Some(BlockResult::CompletedValue {
-                    value: event.pid as u64,
+                    value: if matches!(api, WaitChildApi::Wait4) {
+                        event.pid as u64
+                    } else {
+                        0
+                    },
                 });
                 parent_process.state = ProcessState::Runnable;
                 let assigned_cpu = parent_process.assigned_cpu;
                 let _ = parent_process;
                 self.enqueue_runnable_pid(parent_pid, assigned_cpu);
-                if matches!(event.kind, ChildEventKind::Exited(_)) {
+                if matches!(api, WaitChildApi::Wait4)
+                    && matches!(event.kind, ChildEventKind::Exited(_))
+                {
                     let parent = self
                         .zombies
                         .remove(&event.pid)
@@ -1974,7 +2037,7 @@ impl ProcessManager {
             }
         }
 
-        if !woke_waiter {
+        if !woke_waiter || preserve_event {
             self.child_events
                 .entry(parent_pid)
                 .or_default()

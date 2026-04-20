@@ -12,11 +12,14 @@ use crate::signal::{SignalAction, SignalInfo};
 const SA_NODEFER: u64 = 0x4000_0000;
 const SA_RESTORER: u64 = 0x0400_0000;
 const SA_SIGINFO: u64 = 0x0000_0004;
+const UC_SIGCONTEXT_SS: u64 = 0x2;
+const UC_STRICT_RESTORE_SS: u64 = 0x4;
 const X86_64_RED_ZONE_SIZE: u64 = 128;
 const X86_64_SIGNAL_FRAME_ALIGN: u64 = 16;
 const USER_CODE_SELECTOR: u64 = 0x23;
 const USER_DATA_SELECTOR: u64 = 0x1b;
 const TRAMPOLINE_BYTES: [u8; 9] = [0xb8, 15, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b];
+const FPREGS_MEM_OFFSET: u64 = 424;
 
 const X64_REG_R8: usize = 0;
 const X64_REG_R9: usize = 1;
@@ -156,7 +159,12 @@ pub fn deliver_signal_to_user(
     let saved_mask = process.signals.blocked();
     let layout = SignalFrameLayout::new(saved.general.rsp, action)?;
     let siginfo = build_siginfo(signal);
-    let ucontext = build_ucontext(saved, saved_mask);
+    let ucontext = build_ucontext(
+        &process.task.process,
+        saved,
+        saved_mask,
+        layout.ucontext_addr,
+    );
     let siginfo_bytes = serialize_siginfo(&siginfo);
     let ucontext_bytes = serialize_ucontext(&ucontext);
 
@@ -210,6 +218,16 @@ pub fn restore_signal_from_user(process: &mut KernelProcess) -> SysResult<u64> {
         .read_user_exact(ucontext_addr, size_of::<LinuxUContext>())
         .map_err(|_| SysErr::Fault)?;
     let ucontext = decode_ucontext(&bytes).ok_or(SysErr::Fault)?;
+    if ucontext.uc_mcontext.fpregs != 0 {
+        let fpregs = process
+            .task
+            .address_space
+            .read_user_exact(ucontext.uc_mcontext.fpregs, ucontext.fpregs_mem.len())
+            .map_err(|_| SysErr::Fault)?;
+        let _ = process.task.process.restore_fpu_state_prefix(&fpregs);
+        // TODO: restore the full XSAVE user buffer once the kernel exposes it directly in the
+        // signal frame. The current implementation restores the architectural FXSAVE prefix only.
+    }
     let current = *process.task.process.context();
     let restored = restore_ucontext(current, &ucontext);
     process.signals.restore_mask(ucontext.uc_sigmask.bits[0]);
@@ -285,8 +303,15 @@ fn build_siginfo(info: SignalInfo) -> LinuxSiginfo {
     }
 }
 
-fn build_ucontext(context: UserContext, mask: u64) -> LinuxUContext {
+fn build_ucontext(
+    process: &aether_frame::process::Process,
+    context: UserContext,
+    mask: u64,
+    ucontext_addr: u64,
+) -> LinuxUContext {
     let mut ucontext = LinuxUContext::default();
+    ucontext.uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
+    ucontext.uc_mcontext.fpregs = ucontext_addr + FPREGS_MEM_OFFSET;
     ucontext.uc_mcontext.gregs[X64_REG_R8] = context.general.r8;
     ucontext.uc_mcontext.gregs[X64_REG_R9] = context.general.r9;
     ucontext.uc_mcontext.gregs[X64_REG_R10] = context.general.r10;
@@ -309,6 +334,9 @@ fn build_ucontext(context: UserContext, mask: u64) -> LinuxUContext {
     ucontext.uc_mcontext.gregs[X64_REG_ERR] = context.error_code;
     ucontext.uc_mcontext.gregs[X64_REG_TRAPNO] = context.trap_num;
     ucontext.uc_sigmask.bits[0] = mask;
+    let _ = process.copy_fpu_state_prefix(&mut ucontext.fpregs_mem);
+    // TODO: copy the complete XSAVE image when user-visible extended signal frames are modeled.
+    // The inlined `__fpregs_mem` buffer only preserves the FXSAVE-compatible prefix for now.
     ucontext
 }
 

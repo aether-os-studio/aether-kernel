@@ -161,13 +161,17 @@ impl<S> ProcessSyscallContext<'_, S> {
 
     pub(crate) fn wait_wait_child(
         &mut self,
-        pid: i32,
+        selector: crate::process::WaitChildSelector,
+        api: crate::process::WaitChildApi,
         status_ptr: u64,
+        info_ptr: u64,
         options: u64,
     ) -> Result<BlockResult, SyscallDisposition> {
         self.take_wake_result_or_block(BlockType::WaitChild {
-            pid,
+            selector,
+            api,
             status_ptr,
+            info_ptr,
             options,
         })
     }
@@ -878,6 +882,26 @@ impl<S: ProcessServices> KernelSyscallContext for ProcessSyscallContext<'_, S> {
         rusage: u64,
     ) -> crate::syscall::SyscallDisposition {
         Self::syscall_wait4_blocking(self, pid, status, options, rusage)
+    }
+    fn waitid(
+        &mut self,
+        idtype: i32,
+        id: u64,
+        infop: u64,
+        options: u64,
+        rusage: u64,
+    ) -> SysResult<u64> {
+        Self::syscall_waitid(self, idtype, id, infop, options, rusage)
+    }
+    fn waitid_blocking(
+        &mut self,
+        idtype: i32,
+        id: u64,
+        infop: u64,
+        options: u64,
+        rusage: u64,
+    ) -> crate::syscall::SyscallDisposition {
+        Self::syscall_waitid_blocking(self, idtype, id, infop, options, rusage)
     }
     fn send_signal(&mut self, pid: i32, signal: u64) -> SysResult<u64> {
         Self::syscall_send_signal(self, pid, signal)

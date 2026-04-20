@@ -6,7 +6,7 @@ mod registry;
 
 use crate::arch::ArchContext;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{CloneParams, FutexKey, Pid};
+use crate::process::{CloneParams, FutexKey, Pid, WaitChildApi, WaitChildSelector};
 use aether_vfs::PollEvents;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -55,8 +55,10 @@ pub enum BlockType {
         child: Pid,
     },
     WaitChild {
-        pid: i32,
+        selector: WaitChildSelector,
+        api: WaitChildApi,
         status_ptr: u64,
+        info_ptr: u64,
         options: u64,
     },
 }
@@ -424,6 +426,22 @@ pub trait KernelSyscallContext {
         &mut self,
         pid: i32,
         status: u64,
+        options: u64,
+        rusage: u64,
+    ) -> SyscallDisposition;
+    fn waitid(
+        &mut self,
+        idtype: i32,
+        id: u64,
+        infop: u64,
+        options: u64,
+        rusage: u64,
+    ) -> SysResult<u64>;
+    fn waitid_blocking(
+        &mut self,
+        idtype: i32,
+        id: u64,
+        infop: u64,
         options: u64,
         rusage: u64,
     ) -> SyscallDisposition;

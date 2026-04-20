@@ -1,6 +1,8 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext, wait_status};
+use crate::process::{
+    ProcessServices, ProcessSyscallContext, WaitChildApi, WaitChildSelector, wait_status,
+};
 use crate::syscall::{BlockResult, KernelSyscallContext, SyscallDisposition};
 
 crate::declare_syscall!(
@@ -10,6 +12,15 @@ crate::declare_syscall!(
 );
 
 impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
+    fn wait4_selector(&self, pid: i32) -> SysResult<WaitChildSelector> {
+        Ok(match pid {
+            -1 => WaitChildSelector::Any,
+            0 => WaitChildSelector::ProcessGroup(self.process.identity.process_group),
+            value if value < -1 => WaitChildSelector::ProcessGroup(value.unsigned_abs()),
+            value => WaitChildSelector::Pid(value as u32),
+        })
+    }
+
     pub(crate) fn syscall_wait4(
         &mut self,
         pid: i32,
@@ -17,9 +28,10 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         options: u64,
         _rusage: u64,
     ) -> SysResult<u64> {
-        if let Some(event) = self
-            .services
-            .reap_child_event(self.process.identity.pid, pid, options)
+        let selector = self.wait4_selector(pid)?;
+        if let Some(event) =
+            self.services
+                .wait_child_event(self.process.identity.pid, selector, options, true)
         {
             if status != 0 {
                 let raw = wait_status(event.kind);
@@ -29,13 +41,19 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
 
         if (options & 1) != 0 {
-            if self.services.has_child(self.process.identity.pid, pid) {
+            if self
+                .services
+                .has_waitable_child(self.process.identity.pid, selector)
+            {
                 return Ok(0);
             }
             return Err(SysErr::Child);
         }
 
-        if self.services.has_child(self.process.identity.pid, pid) {
+        if self
+            .services
+            .has_waitable_child(self.process.identity.pid, selector)
+        {
             return Err(SysErr::Again);
         }
         Err(SysErr::Child)
@@ -48,6 +66,10 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         options: u64,
         rusage: u64,
     ) -> SyscallDisposition {
+        let selector = match self.wait4_selector(pid) {
+            Ok(selector) => selector,
+            Err(error) => return SyscallDisposition::err(error),
+        };
         let _ = rusage;
         if let Some(result) = self.process.wake_result.take() {
             return match result {
@@ -58,13 +80,18 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
 
         match self.syscall_wait4(pid, status, options, rusage) {
-            Ok(value) => SyscallDisposition::ok(value),
-            Err(SysErr::Again) => match self.wait_wait_child(pid, status, options) {
-                Ok(BlockResult::CompletedValue { value }) => SyscallDisposition::ok(value),
-                Ok(BlockResult::SignalInterrupted) => SyscallDisposition::err(SysErr::Intr),
-                Ok(_) => SyscallDisposition::err(SysErr::Intr),
-                Err(disposition) => disposition,
-            },
+            Ok(value) => {
+                // TODO: populate `rusage` with real child resource usage once the kernel tracks it.
+                SyscallDisposition::ok(value)
+            }
+            Err(SysErr::Again) => {
+                match self.wait_wait_child(selector, WaitChildApi::Wait4, status, 0, options) {
+                    Ok(BlockResult::CompletedValue { value }) => SyscallDisposition::ok(value),
+                    Ok(BlockResult::SignalInterrupted) => SyscallDisposition::err(SysErr::Intr),
+                    Ok(_) => SyscallDisposition::err(SysErr::Intr),
+                    Err(disposition) => disposition,
+                }
+            }
             Err(error) => SyscallDisposition::err(error),
         }
     }

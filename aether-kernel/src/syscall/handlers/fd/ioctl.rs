@@ -14,11 +14,16 @@ const TCGETS: u64 = 0x5401;
 const TCSETS: u64 = 0x5402;
 const TCSETSW: u64 = 0x5403;
 const TCSETSF: u64 = 0x5404;
+const FIONREAD: u64 = 0x541b;
 const TIOCGPGRP: u64 = 0x540f;
 const TIOCSPGRP: u64 = 0x5410;
+const TIOCOUTQ: u64 = 0x5411;
 const TIOCSWINSZ: u64 = 0x5414;
 const TIOCSCTTY: u64 = 0x540e;
 const TIOCNOTTY: u64 = 0x5422;
+const TIOCGETD: u64 = 0x5424;
+const TIOCSETD: u64 = 0x5423;
+const TIOCGSID: u64 = 0x5429;
 const TIOCGPTN: u64 = 0x8004_5430;
 const TIOCSPTLCK: u64 = 0x4004_5431;
 const TIOCGPTLCK: u64 = 0x8004_5439;
@@ -32,6 +37,12 @@ const VT_ACTIVATE: u64 = 0x5606;
 const VT_WAITACTIVE: u64 = 0x5607;
 const TCGETS2: u64 = 0x802c_542a;
 const TCSETS2: u64 = 0x402c_542b;
+const TCSETSW2: u64 = 0x402c_542c;
+const TCSETSF2: u64 = 0x402c_542d;
+const TCIFLUSH: u64 = 0;
+const TCOFLUSH: u64 = 1;
+const TCIOFLUSH: u64 = 2;
+const N_TTY: i32 = 0;
 
 crate::declare_syscall!(
     pub struct IoctlSyscall => nr::IOCTL, "ioctl", |ctx, args| {
@@ -132,17 +143,30 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 )?)
                 .ok_or(SysErr::Fault)?;
                 console.set_termios(termios);
+                if command == TCSETSF {
+                    console.flush_input();
+                }
+                // TODO: Linux waits for pending tty output to drain for `TCSETSW/TCSETSF`.
+                // The current kernel PTY path applies the termios update immediately.
                 Some(IoctlResponse::success())
             }
-            TCSETS2 => {
+            TCSETS2 | TCSETSW2 | TCSETSF2 => {
                 let termios = LinuxTermios2::from_bytes(&self.syscall_read_user_exact_buffer(
                     argument,
                     core::mem::size_of::<LinuxTermios2>(),
                 )?)
                 .ok_or(SysErr::Fault)?;
                 console.set_termios2(termios);
+                if command == TCSETSF2 {
+                    console.flush_input();
+                }
+                // TODO: Linux waits for pending tty output to drain for `TCSETSW2/TCSETSF2`.
+                // The current kernel PTY path applies the termios update immediately.
                 Some(IoctlResponse::success())
             }
+            FIONREAD => Some(IoctlResponse::Data(
+                (console.input_len() as i32).to_ne_bytes().to_vec(),
+            )),
             TIOCGPGRP => {
                 if self.process.controlling_terminal != Some(tty_id)
                     || console.session() != current_session
@@ -169,10 +193,20 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 if !self.services.has_process_group(process_group as u32) {
                     return Err(SysErr::Srch);
                 }
-                // TODO: Linux also verifies that the target process group belongs to the
-                // caller's session before updating the tty foreground process group.
+                if self.services.process_group_session(process_group as u32)
+                    != Some(self.process.identity.session)
+                {
+                    return Err(SysErr::Perm);
+                }
                 console.set_process_group(process_group);
                 Some(IoctlResponse::success())
+            }
+            TIOCGSID => {
+                let session = console.session();
+                if session == 0 {
+                    return Err(SysErr::NoTty);
+                }
+                Some(IoctlResponse::Data(session.to_ne_bytes().to_vec()))
             }
             TIOCSWINSZ => {
                 let winsize = LinuxWinSize::from_bytes(&self.syscall_read_user_exact_buffer(
@@ -216,8 +250,33 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 }
                 Some(IoctlResponse::success())
             }
-            TCFLSH => Some(IoctlResponse::success()),
+            TCFLSH => {
+                match argument {
+                    TCIFLUSH | TCIOFLUSH => console.flush_input(),
+                    TCOFLUSH => {
+                        // TODO: track tty output queues so `TCOFLUSH` can discard pending slave
+                        // output exactly like Linux. The current direct-write console path has no
+                        // separate buffered output queue to flush here.
+                    }
+                    _ => return Err(SysErr::Inval),
+                }
+                Some(IoctlResponse::success())
+            }
             TIOCNXCL => Some(IoctlResponse::success()),
+            TIOCOUTQ => Some(IoctlResponse::Data(0i32.to_ne_bytes().to_vec())),
+            TIOCGETD => Some(IoctlResponse::Data(N_TTY.to_ne_bytes().to_vec())),
+            TIOCSETD => {
+                let bytes =
+                    self.syscall_read_user_exact_buffer(argument, core::mem::size_of::<i32>())?;
+                let discipline =
+                    i32::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| SysErr::Fault)?);
+                if discipline != N_TTY {
+                    // TODO: support additional tty line disciplines if userspace starts
+                    // depending on them. Only the default `N_TTY` discipline exists today.
+                    return Err(SysErr::Inval);
+                }
+                Some(IoctlResponse::success())
+            }
             KDSETMODE => {
                 console.set_tty_mode(argument as i32);
                 Some(IoctlResponse::success())
@@ -260,6 +319,10 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         const PT_PEER_ALLOWED_FLAGS: u64 = O_ACCMODE | O_NOCTTY | O_NONBLOCK | O_CLOEXEC;
 
         let result = match command {
+            FIONREAD => Some(IoctlResponse::Data(
+                (master.readable_len() as i32).to_ne_bytes().to_vec(),
+            )),
+            TIOCOUTQ => Some(IoctlResponse::Data(0i32.to_ne_bytes().to_vec())),
             TIOCGPTN => Some(IoctlResponse::Data(
                 master.pty_number().to_ne_bytes().to_vec(),
             )),
@@ -285,6 +348,17 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 let peer = master.peer_node().ok_or(SysErr::Io)?;
                 let fd = self.open_node(peer, filesystem, None, argument)?;
                 Some(IoctlResponse::None(fd))
+            }
+            TCFLSH => {
+                match argument {
+                    TCIFLUSH | TCIOFLUSH => master.flush_readable(),
+                    TCOFLUSH => {
+                        // TODO: propagate PTY master `TCOFLUSH` into the slave input queue once
+                        // the kernel tracks a distinct buffered master-to-slave transmit queue.
+                    }
+                    _ => return Err(SysErr::Inval),
+                }
+                Some(IoctlResponse::success())
             }
             _ => self.syscall_tty_ioctl(master.slave(), command, argument)?,
         };

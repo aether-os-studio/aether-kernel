@@ -220,6 +220,14 @@ impl Process {
         &mut self.context
     }
 
+    pub fn copy_fpu_state_prefix(&self, dest: &mut [u8]) -> usize {
+        self.fpu_state.copy_prefix_to(dest)
+    }
+
+    pub fn restore_fpu_state_prefix(&mut self, src: &[u8]) -> usize {
+        self.fpu_state.restore_prefix_from(src)
+    }
+
     #[must_use]
     pub const fn kernel_stack_top(&self) -> u64 {
         self.kernel_stack_top

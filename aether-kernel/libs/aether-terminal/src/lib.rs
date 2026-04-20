@@ -75,6 +75,9 @@ const ICANON: u32 = 0o000002;
 const ECHO: u32 = 0o000010;
 const ECHOE: u32 = 0o000020;
 const ECHOK: u32 = 0o000040;
+const ECHOCTL: u32 = 0o001000;
+const ECHOKE: u32 = 0o004000;
+const IEXTEN: u32 = 0o100000;
 
 const SIGINT: i32 = 2;
 const SIGQUIT: i32 = 3;
@@ -177,7 +180,7 @@ impl LinuxTermios {
             c_iflag: ICRNL | IXON | BRKINT | ISTRIP | INPCK,
             c_oflag: OPOST | ONLCR,
             c_cflag: B38400 | CS8 | CREAD | HUPCL,
-            c_lflag: ISIG | ICANON | ECHO | ECHOE | ECHOK,
+            c_lflag: ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN,
             c_line: 0,
             c_cc,
         }
@@ -547,7 +550,7 @@ fn tty_echo_erase(endpoint: &TtyEndpoint, state: &ConsoleTtyState) {
     if (state.termios.c_lflag & ECHO) == 0 {
         return;
     }
-    if (state.termios.c_lflag & ECHOE) != 0 {
+    if (state.termios.c_lflag & (ECHOE | ECHOKE)) != 0 {
         endpoint.write_bytes(b"\x08 \x08");
     }
 }
@@ -1220,6 +1223,23 @@ impl TtyFile {
         self.with_state_mut(|state| state.termios = termios);
     }
 
+    pub fn input_len(&self) -> usize {
+        self.with_state(|state| state.input_count as usize)
+    }
+
+    pub fn flush_input(&self) {
+        let endpoint = self.endpoint();
+        {
+            let mut state = endpoint.tty.lock();
+            state.input_head = 0;
+            state.input_tail = 0;
+            state.input_count = 0;
+            state.canon_count = 0;
+        }
+        endpoint.bump_version();
+        endpoint.waiters.notify(PollEvents::READ);
+    }
+
     pub fn termios2(&self) -> LinuxTermios2 {
         LinuxTermios2::from_termios(self.termios())
     }
@@ -1384,6 +1404,7 @@ impl FileOperations for TtyFile {
         let mut state = endpoint.tty.lock();
         let vmin = state.termios.c_cc[VMIN].max(1) as usize;
         let canonical = (state.termios.c_lflag & ICANON) != 0;
+        let veol = state.termios.c_cc[VEOL];
 
         if state.input_count == 0 {
             return Err(FsError::WouldBlock);
@@ -1396,7 +1417,7 @@ impl FileOperations for TtyFile {
             };
             buffer[read] = byte;
             read += 1;
-            if canonical && byte == b'\n' {
+            if canonical && (byte == b'\n' || byte == veol) {
                 break;
             }
             if !canonical && read >= vmin {

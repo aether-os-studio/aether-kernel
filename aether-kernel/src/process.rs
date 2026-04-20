@@ -97,8 +97,10 @@ pub enum ProcessBlock {
         child: Pid,
     },
     WaitChild {
-        pid: i32,
+        selector: WaitChildSelector,
+        api: WaitChildApi,
         status_ptr: u64,
+        info_ptr: u64,
         options: u64,
     },
     Futex {
@@ -480,9 +482,23 @@ pub struct ChildEvent {
     pub kind: ChildEventKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitChildSelector {
+    Any,
+    Pid(Pid),
+    ProcessGroup(Pid),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitChildApi {
+    Wait4,
+    WaitId,
+}
+
 #[derive(Clone)]
 struct ZombieProcess {
     parent: Option<Pid>,
+    process_group: Pid,
     pidfd: Arc<PidFdHandle>,
 }
 
@@ -560,16 +576,18 @@ pub trait ProcessServices {
         envp: Vec<String>,
     ) -> SysResult<u64>;
     fn clone_process(&mut self, parent: &mut KernelProcess, params: CloneParams) -> SysResult<Pid>;
-    fn reap_child_event(
+    fn wait_child_event(
         &mut self,
         parent_pid: Pid,
-        requested: i32,
+        selector: WaitChildSelector,
         options: u64,
+        consume: bool,
     ) -> Option<ChildEvent>;
-    fn has_child(&mut self, parent_pid: Pid, requested: i32) -> bool;
+    fn has_waitable_child(&mut self, parent_pid: Pid, selector: WaitChildSelector) -> bool;
     fn thread_group_of(&mut self, pid: Pid) -> Option<Pid>;
     fn has_thread_group(&mut self, tgid: Pid) -> bool;
     fn has_process_group(&mut self, process_group: Pid) -> bool;
+    fn process_group_session(&mut self, process_group: Pid) -> Option<Pid>;
     fn setpgid(
         &mut self,
         caller: &mut KernelProcess,

@@ -18,7 +18,14 @@ pub(super) fn child_event_matches_options(kind: ChildEventKind, options: u64) ->
 
 pub(crate) fn wait_status(kind: ChildEventKind) -> i32 {
     match kind {
-        ChildEventKind::Exited(status) => (status & 0xff) << 8,
+        ChildEventKind::Exited(status) => {
+            if status >= 128 {
+                // TODO: set the Linux core-dump bit once the kernel tracks that termination mode.
+                status - 128
+            } else {
+                (status & 0xff) << 8
+            }
+        }
         ChildEventKind::Stopped(signal) => ((signal as i32) << 8) | 0x7f,
         ChildEventKind::Continued => 0xffff,
     }

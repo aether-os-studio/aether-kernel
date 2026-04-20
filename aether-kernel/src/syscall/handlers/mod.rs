@@ -278,6 +278,8 @@ mod setuid;
 mod vfork;
 #[path = "process/wait4.rs"]
 mod wait4;
+#[path = "process/waitid.rs"]
+mod waitid;
 
 #[path = "signal/getrandom.rs"]
 mod getrandom;
@@ -329,6 +331,7 @@ pub fn init() {
             vfork::VforkSyscall,
             clone3::Clone3Syscall,
             wait4::Wait4Syscall,
+            waitid::WaitidSyscall,
             kill::KillSyscall,
             lstat::LstatSyscall,
             lseek::LseekSyscall,

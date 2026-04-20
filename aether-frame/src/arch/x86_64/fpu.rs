@@ -103,6 +103,22 @@ impl FpuState {
     pub(crate) fn copy_from(&mut self, other: &Self) {
         self.bytes.copy_from_slice(&other.bytes);
     }
+
+    pub fn copy_prefix_to(&self, dest: &mut [u8]) -> usize {
+        let len = core::cmp::min(dest.len(), self.active_len());
+        dest[..len].copy_from_slice(&self.bytes[..len]);
+        len
+    }
+
+    pub fn restore_prefix_from(&mut self, src: &[u8]) -> usize {
+        let len = core::cmp::min(src.len(), self.active_len());
+        self.bytes[..len].copy_from_slice(&src[..len]);
+        len
+    }
+
+    pub fn active_len(&self) -> usize {
+        config().state_size
+    }
 }
 
 impl Default for FpuState {

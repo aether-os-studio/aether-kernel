@@ -824,19 +824,26 @@ impl ProcessServices for RuntimeServices<'_> {
         Ok(self.processes.lock().insert_cloned_process(child))
     }
 
-    fn reap_child_event(
+    fn wait_child_event(
         &mut self,
         parent_pid: Pid,
-        requested: i32,
+        selector: crate::process::WaitChildSelector,
         options: u64,
+        consume: bool,
     ) -> Option<ChildEvent> {
         self.processes
             .lock()
-            .reap_child_event(parent_pid, requested, options)
+            .wait_child_event(parent_pid, selector, options, consume)
     }
 
-    fn has_child(&mut self, parent_pid: Pid, requested: i32) -> bool {
-        self.processes.lock().has_child(parent_pid, requested)
+    fn has_waitable_child(
+        &mut self,
+        parent_pid: Pid,
+        selector: crate::process::WaitChildSelector,
+    ) -> bool {
+        self.processes
+            .lock()
+            .has_waitable_child(parent_pid, selector)
     }
 
     fn thread_group_of(&mut self, pid: Pid) -> Option<Pid> {
@@ -849,6 +856,10 @@ impl ProcessServices for RuntimeServices<'_> {
 
     fn has_process_group(&mut self, process_group: Pid) -> bool {
         self.processes.lock().has_process_group(process_group)
+    }
+
+    fn process_group_session(&mut self, process_group: Pid) -> Option<Pid> {
+        self.processes.lock().process_group_session(process_group)
     }
 
     fn setpgid(

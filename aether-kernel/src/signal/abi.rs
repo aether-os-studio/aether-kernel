@@ -46,6 +46,12 @@ pub const SIG_IGN: u64 = 1;
 pub const SA_NOCLDSTOP: u64 = 0x0000_0001;
 pub const SA_NOCLDWAIT: u64 = 0x0000_0002;
 
+pub const CLD_EXITED: i32 = 1;
+pub const CLD_KILLED: i32 = 2;
+pub const CLD_DUMPED: i32 = 3;
+pub const CLD_STOPPED: i32 = 5;
+pub const CLD_CONTINUED: i32 = 6;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignalInfo {
     pub signal: u8,
@@ -58,9 +64,16 @@ pub struct SignalInfo {
 impl SignalInfo {
     #[allow(dead_code)]
     pub const fn child_exit(pid: u32, status: i32) -> Self {
+        let (code, status) = if status >= 128 {
+            // TODO: distinguish `CLD_DUMPED` once the kernel tracks core-dump termination
+            // separately from generic signal death.
+            (CLD_KILLED, status - 128)
+        } else {
+            (CLD_EXITED, status)
+        };
         Self {
             signal: SIGCHLD,
-            code: 1,
+            code,
             status,
             pid: pid as i32,
             uid: 0,
@@ -70,7 +83,7 @@ impl SignalInfo {
     pub const fn child_stop(pid: u32, signal: u8) -> Self {
         Self {
             signal: SIGCHLD,
-            code: 5,
+            code: CLD_STOPPED,
             status: signal as i32,
             pid: pid as i32,
             uid: 0,
@@ -80,7 +93,7 @@ impl SignalInfo {
     pub const fn child_continue(pid: u32) -> Self {
         Self {
             signal: SIGCHLD,
-            code: 6,
+            code: CLD_CONTINUED,
             status: 0,
             pid: pid as i32,
             uid: 0,
