@@ -562,7 +562,7 @@ fn tty_echo_erase(endpoint: &TtyEndpoint, state: &ConsoleTtyState) {
         return;
     }
     if (state.termios.c_lflag & (ECHOE | ECHOKE)) != 0 {
-        endpoint.write_bytes(b"\x08 \x08");
+        endpoint.write_bytes_in_mode(state.tty_mode, b"\x08 \x08");
     }
 }
 

@@ -70,7 +70,7 @@ pub struct LinuxStatx {
     pub stx_uid: u32,
     pub stx_gid: u32,
     pub stx_mode: u16,
-    pub __spare0: u16,
+    pub __spare0: [u16; 1],
     pub stx_ino: u64,
     pub stx_size: u64,
     pub stx_blocks: u64,
@@ -90,10 +90,14 @@ pub struct LinuxStatx {
     pub stx_atomic_write_unit_min: u32,
     pub stx_atomic_write_unit_max: u32,
     pub stx_atomic_write_segments_max: u32,
+    pub stx_dio_read_offset_align: u32,
     pub stx_atomic_write_unit_max_opt: u32,
-    pub __spare2: u32,
-    pub __spare3: [u64; 12],
+    pub __spare2: [u32; 1],
+    pub __spare3: [u64; 8],
 }
+
+const _: [(); 16] = [(); core::mem::size_of::<LinuxStatxTimestamp>()];
+const _: [(); 256] = [(); core::mem::size_of::<LinuxStatx>()];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileSystemIdentity {
@@ -174,6 +178,7 @@ pub const STATX_BASIC_STATS: u32 = STATX_TYPE
     | STATX_SIZE
     | STATX_BLOCKS;
 pub const STATX_BTIME: u32 = 0x0000_0800;
+pub const STATX_MNT_ID: u32 = 0x0000_1000;
 pub const STATX_RESERVED: u32 = 0x8000_0000;
 
 pub fn make_stat(node: &NodeRef) -> LinuxStat {
@@ -206,7 +211,7 @@ pub fn make_stat(node: &NodeRef) -> LinuxStat {
 
 pub fn make_statx(node: &NodeRef, mask: u32) -> LinuxStatx {
     let metadata = node.metadata();
-    let supported = STATX_BASIC_STATS | STATX_BTIME;
+    let supported = STATX_BASIC_STATS | STATX_BTIME | STATX_MNT_ID;
     let result_mask = if mask == 0 {
         supported
     } else {
@@ -232,6 +237,7 @@ pub fn make_statx(node: &NodeRef, mask: u32) -> LinuxStatx {
         stx_rdev_minor: metadata.rdev_minor,
         stx_dev_major: dev_major,
         stx_dev_minor: dev_minor,
+        stx_mnt_id: metadata.device_id,
         ..LinuxStatx::default()
     }
 }
@@ -270,7 +276,9 @@ pub fn serialize_statx(statx: &LinuxStatx) -> Vec<u8> {
     bytes.extend_from_slice(&statx.stx_uid.to_ne_bytes());
     bytes.extend_from_slice(&statx.stx_gid.to_ne_bytes());
     bytes.extend_from_slice(&statx.stx_mode.to_ne_bytes());
-    bytes.extend_from_slice(&statx.__spare0.to_ne_bytes());
+    for value in statx.__spare0 {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
     bytes.extend_from_slice(&statx.stx_ino.to_ne_bytes());
     bytes.extend_from_slice(&statx.stx_size.to_ne_bytes());
     bytes.extend_from_slice(&statx.stx_blocks.to_ne_bytes());
@@ -290,11 +298,15 @@ pub fn serialize_statx(statx: &LinuxStatx) -> Vec<u8> {
     bytes.extend_from_slice(&statx.stx_atomic_write_unit_min.to_ne_bytes());
     bytes.extend_from_slice(&statx.stx_atomic_write_unit_max.to_ne_bytes());
     bytes.extend_from_slice(&statx.stx_atomic_write_segments_max.to_ne_bytes());
+    bytes.extend_from_slice(&statx.stx_dio_read_offset_align.to_ne_bytes());
     bytes.extend_from_slice(&statx.stx_atomic_write_unit_max_opt.to_ne_bytes());
-    bytes.extend_from_slice(&statx.__spare2.to_ne_bytes());
+    for value in statx.__spare2 {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
     for value in statx.__spare3 {
         bytes.extend_from_slice(&value.to_ne_bytes());
     }
+    debug_assert_eq!(bytes.len(), core::mem::size_of::<LinuxStatx>());
     bytes
 }
 

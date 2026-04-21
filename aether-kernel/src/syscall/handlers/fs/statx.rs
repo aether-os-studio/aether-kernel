@@ -43,18 +43,6 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         const AT_FDCWD: i64 = -100;
         const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
         const AT_EMPTY_PATH: u64 = 0x1000;
-        const AT_STATX_SYNC_TYPE: u64 = 0x6000;
-        const AT_STATX_FORCE_SYNC: u64 = 0x2000;
-        const AT_STATX_DONT_SYNC: u64 = 0x4000;
-        const VALID_FLAGS: u64 =
-            AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_STATX_FORCE_SYNC | AT_STATX_DONT_SYNC;
-
-        if (flags & !VALID_FLAGS) != 0 || (mask as u32 & crate::fs::STATX_RESERVED) != 0 {
-            return Err(SysErr::Inval);
-        }
-        if (flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE {
-            return Err(SysErr::Inval);
-        }
 
         let node = if (flags & AT_EMPTY_PATH) != 0 && path.is_empty() {
             if dirfd == AT_FDCWD {
