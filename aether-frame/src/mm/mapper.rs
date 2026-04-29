@@ -219,9 +219,8 @@ impl<A: PageTableArch> AddressSpace<A> {
         let frame = allocator
             .alloc(count)
             .map_err(|_| MappingError::OutOfMemory)?;
-        self.map(virt, frame, size, flags, allocator).map_err(|e| {
+        self.map(virt, frame, size, flags, allocator).inspect_err(|_| {
             let _ = allocator.release(frame, count);
-            e
         })
     }
 

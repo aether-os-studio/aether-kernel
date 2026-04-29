@@ -1,8 +1,8 @@
-use core::mem::MaybeUninit;
-use core::ptr;
-
+use crate::arch::cpu::current_cpu_index;
 use crate::boot::{MAX_MEMORY_REGIONS, MemoryMap, MemoryRegionKind};
 use crate::libs::percpu::MAX_PERCPU_CPUS;
+use core::mem::MaybeUninit;
+use core::ptr;
 
 use super::address::{PAGE_SHIFT, PAGE_SIZE, PhysAddr};
 use super::frame::{FrameAllocError, FrameAllocator, PhysFrame};
@@ -355,7 +355,8 @@ impl<const MAX_USABLE_RANGES: usize, const MAX_CPUS: usize, const MAX_BLOCK_NODE
 
     #[allow(non_snake_case)]
     pub fn alloc_frame_4k(&mut self, count: usize) -> Result<u64, FrameAllocError> {
-        self.alloc_frame_4k_on_cpu(0, count)
+        let cpuid = current_cpu_index();
+        self.alloc_frame_4k_on_cpu(cpuid, count)
     }
 
     pub fn alloc_frame_4k_on_cpu(
@@ -383,7 +384,8 @@ impl<const MAX_USABLE_RANGES: usize, const MAX_CPUS: usize, const MAX_BLOCK_NODE
     }
 
     pub fn free_frame(&mut self, block: u64) -> Result<(), FrameAllocError> {
-        self.free_frame_on_cpu(0, block)
+        let cpuid = current_cpu_index();
+        self.free_frame_on_cpu(cpuid, block)
     }
 
     pub fn free_frame_on_cpu(&mut self, cpu_id: usize, block: u64) -> Result<(), FrameAllocError> {
