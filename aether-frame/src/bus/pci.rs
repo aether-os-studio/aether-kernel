@@ -128,7 +128,11 @@ impl PciDeviceInfo {
 
         let mut bytes = Vec::with_capacity(self.config_size);
         for offset in 0..self.config_size {
-            bytes.push(config.read_u8(offset as u16).unwrap_or(0xff));
+            bytes.push(
+                config
+                    .read_u8(u16::try_from(offset).unwrap())
+                    .unwrap_or(0xff),
+            );
         }
         bytes
     }
@@ -224,8 +228,8 @@ fn visit_bus(
 
         let multifunction = config0
             .read_u8(PCI_HEADER_TYPE)
-            .map(|value| (value & 0x80) != 0)
-            .unwrap_or(false);
+            .is_some_and(|value| (value & 0x80) != 0);
+
         let functions = if multifunction { 8 } else { 1 };
 
         for function in 0..functions {
@@ -327,7 +331,7 @@ fn read_bars(config: &PciConfigSpace, header_type: u8) -> Vec<PciBar> {
     let mut index = 0usize;
 
     while index < bar_count {
-        let offset = PCI_BAR0 + (index as u16 * 4);
+        let offset = PCI_BAR0 + (u16::try_from(index).unwrap() * 4);
         let Some(low) = config.read_u32(offset) else {
             break;
         };
@@ -338,9 +342,9 @@ fn read_bars(config: &PciConfigSpace, header_type: u8) -> Vec<PciBar> {
 
         if (low & 0x1) != 0 {
             bars.push(PciBar {
-                index: index as u8,
+                index: u8::try_from(index).unwrap(),
                 kind: PciBarKind::Io,
-                address: (low & !0x3) as u64,
+                address: u64::from(low & !0x3),
                 prefetchable: false,
             });
             index += 1;
@@ -349,9 +353,9 @@ fn read_bars(config: &PciConfigSpace, header_type: u8) -> Vec<PciBar> {
 
         let prefetchable = (low & 0x8) != 0;
         if (low & 0x6) == 0x4 && index + 1 < bar_count {
-            let high = config.read_u32(offset + 4).unwrap_or(0) as u64;
+            let high = u64::from(config.read_u32(offset + 4).unwrap_or(0));
             bars.push(PciBar {
-                index: index as u8,
+                index: u8::try_from(index).unwrap(),
                 kind: PciBarKind::Memory64,
                 address: (high << 32) | u64::from(low & !0xf),
                 prefetchable,
@@ -361,7 +365,7 @@ fn read_bars(config: &PciConfigSpace, header_type: u8) -> Vec<PciBar> {
         }
 
         bars.push(PciBar {
-            index: index as u8,
+            index: u8::try_from(index).unwrap(),
             kind: PciBarKind::Memory32,
             address: u64::from(low & !0xf),
             prefetchable,

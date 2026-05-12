@@ -264,7 +264,7 @@ impl Process {
                 .as_u64(),
             kernel_interrupts_enabled: 1,
             return_rip: 0,
-            process: core::ptr::from_mut(self) as usize,
+            process: ptr::from_mut(self) as usize,
             saved_rbx: 0,
             saved_rbp: 0,
             saved_r12: 0,
@@ -278,7 +278,7 @@ impl Process {
             crate::arch::interrupt::install_process_syscall_stack(self.kernel_stack_top);
             crate::arch::interrupt::install_user_entry_context(
                 current_run as *const CurrentRun,
-                core::ptr::from_mut(&mut self.context),
+                ptr::from_mut(&mut self.context),
             );
             crate::arch::fpu::restore(&self.fpu_state);
             restore_user_tls_bases(&self.context);
@@ -426,10 +426,10 @@ where
         F: FnOnce() -> R,
     {
         let call = unsafe { &mut *(arg as *mut StackCall<F, R>) };
-        let result = (call
+        let result = call
             .func
             .take()
-            .expect("kernel stack trampoline invoked twice"))();
+            .expect("kernel stack trampoline invoked twice")();
         let _ = call.result.write(result);
         0
     }
@@ -455,7 +455,7 @@ pub fn initialize_kernel_context(
     arg: *mut (),
 ) -> KernelContext {
     let mut rsp = align_down(stack_top, 16);
-    rsp -= core::mem::size_of::<KernelContextStartFrame>() as u64;
+    rsp -= size_of::<KernelContextStartFrame>() as u64;
     let frame = rsp as *mut KernelContextStartFrame;
     unsafe {
         frame.write(KernelContextStartFrame { arg, entry });
@@ -486,7 +486,7 @@ pub fn initialize_typed_kernel_context<T>(
     entry: fn(&mut T) -> !,
 ) -> KernelContext {
     let mut typed_entry_top = align_down(stack_top, 16);
-    typed_entry_top -= core::mem::size_of::<TypedKernelContextEntry<T>>() as u64;
+    typed_entry_top -= size_of::<TypedKernelContextEntry<T>>() as u64;
     let typed_entry_ptr = typed_entry_top as *mut TypedKernelContextEntry<T>;
     unsafe {
         typed_entry_ptr.write(TypedKernelContextEntry { state, entry });

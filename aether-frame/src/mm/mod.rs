@@ -121,8 +121,8 @@ pub fn init() -> Result<(), FrameAllocError> {
             BuddyAllocator::bootstrap_in_place(slot, &boot::info().memory_map, 16)
         })?;
     }
-    for addr in
-        (KERNEL_HEAP_START..KERNEL_HEAP_START + KERNEL_HEAP_SIZE).step_by(usize::try_from(PAGE_SIZE).unwrap())
+    for addr in (KERNEL_HEAP_START..KERNEL_HEAP_START + KERNEL_HEAP_SIZE)
+        .step_by(usize::try_from(PAGE_SIZE).unwrap())
     {
         current_address_space
             .map_alloc(

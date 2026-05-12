@@ -93,11 +93,12 @@ pub fn init() -> Result<(), AcpiInitError> {
         .rsdp_addr
         .ok_or(AcpiInitError::MissingRsdp)?;
     let hhdm_offset = crate::boot::hhdm_offset();
-    let rsdp_phys = if rsdp_addr >= hhdm_offset {
+    let rsdp_phys = usize::try_from(if rsdp_addr >= hhdm_offset {
         rsdp_addr - hhdm_offset
     } else {
         rsdp_addr
-    } as usize;
+    })
+    .unwrap();
     log::info!("ACPI: parsing tables from RSDP at phys {rsdp_phys:#x}");
     let handler = AetherAcpiHandler;
     let tables = unsafe { AcpiTables::from_rsdp(handler, rsdp_phys)? };

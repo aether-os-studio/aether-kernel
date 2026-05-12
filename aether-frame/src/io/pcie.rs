@@ -38,6 +38,7 @@ impl PciConfigSpace {
         self.address
     }
 
+    #[must_use]
     pub fn read_u8(&self, offset: u16) -> Option<u8> {
         match self.backend {
             PciConfigBackend::Mmio(region) => {
@@ -53,6 +54,7 @@ impl PciConfigSpace {
         }
     }
 
+    #[must_use]
     pub fn read_u16(&self, offset: u16) -> Option<u16> {
         match self.backend {
             PciConfigBackend::Mmio(region) => {
@@ -68,6 +70,7 @@ impl PciConfigSpace {
         }
     }
 
+    #[must_use]
     pub fn read_u32(&self, offset: u16) -> Option<u32> {
         match self.backend {
             PciConfigBackend::Mmio(region) => {
@@ -177,13 +180,13 @@ impl PciConfigSpace {
             return None;
         }
 
-        let offset = PCI_BAR0 + (index as u16 * 4);
-        let low = self.read_u32(offset)? as u64;
+        let offset = PCI_BAR0 + (u16::try_from(index).unwrap() * 4);
+        let low: u64 = self.read_u32(offset)?.into();
         if (low & 0x1) != 0 {
             return None;
         }
         if (low & 0x6) == 0x4 {
-            let high = self.read_u32(offset + 4)? as u64;
+            let high: u64 = self.read_u32(offset + 4)?.into();
             Some((high << 32) | (low & !0xf))
         } else {
             Some(low & !0xf)

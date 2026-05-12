@@ -29,7 +29,7 @@ pub fn dispatch_trap(trap: Trap, frame: &mut TrapFrame) {
         return;
     }
 
-    if trap.kind() == TrapKind::Exception && !frame.from_user() {
+    if trap.kind() == TrapKind::Exception && !frame.user_from() {
         log::error!(
             "unhandled kernel exception: vector={}, error_code={:#x}, rip={:#x}",
             trap.vector(),

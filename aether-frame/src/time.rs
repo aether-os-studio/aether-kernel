@@ -87,7 +87,8 @@ impl RealtimeInstant {
     #[must_use]
     pub fn total_nanos(self) -> Option<u64> {
         (self.seconds >= 0).then(|| {
-            self.seconds.cast_unsigned()
+            self.seconds
+                .cast_unsigned()
                 .saturating_mul(NANOS_PER_SECOND)
                 .saturating_add(u64::from(self.nanoseconds))
         })

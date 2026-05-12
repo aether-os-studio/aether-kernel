@@ -39,7 +39,7 @@ impl Trap {
             vector,
             error_code: frame.error_code(),
             kind,
-            privilege: if frame.from_user() {
+            privilege: if frame.user_from() {
                 PrivilegeLevel::User
             } else {
                 PrivilegeLevel::Kernel

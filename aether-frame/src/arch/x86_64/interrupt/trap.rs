@@ -71,7 +71,7 @@ impl TrapFrame {
     }
 
     #[must_use]
-    pub const fn from_user(&self) -> bool {
+    pub const fn user_from(&self) -> bool {
         (self.cs & 0x3) == 0x3
     }
 
@@ -110,7 +110,7 @@ pub fn init_syscall(cpu_index: usize) -> Result<(), &'static str> {
         )
         .map_err(|_| "failed to initialize per-cpu user entry state")?;
     let gs_base = USER_ENTRY_STATE
-        .with(cpu_index, |data| core::ptr::from_ref(data) as u64)
+        .with(cpu_index, |data| ptr::from_ref(data) as u64)
         .map_err(|_| "per-cpu user entry state is unavailable")?;
 
     unsafe {

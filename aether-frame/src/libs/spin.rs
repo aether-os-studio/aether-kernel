@@ -77,8 +77,8 @@ impl<T, G> SpinLock<T, G> {
 impl<T> SpinLock<T, PreemptDisabled> {
     #[must_use]
     pub fn disable_irq(&self) -> &SpinLock<T, LocalIrqDisabled> {
-        let ptr =
-            self as *const SpinLock<T, PreemptDisabled> as *const SpinLock<T, LocalIrqDisabled>;
+        let ptr = core::ptr::from_ref::<SpinLock<T, PreemptDisabled>>(self)
+            .cast::<SpinLock<T, LocalIrqDisabled>>();
         unsafe { &*ptr }
     }
 }

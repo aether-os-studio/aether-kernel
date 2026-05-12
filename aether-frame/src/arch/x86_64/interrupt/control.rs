@@ -26,6 +26,7 @@ pub fn restore(state: InterruptState) {
     }
 }
 
+#[must_use]
 pub fn are_enabled() -> bool {
     let rflags: u64;
     unsafe {

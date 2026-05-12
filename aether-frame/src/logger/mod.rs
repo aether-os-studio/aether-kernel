@@ -28,7 +28,8 @@ static LOG_WRITERS: SpinLock<[Option<LogWriter>; MAX_LOG_WRITERS], LocalIrqDisab
 pub struct KernelLogger;
 
 impl KernelLogger {
-    fn log_message(&self, record: &Record) {
+    #[allow(clippy::used_underscore_items)]
+    fn log_message(record: &Record) {
         let message = LogMessage {
             level: record.level(),
             file: record.file().unwrap_or("<unknown>"),
@@ -44,10 +45,11 @@ impl KernelLogger {
         };
 
         crate::serial_println!(
-            "[{}:{}] [{}] {}",
+            "[{}:{}] [\x1b[{}m{}\x1b[0m] {}",
             message.file,
             message.line,
-            format_args!("\x1b[{}m{}\x1b[0m", color, record.level()),
+            color,
+            record.level(),
             message.args,
         );
 
@@ -62,11 +64,11 @@ impl Log for KernelLogger {
         metadata.level() <= log::max_level()
     }
 
-    fn flush(&self) {}
-
     fn log(&self, record: &Record) {
-        self.log_message(record);
+        Self::log_message(record);
     }
+
+    fn flush(&self) {}
 }
 
 pub fn init() {

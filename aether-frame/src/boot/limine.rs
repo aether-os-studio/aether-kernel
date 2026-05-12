@@ -296,7 +296,7 @@ pub unsafe fn start_secondary_cpus(entry: super::SecondaryCpuEntry) -> Result<us
         .ok_or("limine mp response is unavailable")?;
     let cpu_count = SMP_CPU_COUNT
         .load(Ordering::Acquire)
-        .min(response.cpu_count as usize);
+        .min(usize::try_from(response.cpu_count).unwrap());
     if cpu_count == 0 {
         return Ok(0);
     }
@@ -321,7 +321,7 @@ pub unsafe fn start_secondary_cpus(entry: super::SecondaryCpuEntry) -> Result<us
 
 unsafe extern "C" fn limine_mp_entry(info: *mut LimineMpInfo) -> ! {
     let callback: super::SecondaryCpuEntry = unsafe { transmute(AP_ENTRY.load(Ordering::Acquire)) };
-    let index = unsafe { (*info).extra_argument as usize };
+    let index = unsafe { usize::try_from((*info).extra_argument).unwrap() };
     callback(index)
 }
 
@@ -350,10 +350,10 @@ unsafe fn parse_framebuffer_response(
     Some(FramebufferInfo {
         base: framebuffer.address as u64,
         size: framebuffer.pitch.saturating_mul(framebuffer.height),
-        width: framebuffer.width as u32,
-        height: framebuffer.height as u32,
-        stride: framebuffer.pitch as u32,
-        bits_per_pixel: framebuffer.bpp as u8,
+        width: u32::try_from(framebuffer.width).unwrap(),
+        height: u32::try_from(framebuffer.height).unwrap(),
+        stride: u32::try_from(framebuffer.pitch).unwrap(),
+        bits_per_pixel: u8::try_from(framebuffer.bpp).unwrap(),
         pixel_layout: PixelLayout {
             red: PixelBitfield {
                 size: framebuffer.red_mask_size,
@@ -386,8 +386,12 @@ unsafe fn parse_initrd(response: &ModuleRequestResponse) -> Option<super::Initrd
         return None;
     }
 
-    let modules =
-        unsafe { slice::from_raw_parts(response.modules, response.module_count as usize) };
+    let modules = unsafe {
+        slice::from_raw_parts(
+            response.modules,
+            usize::try_from(response.module_count).unwrap(),
+        )
+    };
     let module = modules
         .iter()
         .filter_map(|entry| unsafe { entry.as_ref() })
@@ -403,6 +407,7 @@ unsafe fn parse_initrd(response: &ModuleRequestResponse) -> Option<super::Initrd
     })
 }
 
+#[allow(clippy::used_underscore_items)]
 unsafe fn parse_memmap_response(
     response: &MemmapRequestResponse,
     regions_out: &mut [MemoryRegion; MAX_MEMORY_REGIONS],
@@ -411,7 +416,10 @@ unsafe fn parse_memmap_response(
         return 0;
     }
 
-    let count = usize::min(response.entry_count as usize, MAX_MEMORY_REGIONS);
+    let count = usize::min(
+        usize::try_from(response.entry_count).unwrap(),
+        MAX_MEMORY_REGIONS,
+    );
     let entries = unsafe { slice::from_raw_parts(response.entries, count) };
 
     for (index, entry_ptr) in entries.iter().enumerate() {
@@ -443,7 +451,7 @@ unsafe fn parse_mp_response(response: &MpRequestResponse, cpus_out: &mut [Cpu; M
         return 0;
     }
 
-    let count = usize::min(response.cpu_count as usize, MAX_CPUS);
+    let count = usize::min(usize::try_from(response.cpu_count).unwrap(), MAX_CPUS);
     let cpus = unsafe { slice::from_raw_parts(response.cpus, count) };
 
     for (index, cpu_ptr) in cpus.iter().enumerate() {
@@ -456,7 +464,7 @@ unsafe fn parse_mp_response(response: &MpRequestResponse, cpus_out: &mut [Cpu; M
         unsafe {
             *(&raw mut SMP_CPU_ENTRIES)
                 .cast::<*mut LimineMpInfo>()
-                .add(index) = *cpu_ptr
+                .add(index) = *cpu_ptr;
         };
         cpus_out[index] = Cpu {
             processor_id: cpu.processor_id,

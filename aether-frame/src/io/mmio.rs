@@ -91,7 +91,7 @@ impl MmioRegion {
 
     #[must_use]
     pub fn as_ptr<T>(&self, offset: usize) -> Option<*mut T> {
-        if offset.checked_add(core::mem::size_of::<T>())? > self.len {
+        if offset.checked_add(size_of::<T>())? > self.len {
             return None;
         }
 
@@ -116,14 +116,14 @@ pub fn remap_mmio(phys_base: u64, size: usize) -> Result<MmioRegion, RemapError>
 
     let _guard = MMIO_REMAP_LOCK.lock();
     let page_base = phys_base & !(PAGE_SIZE - 1);
-    let page_offset = (phys_base - page_base) as usize;
-    let total_len = align_up(page_offset + size, PAGE_SIZE as usize);
+    let page_offset: usize = (phys_base - page_base).try_into().unwrap();
+    let total_len = align_up(page_offset + size, PAGE_SIZE.try_into().unwrap());
     let virt_base = allocate_mmio_range(total_len as u64)?;
 
     let mut address_space = AddressSpace::<ArchitecturePageTable>::current();
     let mut allocator = frame_allocator().lock();
 
-    for page_offset_bytes in (0..total_len).step_by(PAGE_SIZE as usize) {
+    for page_offset_bytes in (0..total_len).step_by(PAGE_SIZE.try_into().unwrap()) {
         let phys =
             PhysFrame::from_start_address(PhysAddr::new(page_base + page_offset_bytes as u64));
         let virt = VirtAddr::new(virt_base + page_offset_bytes as u64);

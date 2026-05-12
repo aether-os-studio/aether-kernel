@@ -19,7 +19,7 @@ pub fn boot_and_enter_kernel() -> ! {
 
     let started =
         boot::start_secondary_cpus(secondary_cpu_entry).expect("secondary CPU startup failed");
-    log::info!("frame: started {} secondary CPUs", started);
+    log::info!("frame: started {started} secondary CPUs");
 
     interrupt::enable();
 

@@ -12,6 +12,7 @@ use core::arch::asm;
 use crate::boot;
 
 #[unsafe(no_mangle)]
+#[allow(clippy::used_underscore_items)]
 pub extern "C" fn _start() -> ! {
     if !boot::limine_base_revision_supported() {
         crate::serial_println!("limine base revision 6 is not supported");

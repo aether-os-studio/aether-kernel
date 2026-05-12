@@ -33,21 +33,24 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Acquire)
 }
 
+#[must_use]
 pub fn nanos_since_boot() -> u64 {
     crate::arch::timer::hpet::nanos_since_boot()
-        .unwrap_or_else(|| ticks().saturating_mul(1_000_000_000 / TARGET_TIMER_HZ as u64))
+        .unwrap_or_else(|| ticks().saturating_mul(1_000_000_000 / u64::from(TARGET_TIMER_HZ)))
 }
 
+#[must_use]
 pub fn unix_time() -> i64 {
     let boot_time = crate::boot::info().boot_time.unwrap_or(0);
     let nanos = nanos_since_boot();
-    boot_time.saturating_add((nanos / 1_000_000_000) as i64)
+    boot_time.saturating_add((nanos / 1_000_000_000).cast_signed())
 }
 
+#[must_use]
 pub fn unix_time_nanos() -> (i64, u64) {
     let boot_time = crate::boot::info().boot_time.unwrap_or(0);
     let nanos = nanos_since_boot();
-    let secs = (nanos / 1_000_000_000) as i64;
+    let secs = (nanos / 1_000_000_000).cast_signed();
     let subsec_nanos = nanos % 1_000_000_000;
     (boot_time.saturating_add(secs), subsec_nanos)
 }
@@ -58,6 +61,7 @@ pub fn register_tick_handler(handler: fn()) {
     }
 }
 
+#[must_use]
 pub fn supports_deadline_wakeup() -> bool {
     crate::arch::timer::supports_deadline_wakeup()
 }

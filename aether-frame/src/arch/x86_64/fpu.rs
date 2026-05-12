@@ -116,6 +116,7 @@ impl FpuState {
         len
     }
 
+    #[must_use]
     pub fn active_len(&self) -> usize {
         config().state_size
     }
@@ -189,6 +190,7 @@ pub fn init_for_cpu(cpu_index: usize) -> Result<(), &'static str> {
     Ok(())
 }
 
+#[allow(clippy::cast_possible_truncation)]
 pub fn save(state: &mut FpuState) {
     let config = config();
     if config.xsave_enabled {
@@ -215,6 +217,7 @@ pub fn save(state: &mut FpuState) {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 pub fn restore(state: &FpuState) {
     let config = config();
     if config.xsave_enabled {
@@ -310,6 +313,7 @@ fn write_cr4(value: u64) {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn write_xcr0(value: u64) {
     let eax = value as u32;
     let edx = (value >> 32) as u32;
