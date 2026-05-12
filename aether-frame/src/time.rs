@@ -8,34 +8,42 @@ pub struct MonotonicInstant {
 }
 
 impl MonotonicInstant {
+    #[must_use]
     pub const fn from_nanos(nanos: u64) -> Self {
         Self { nanos }
     }
 
+    #[must_use]
     pub fn now() -> Self {
         monotonic_now()
     }
 
+    #[must_use]
     pub const fn as_nanos(self) -> u64 {
         self.nanos
     }
 
+    #[must_use]
     pub fn as_duration(self) -> Duration {
         Duration::from_nanos(self.nanos)
     }
 
+    #[must_use]
     pub fn saturating_add_nanos(self, nanos: u64) -> Self {
         Self::from_nanos(self.nanos.saturating_add(nanos))
     }
 
+    #[must_use]
     pub fn saturating_duration_since(self, earlier: Self) -> Duration {
         Duration::from_nanos(self.nanos.saturating_sub(earlier.nanos))
     }
 
+    #[must_use]
     pub fn saturating_nanos_since(self, earlier: Self) -> u64 {
         self.nanos.saturating_sub(earlier.nanos)
     }
 
+    #[must_use]
     pub fn is_reached(self) -> bool {
         monotonic_now() >= self
     }
@@ -48,6 +56,7 @@ pub struct RealtimeInstant {
 }
 
 impl RealtimeInstant {
+    #[must_use]
     pub const fn new(seconds: i64, nanoseconds: u32) -> Self {
         Self {
             seconds,
@@ -55,54 +64,67 @@ impl RealtimeInstant {
         }
     }
 
+    #[must_use]
     pub fn now() -> Self {
         realtime_now()
     }
 
+    #[must_use]
     pub const fn seconds(self) -> i64 {
         self.seconds
     }
 
+    #[must_use]
     pub const fn nanoseconds(self) -> u32 {
         self.nanoseconds
     }
 
+    #[must_use]
     pub const fn split(self) -> (i64, u32) {
         (self.seconds, self.nanoseconds)
     }
 
+    #[must_use]
     pub fn total_nanos(self) -> Option<u64> {
         (self.seconds >= 0).then(|| {
-            (self.seconds as u64)
+            self.seconds.cast_unsigned()
                 .saturating_mul(NANOS_PER_SECOND)
-                .saturating_add(self.nanoseconds as u64)
+                .saturating_add(u64::from(self.nanoseconds))
         })
     }
 }
 
+#[must_use]
 pub fn monotonic_now() -> MonotonicInstant {
     MonotonicInstant::from_nanos(monotonic_nanos())
 }
 
+#[must_use]
 pub fn monotonic_nanos() -> u64 {
     crate::interrupt::timer::nanos_since_boot()
 }
 
+#[must_use]
 pub fn realtime_now() -> RealtimeInstant {
     let (seconds, nanoseconds) = crate::interrupt::timer::unix_time_nanos();
-    RealtimeInstant::new(seconds, nanoseconds as u32)
+    RealtimeInstant::new(seconds, nanoseconds.try_into().unwrap())
 }
 
+#[must_use]
 pub fn realtime_nanos() -> (i64, u32) {
     realtime_now().split()
 }
 
+#[must_use]
 pub fn realtime_seconds() -> i64 {
     realtime_now().seconds()
 }
 
 pub fn spin_delay(duration: Duration) -> Result<(), &'static str> {
-    let nanos = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
+    let nanos_result = u64::try_from(duration.as_nanos().min(u128::from(u64::MAX)));
+    let Ok(nanos) = nanos_result else {
+        return Err("duration exceeded u64::MAX");
+    };
     spin_delay_nanos(nanos)
 }
 

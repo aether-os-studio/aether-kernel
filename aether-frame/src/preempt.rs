@@ -30,8 +30,9 @@ impl DisabledPreemptGuard {
     fn new() -> Self {
         if let Some(state) = current_state() {
             let previous = state.info.fetch_add(1, Ordering::AcqRel);
-            assert!(
-                (previous & DISABLE_COUNT_MASK) != DISABLE_COUNT_MASK,
+            assert_ne!(
+                previous & DISABLE_COUNT_MASK,
+                DISABLE_COUNT_MASK,
                 "preempt disable count overflow"
             );
             Self { active: true }
@@ -49,8 +50,9 @@ impl Drop for DisabledPreemptGuard {
 
         let state = current_state().expect("preempt guard dropped without cpu-local state");
         let previous = state.info.fetch_sub(1, Ordering::AcqRel);
-        assert!(
-            (previous & DISABLE_COUNT_MASK) != 0,
+        assert_ne!(
+            previous & DISABLE_COUNT_MASK,
+            0,
             "preempt disable count underflow"
         );
     }
@@ -77,16 +79,18 @@ pub fn enable() {
         return;
     };
     let previous = state.info.fetch_sub(1, Ordering::AcqRel);
-    assert!(
-        (previous & DISABLE_COUNT_MASK) != 0,
+    assert_ne!(
+        previous & DISABLE_COUNT_MASK,
+        0,
         "preempt disable count underflow"
     );
 }
 
+#[must_use]
 pub fn count() -> usize {
-    current_state()
-        .map(|state| (state.info.load(Ordering::Acquire) & DISABLE_COUNT_MASK) as usize)
-        .unwrap_or(0)
+    current_state().map_or(0, |state| {
+        (state.info.load(Ordering::Acquire) & DISABLE_COUNT_MASK) as usize
+    })
 }
 
 pub fn is_disabled() -> bool {
@@ -106,24 +110,22 @@ pub fn request_reschedule_cpu(cpu_index: usize) {
     }
 }
 
+#[must_use]
 pub fn need_resched() -> bool {
     current_state()
-        .map(|state| (state.info.load(Ordering::Acquire) & NEED_RESCHED_MASK) == 0)
-        .unwrap_or(false)
+        .is_some_and(|state| (state.info.load(Ordering::Acquire) & NEED_RESCHED_MASK) == 0)
 }
 
+#[must_use]
 pub fn should_preempt() -> bool {
-    current_state()
-        .map(|state| state.info.load(Ordering::Acquire) == 0)
-        .unwrap_or(false)
+    current_state().is_some_and(|state| state.info.load(Ordering::Acquire) == 0)
 }
 
+#[must_use]
 pub fn take_need_resched() -> bool {
-    current_state()
-        .map(|state| {
-            (state.info.fetch_or(NEED_RESCHED_MASK, Ordering::AcqRel) & NEED_RESCHED_MASK) == 0
-        })
-        .unwrap_or(false)
+    current_state().is_some_and(|state| {
+        (state.info.fetch_or(NEED_RESCHED_MASK, Ordering::AcqRel) & NEED_RESCHED_MASK) == 0
+    })
 }
 
 pub fn clear_need_resched() {
@@ -132,6 +134,7 @@ pub fn clear_need_resched() {
     }
 }
 
+#[must_use]
 pub fn preemptible() -> bool {
     !is_disabled() && crate::interrupt::are_enabled()
 }

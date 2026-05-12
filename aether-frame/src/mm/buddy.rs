@@ -327,14 +327,17 @@ impl<const MAX_USABLE_RANGES: usize, const MAX_CPUS: usize, const MAX_BLOCK_NODE
         Ok(())
     }
 
+    #[must_use]
     pub fn cpu_count(&self) -> usize {
         self.cpu_count
     }
 
+    #[must_use]
     pub fn total_frames(&self) -> usize {
         self.total_frames
     }
 
+    #[must_use]
     pub fn free_pages(&self) -> usize {
         let mut global = 0usize;
         let mut order = 0usize;
@@ -371,7 +374,7 @@ impl<const MAX_USABLE_RANGES: usize, const MAX_CPUS: usize, const MAX_BLOCK_NODE
     }
 
     pub fn retain_frame(&mut self, block: u64) -> Result<u32, FrameAllocError> {
-        let frame = self.frame_number_from_addr(block)?;
+        let frame = Self::frame_number_from_addr(block)?;
         let node_index = self
             .find_allocation_index(frame)
             .ok_or(FrameAllocError::InvalidFrame)?;
@@ -390,7 +393,7 @@ impl<const MAX_USABLE_RANGES: usize, const MAX_CPUS: usize, const MAX_BLOCK_NODE
 
     pub fn free_frame_on_cpu(&mut self, cpu_id: usize, block: u64) -> Result<(), FrameAllocError> {
         let cpu_id = self.checked_cpu(cpu_id)?;
-        let frame = self.frame_number_from_addr(block)?;
+        let frame = Self::frame_number_from_addr(block)?;
         let node_index = self
             .find_allocation_index(frame)
             .ok_or(FrameAllocError::InvalidFrame)?;
@@ -436,8 +439,9 @@ impl<const MAX_USABLE_RANGES: usize, const MAX_CPUS: usize, const MAX_BLOCK_NODE
         Ok(self.global_free_lens[order])
     }
 
+    #[must_use]
     pub fn ref_count_for_addr(&self, block: u64) -> Option<usize> {
-        let frame = self.frame_number_from_addr(block).ok()?;
+        let frame = Self::frame_number_from_addr(block).ok()?;
         let node_index = self.find_allocation_index(frame)?;
         Some(self.nodes.nodes[node_index].refcount as usize)
     }
@@ -665,11 +669,11 @@ impl<const MAX_USABLE_RANGES: usize, const MAX_CPUS: usize, const MAX_BLOCK_NODE
         }
     }
 
-    fn frame_number_from_addr(&self, block: u64) -> Result<usize, FrameAllocError> {
+    fn frame_number_from_addr(block: u64) -> Result<usize, FrameAllocError> {
         if block & (PAGE_SIZE - 1) != 0 {
             return Err(FrameAllocError::InvalidFrame);
         }
-        Ok((block as usize) >> PAGE_SHIFT)
+        Ok(usize::try_from(block).unwrap() >> PAGE_SHIFT)
     }
 
     fn checked_addr_from_frame(frame: PhysFrame) -> Result<u64, FrameAllocError> {
@@ -968,7 +972,7 @@ fn collect_usable_ranges<const CAP: usize>(
 ) -> Result<(), FrameAllocError> {
     ranges.clear();
 
-    for region in mem_map.iter() {
+    for region in mem_map {
         if region.kind != MemoryRegionKind::USABLE {
             continue;
         }
@@ -981,8 +985,8 @@ fn collect_usable_ranges<const CAP: usize>(
             .and_then(|end| usize::try_from(end).ok())
             .ok_or(FrameAllocError::InvalidMemoryMap)?;
 
-        let start = align_up(region_start, PAGE_SIZE as usize);
-        let end = align_down(region_end, PAGE_SIZE as usize);
+        let start = align_up(region_start, usize::try_from(PAGE_SIZE).unwrap());
+        let end = align_down(region_end, usize::try_from(PAGE_SIZE).unwrap());
         if end <= start {
             continue;
         }

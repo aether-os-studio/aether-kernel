@@ -271,7 +271,7 @@ impl<A: PageTableArch> AddressSpace<A> {
                 } else {
                     1
                 };
-                self.prune_empty_tables(&walk, level, allocator)?;
+                Self::prune_empty_tables(&walk, level, allocator)?;
 
                 return Ok(UnmapResult {
                     frame,
@@ -313,7 +313,6 @@ impl<A: PageTableArch> AddressSpace<A> {
     }
 
     fn prune_empty_tables<F: FrameAllocator>(
-        &self,
         walk: &[Option<WalkEntry>; MAX_PAGE_TABLE_LEVELS],
         leaf_level: usize,
         allocator: &mut F,
@@ -351,7 +350,7 @@ fn table_is_empty<A: PageTableArch>(table: PhysFrame) -> bool {
 unsafe fn zero_page(frame: PhysFrame) {
     let page = phys_to_virt(frame.start_address().as_u64()) as *mut u8;
     unsafe {
-        ptr::write_bytes(page, 0, PAGE_SIZE as usize);
+        ptr::write_bytes(page, 0, usize::try_from(PAGE_SIZE).unwrap());
     }
 }
 

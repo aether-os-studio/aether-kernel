@@ -82,6 +82,7 @@ static OOM_RECOVERY_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub struct LockedHeap(SpinLock<Allocator, LocalIrqDisabled>);
 
 impl LockedHeap {
+    #[must_use]
     pub const fn empty() -> Self {
         Self(SpinLock::new(Allocator::empty()))
     }
@@ -121,7 +122,7 @@ pub fn init() -> Result<(), FrameAllocError> {
         })?;
     }
     for addr in
-        (KERNEL_HEAP_START..KERNEL_HEAP_START + KERNEL_HEAP_SIZE).step_by(PAGE_SIZE as usize)
+        (KERNEL_HEAP_START..KERNEL_HEAP_START + KERNEL_HEAP_SIZE).step_by(usize::try_from(PAGE_SIZE).unwrap())
     {
         current_address_space
             .map_alloc(
@@ -138,6 +139,7 @@ pub fn init() -> Result<(), FrameAllocError> {
     Ok(())
 }
 
+#[must_use]
 pub fn frame_allocator() -> &'static FrameAllocatorSlot {
     &FRAME_ALLOCATOR
 }
@@ -147,7 +149,7 @@ pub fn zero_frame(frame: PhysFrame) {
         ptr::write_bytes(
             boot::phys_to_virt(frame.start_address().as_u64()) as *mut u8,
             0,
-            PAGE_SIZE as usize,
+            usize::try_from(PAGE_SIZE).unwrap(),
         );
     }
 }
