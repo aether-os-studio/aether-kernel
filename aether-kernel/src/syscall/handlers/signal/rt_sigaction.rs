@@ -1,8 +1,8 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::signal::{parse_sigaction, serialize_sigaction};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
     pub struct RtSigactionSyscall => nr::RT_SIGACTION, "rt_sigaction", |ctx, args| {
@@ -10,8 +10,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_rt_sigaction(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn rt_sigaction(
         &mut self,
         signal: u64,
         act: u64,
@@ -31,7 +31,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
 
         if act != 0 {
-            let raw = self.syscall_read_user_exact_buffer(act, 32)?;
+            let raw = self.read_user_exact_buffer(act, 32)?;
             let action = parse_sigaction(&raw).ok_or(SysErr::Inval)?;
             if !self.process.signals.set_action(signal, action) {
                 return Err(SysErr::Inval);

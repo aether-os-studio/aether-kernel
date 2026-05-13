@@ -1,11 +1,9 @@
+use alloc::string::String;
+
 use super::*;
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(super) fn syscall_read_user_c_string(
-        &self,
-        address: u64,
-        limit: usize,
-    ) -> SysResult<String> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn read_user_c_string(&self, address: u64, limit: usize) -> SysResult<String> {
         self.process
             .task
             .address_space
@@ -13,7 +11,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             .map_err(|_| SysErr::Fault)
     }
 
-    pub(super) fn syscall_read_user_buffer(&self, address: u64, len: usize) -> SysResult<Vec<u8>> {
+    pub(crate) fn read_user_buffer(&self, address: u64, len: usize) -> SysResult<Vec<u8>> {
         let mut buffer = vec![0; len];
         let read = self
             .process
@@ -25,11 +23,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(buffer)
     }
 
-    pub(crate) fn syscall_read_user_exact_buffer(
-        &self,
-        address: u64,
-        len: usize,
-    ) -> SysResult<Vec<u8>> {
+    pub(crate) fn read_user_exact_buffer(&self, address: u64, len: usize) -> SysResult<Vec<u8>> {
         self.process
             .task
             .address_space
@@ -37,7 +31,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             .map_err(|_| SysErr::Fault)
     }
 
-    pub(super) fn syscall_read_user_pointer_array(
+    pub(crate) fn read_user_pointer_array(
         &self,
         address: u64,
         limit: usize,
@@ -75,11 +69,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(pointers)
     }
 
-    pub(super) fn syscall_write_user_buffer(
-        &mut self,
-        address: u64,
-        bytes: &[u8],
-    ) -> SysResult<()> {
+    pub(crate) fn write_user_buffer(&mut self, address: u64, bytes: &[u8]) -> SysResult<()> {
         let written = self
             .process
             .task
@@ -92,7 +82,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(())
     }
 
-    pub(super) fn syscall_write_user_timespec(
+    pub(crate) fn write_user_timespec(
         &mut self,
         address: u64,
         secs: i64,
@@ -101,6 +91,6 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let mut bytes = [0u8; 16];
         bytes[..8].copy_from_slice(&secs.to_ne_bytes());
         bytes[8..].copy_from_slice(&nanos.to_ne_bytes());
-        self.syscall_write_user_buffer(address, &bytes)
+        self.write_user_buffer(address, &bytes)
     }
 }

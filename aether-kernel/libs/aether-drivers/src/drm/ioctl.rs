@@ -49,10 +49,14 @@ pub const fn ioctl_size(command: u64) -> usize {
 }
 
 pub const DRM_IOCTL_VERSION: u64 = iowr(DRM_IOCTL_BASE, 0x00, DrmVersion::SIZE);
+pub const DRM_IOCTL_GET_MAGIC: u64 = ioc(IOC_READ, DRM_IOCTL_BASE, 0x02, DrmAuth::SIZE);
 pub const DRM_IOCTL_GET_CAP: u64 = iowr(DRM_IOCTL_BASE, 0x0c, DrmGetCap::SIZE);
 pub const DRM_IOCTL_SET_CLIENT_CAP: u64 = iow(DRM_IOCTL_BASE, 0x0d, DrmSetClientCap::SIZE);
+pub const DRM_IOCTL_AUTH_MAGIC: u64 = iow(DRM_IOCTL_BASE, 0x11, DrmAuth::SIZE);
 pub const DRM_IOCTL_SET_MASTER: u64 = io(DRM_IOCTL_BASE, 0x1e);
 pub const DRM_IOCTL_DROP_MASTER: u64 = io(DRM_IOCTL_BASE, 0x1f);
+pub const DRM_IOCTL_PRIME_HANDLE_TO_FD: u64 = iowr(DRM_IOCTL_BASE, 0x2d, DrmPrimeHandle::SIZE);
+pub const DRM_IOCTL_PRIME_FD_TO_HANDLE: u64 = iowr(DRM_IOCTL_BASE, 0x2e, DrmPrimeHandle::SIZE);
 pub const DRM_IOCTL_WAIT_VBLANK: u64 = iowr(DRM_IOCTL_BASE, 0x3a, DrmWaitVBlank::SIZE);
 pub const DRM_IOCTL_MODE_GETRESOURCES: u64 = iowr(DRM_IOCTL_BASE, 0xa0, DrmModeCardRes::SIZE);
 pub const DRM_IOCTL_MODE_GETCRTC: u64 = iowr(DRM_IOCTL_BASE, 0xa1, DrmModeCrtc::SIZE);
@@ -82,6 +86,10 @@ pub const DRM_IOCTL_MODE_ATOMIC: u64 = iowr(DRM_IOCTL_BASE, 0xbc, DrmModeAtomic:
 pub const DRM_IOCTL_MODE_CREATEPROPBLOB: u64 = iowr(DRM_IOCTL_BASE, 0xbd, DrmModeCreateBlob::SIZE);
 pub const DRM_IOCTL_MODE_DESTROYPROPBLOB: u64 =
     iowr(DRM_IOCTL_BASE, 0xbe, DrmModeDestroyBlob::SIZE);
+pub const DRM_IOCTL_MODE_CREATE_LEASE: u64 = iowr(DRM_IOCTL_BASE, 0xc6, DrmModeCreateLease::SIZE);
+pub const DRM_IOCTL_MODE_LIST_LESSEES: u64 = iowr(DRM_IOCTL_BASE, 0xc7, DrmModeListLessees::SIZE);
+pub const DRM_IOCTL_MODE_GET_LEASE: u64 = iowr(DRM_IOCTL_BASE, 0xc8, DrmModeGetLease::SIZE);
+pub const DRM_IOCTL_MODE_REVOKE_LEASE: u64 = iowr(DRM_IOCTL_BASE, 0xc9, DrmModeRevokeLease::SIZE);
 pub const DRM_IOCTL_MODE_CLOSEFB: u64 = iowr(DRM_IOCTL_BASE, 0xd0, DrmModeCloseFb::SIZE);
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -162,6 +170,29 @@ pub const DRM_MODE_ATOMIC_FLAGS: u32 = DRM_MODE_PAGE_FLIP_EVENT
     | DRM_MODE_ATOMIC_TEST_ONLY
     | DRM_MODE_ATOMIC_NONBLOCK
     | DRM_MODE_ATOMIC_ALLOW_MODESET;
+pub const DRM_PRIME_CAP_IMPORT: u64 = 0x1;
+pub const DRM_PRIME_CAP_EXPORT: u64 = 0x2;
+pub const DRM_CLOEXEC: u32 = 0o2000000;
+pub const DRM_RDWR: u32 = 0x2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmAuth {
+    pub magic: u32,
+}
+
+impl DrmAuth {
+    pub const SIZE: usize = 4;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            magic: read_u32(bytes, 0)?,
+        })
+    }
+
+    pub fn write_to_bytes(self, bytes: &mut [u8]) -> bool {
+        write_u32(bytes, 0, self.magic)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DrmWaitVBlank {
@@ -254,6 +285,31 @@ impl DrmGetCap {
 
     pub fn write_to_bytes(self, bytes: &mut [u8]) -> bool {
         write_u64(bytes, 0, self.capability) && write_u64(bytes, 8, self.value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmPrimeHandle {
+    pub handle: u32,
+    pub flags: u32,
+    pub fd: i32,
+}
+
+impl DrmPrimeHandle {
+    pub const SIZE: usize = 12;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            handle: read_u32(bytes, 0)?,
+            flags: read_u32(bytes, 4)?,
+            fd: read_i32(bytes, 8)?,
+        })
+    }
+
+    pub fn write_to_bytes(self, bytes: &mut [u8]) -> bool {
+        write_u32(bytes, 0, self.handle)
+            && write_u32(bytes, 4, self.flags)
+            && write_i32(bytes, 8, self.fd)
     }
 }
 
@@ -1033,6 +1089,102 @@ impl DrmModeCloseFb {
         Some(Self {
             fb_id: read_u32(bytes, 0)?,
             pad: read_u32(bytes, 4)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmModeCreateLease {
+    pub object_ids: u64,
+    pub object_count: u32,
+    pub flags: u32,
+    pub lessee_id: u32,
+    pub fd: u32,
+}
+
+impl DrmModeCreateLease {
+    pub const SIZE: usize = 24;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            object_ids: read_u64(bytes, 0)?,
+            object_count: read_u32(bytes, 8)?,
+            flags: read_u32(bytes, 12)?,
+            lessee_id: read_u32(bytes, 16)?,
+            fd: read_u32(bytes, 20)?,
+        })
+    }
+
+    pub fn write_to_bytes(self, bytes: &mut [u8]) -> bool {
+        write_u64(bytes, 0, self.object_ids)
+            && write_u32(bytes, 8, self.object_count)
+            && write_u32(bytes, 12, self.flags)
+            && write_u32(bytes, 16, self.lessee_id)
+            && write_u32(bytes, 20, self.fd)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmModeListLessees {
+    pub lessees_ptr: u64,
+    pub count_lessees: u32,
+    pub pad: u32,
+}
+
+impl DrmModeListLessees {
+    pub const SIZE: usize = 16;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            lessees_ptr: read_u64(bytes, 0)?,
+            count_lessees: read_u32(bytes, 8)?,
+            pad: read_u32(bytes, 12)?,
+        })
+    }
+
+    pub fn write_to_bytes(self, bytes: &mut [u8]) -> bool {
+        write_u64(bytes, 0, self.lessees_ptr)
+            && write_u32(bytes, 8, self.count_lessees)
+            && write_u32(bytes, 12, self.pad)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmModeGetLease {
+    pub objects_ptr: u64,
+    pub count_objects: u32,
+    pub pad: u32,
+}
+
+impl DrmModeGetLease {
+    pub const SIZE: usize = 16;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            objects_ptr: read_u64(bytes, 0)?,
+            count_objects: read_u32(bytes, 8)?,
+            pad: read_u32(bytes, 12)?,
+        })
+    }
+
+    pub fn write_to_bytes(self, bytes: &mut [u8]) -> bool {
+        write_u64(bytes, 0, self.objects_ptr)
+            && write_u32(bytes, 8, self.count_objects)
+            && write_u32(bytes, 12, self.pad)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrmModeRevokeLease {
+    pub lessee_id: u32,
+}
+
+impl DrmModeRevokeLease {
+    pub const SIZE: usize = 4;
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            lessee_id: read_u32(bytes, 0)?,
         })
     }
 }

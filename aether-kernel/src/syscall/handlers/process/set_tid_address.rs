@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::SysResult;
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -9,8 +9,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_set_tid_address(&mut self, address: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn set_tid_address(&mut self, address: u64) -> SysResult<u64> {
         self.process.clear_child_tid = (address != 0).then_some(address);
         Ok(self.process.identity.pid as u64)
     }

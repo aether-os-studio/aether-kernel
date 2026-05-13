@@ -2,8 +2,7 @@ use crate::arch::syscall::nr;
 use aether_vfs::NodeKind;
 
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::KernelSyscallContext;
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -26,13 +25,8 @@ fn count_dirents(buffer: &[u8]) -> usize {
     count
 }
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_getdents64(
-        &mut self,
-        fd: u64,
-        address: u64,
-        len: usize,
-    ) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn getdents64(&mut self, fd: u64, address: u64, len: usize) -> SysResult<u64> {
         let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
         let mut file = descriptor.file.lock();
         let node = file.node();

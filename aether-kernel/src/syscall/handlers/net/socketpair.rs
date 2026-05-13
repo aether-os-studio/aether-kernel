@@ -1,15 +1,14 @@
 use crate::arch::syscall::nr;
 use crate::errno::SysResult;
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::KernelSyscallContext;
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(pub struct SocketpairSyscall => nr::SOCKETPAIR, "socketpair", |ctx, args| {
     SyscallDisposition::Return(ctx.socketpair(args.get(0) as i32, args.get(1), args.get(2) as i32, args.get(3)))
 });
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_socketpair(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn socketpair(
         &mut self,
         domain: i32,
         socket_type: u64,

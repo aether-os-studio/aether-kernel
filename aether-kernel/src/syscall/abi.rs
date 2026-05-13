@@ -1,7 +1,7 @@
 use alloc::string::String;
 
 use crate::errno::{SysErr, SysResult};
-use crate::syscall::KernelSyscallContext;
+use crate::process::ProcessSyscallContext;
 
 pub const AT_FDCWD: i64 = -100;
 pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -37,7 +37,7 @@ pub struct LinuxTimespec {
 impl LinuxTimespec {
     pub const SIZE: usize = 16;
 
-    pub fn read_from(ctx: &dyn KernelSyscallContext, address: u64) -> SysResult<Self> {
+    pub(crate) fn read_from(ctx: &ProcessSyscallContext<'_>, address: u64) -> SysResult<Self> {
         let bytes = ctx.read_user_buffer(address, Self::SIZE)?;
         if bytes.len() != Self::SIZE {
             return Err(SysErr::Fault);
@@ -73,25 +73,6 @@ pub struct LinuxTimeval {
 impl LinuxTimeval {
     pub const SIZE: usize = 16;
 
-    pub fn read_from(ctx: &dyn KernelSyscallContext, address: u64) -> SysResult<Self> {
-        let bytes = ctx.read_user_buffer(address, Self::SIZE)?;
-        if bytes.len() != Self::SIZE {
-            return Err(SysErr::Fault);
-        }
-
-        Ok(Self {
-            tv_sec: i64::from_ne_bytes(bytes[..8].try_into().map_err(|_| SysErr::Fault)?),
-            tv_usec: i64::from_ne_bytes(bytes[8..].try_into().map_err(|_| SysErr::Fault)?),
-        })
-    }
-
-    pub fn write_to(self, ctx: &mut dyn KernelSyscallContext, address: u64) -> SysResult<()> {
-        let mut bytes = [0u8; Self::SIZE];
-        bytes[..8].copy_from_slice(&self.tv_sec.to_ne_bytes());
-        bytes[8..].copy_from_slice(&self.tv_usec.to_ne_bytes());
-        ctx.write_user_buffer(address, &bytes)
-    }
-
     pub fn validate(self) -> SysResult<Self> {
         if self.tv_sec < 0 || !(0..1_000_000).contains(&self.tv_usec) {
             return Err(SysErr::Inval);
@@ -123,7 +104,7 @@ pub struct LinuxItimerval {
 impl LinuxItimerval {
     pub const SIZE: usize = LinuxTimeval::SIZE * 2;
 
-    pub fn read_from(ctx: &dyn KernelSyscallContext, address: u64) -> SysResult<Self> {
+    pub(crate) fn read_from(ctx: &ProcessSyscallContext<'_>, address: u64) -> SysResult<Self> {
         let bytes = ctx.read_user_buffer(address, Self::SIZE)?;
         if bytes.len() != Self::SIZE {
             return Err(SysErr::Fault);
@@ -141,7 +122,11 @@ impl LinuxItimerval {
         })
     }
 
-    pub fn write_to(self, ctx: &mut dyn KernelSyscallContext, address: u64) -> SysResult<()> {
+    pub(crate) fn write_to(
+        self,
+        ctx: &mut ProcessSyscallContext<'_>,
+        address: u64,
+    ) -> SysResult<()> {
         let mut bytes = [0u8; Self::SIZE];
         bytes[0..8].copy_from_slice(&self.it_interval.tv_sec.to_ne_bytes());
         bytes[8..16].copy_from_slice(&self.it_interval.tv_usec.to_ne_bytes());
@@ -167,25 +152,6 @@ pub struct LinuxRlimit {
 impl LinuxRlimit {
     pub const SIZE: usize = 16;
 
-    pub fn read_from(ctx: &dyn KernelSyscallContext, address: u64) -> SysResult<Self> {
-        let bytes = ctx.read_user_buffer(address, Self::SIZE)?;
-        if bytes.len() != Self::SIZE {
-            return Err(SysErr::Fault);
-        }
-
-        Ok(Self {
-            rlim_cur: u64::from_ne_bytes(bytes[..8].try_into().map_err(|_| SysErr::Fault)?),
-            rlim_max: u64::from_ne_bytes(bytes[8..].try_into().map_err(|_| SysErr::Fault)?),
-        })
-    }
-
-    pub fn write_to(self, ctx: &mut dyn KernelSyscallContext, address: u64) -> SysResult<()> {
-        let mut bytes = [0u8; Self::SIZE];
-        bytes[..8].copy_from_slice(&self.rlim_cur.to_ne_bytes());
-        bytes[8..].copy_from_slice(&self.rlim_max.to_ne_bytes());
-        ctx.write_user_buffer(address, &bytes)
-    }
-
     pub fn validate(self) -> SysResult<Self> {
         if self.rlim_cur > self.rlim_max {
             return Err(SysErr::Inval);
@@ -194,12 +160,16 @@ impl LinuxRlimit {
     }
 }
 
-pub fn read_path(ctx: &dyn KernelSyscallContext, pointer: u64, limit: usize) -> SysResult<String> {
+pub(crate) fn read_path(
+    ctx: &ProcessSyscallContext<'_>,
+    pointer: u64,
+    limit: usize,
+) -> SysResult<String> {
     ctx.read_user_c_string(pointer, limit)
 }
 
-pub fn read_path_allow_empty(
-    ctx: &dyn KernelSyscallContext,
+pub(crate) fn read_path_allow_empty(
+    ctx: &ProcessSyscallContext<'_>,
     pointer: u64,
     flags: u64,
     limit: usize,
@@ -211,18 +181,6 @@ pub fn read_path_allow_empty(
         return Err(SysErr::Fault);
     }
     ctx.read_user_c_string(pointer, limit)
-}
-
-pub fn read_optional_string(
-    ctx: &dyn KernelSyscallContext,
-    pointer: u64,
-    limit: usize,
-) -> SysResult<Option<String>> {
-    if pointer == 0 {
-        Ok(None)
-    } else {
-        ctx.read_user_c_string(pointer, limit).map(Some)
-    }
 }
 
 pub fn join_u64_halves(low: u64, high: u64) -> u64 {

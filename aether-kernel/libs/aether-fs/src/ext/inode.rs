@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use aether_frame::libs::spin::{PreemptDisabled, SpinLock, SpinLockGuard};
+use aether_frame::time::realtime_seconds;
 use aether_vfs::{FsError, FsResult, Inode, NodeKind, NodeMetadata, NodeRef, NodeTimestamp};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -93,7 +94,7 @@ impl ExtInodeNode {
             mode,
             uid: 0,
             gid: 0,
-            time: Duration::ZERO,
+            time: Duration::from_secs(realtime_seconds() as u64),
             flags,
         }))
         .map_err(map_ext_error)

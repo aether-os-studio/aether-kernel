@@ -1,6 +1,8 @@
 use spin::Once;
 
-use super::{KernelSyscallContext, SyscallArgs, SyscallDisposition};
+use crate::process::ProcessSyscallContext;
+
+use super::{SyscallArgs, SyscallDisposition};
 
 const MAX_SYSCALLS: usize = 512;
 
@@ -9,7 +11,7 @@ const MAX_SYSCALLS: usize = 512;
 pub struct SyscallEntry {
     pub number: u64,
     pub name: &'static str,
-    pub handle: fn(&mut dyn KernelSyscallContext, SyscallArgs) -> SyscallDisposition,
+    pub(crate) handle: fn(&mut ProcessSyscallContext<'_>, SyscallArgs) -> SyscallDisposition,
 }
 
 pub struct SyscallDispatch {
@@ -42,7 +44,7 @@ impl SyscallRegistry {
     pub fn dispatch(
         &self,
         number: u64,
-        context: &mut dyn KernelSyscallContext,
+        context: &mut ProcessSyscallContext<'_>,
         args: SyscallArgs,
     ) -> Option<SyscallDispatch> {
         let entry = self.entries.get(number as usize)?.get()?;
@@ -62,7 +64,7 @@ pub fn registry() -> &'static SyscallRegistry {
 #[inline(never)]
 pub fn dispatch(
     number: u64,
-    context: &mut dyn KernelSyscallContext,
+    context: &mut ProcessSyscallContext<'_>,
     args: SyscallArgs,
 ) -> Option<SyscallDispatch> {
     REGISTRY.dispatch(number, context, args)

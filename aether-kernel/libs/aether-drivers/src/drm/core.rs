@@ -8,13 +8,15 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use aether_device::{DeviceClass, DeviceMetadata, DeviceNode, DeviceRegistry, KernelDevice};
+use aether_device::{
+    DeviceClass, DeviceMetadata, DeviceNode, DeviceRegistry, KernelDevice, SysfsEntry,
+};
 use aether_frame::libs::spin::SpinLock;
 use aether_frame::time;
 use aether_framebuffer::{FramebufferSurface, RgbColor};
 use aether_vfs::{
     FileNode, FileOperations, FsError, FsResult, MmapCachePolicy, MmapRequest, MmapResponse,
-    NodeRef, PollEvents, SharedWaitListener, WaitQueue,
+    NodeRef, OpenFlags, PollEvents, SharedWaitListener, WaitQueue,
 };
 
 use super::plainfb::PlainFbBackend;
@@ -79,6 +81,7 @@ pub const DRM_CAP_CURSOR_HEIGHT: u64 = 0x9;
 pub const DRM_CAP_ADDFB2_MODIFIERS: u64 = 0x10;
 pub const DRM_CAP_PAGE_FLIP_TARGET: u64 = 0x11;
 pub const DRM_CAP_CRTC_IN_VBLANK_EVENT: u64 = 0x12;
+pub const DRM_CAP_PRIME: u64 = 0x5;
 
 pub const DRM_CLIENT_CAP_STEREO_3D: u64 = 1;
 pub const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
@@ -112,6 +115,7 @@ const MAX_READY_DRM_EVENTS: usize = 64;
 const MAX_PENDING_DRM_EVENTS: usize = 256;
 
 static DRM_DEVICES: SpinLock<Vec<Weak<DrmDevice>>> = SpinLock::new(Vec::new());
+static NEXT_DRM_FILE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_VBLANK_DEADLINE_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 static USER_PROPERTY_BLOBS: SpinLock<BTreeMap<u32, Vec<u8>>> = SpinLock::new(BTreeMap::new());
 static NEXT_USER_PROPERTY_BLOB_ID: AtomicU32 = AtomicU32::new(0x3000_0000);
@@ -341,6 +345,21 @@ impl DumbBuffer {
     fn bytes(&self) -> &[u8] {
         &self.dma.as_slice()[..self.size]
     }
+
+    fn write(&self, offset: usize, bytes: &[u8]) -> usize {
+        if offset >= self.size {
+            return 0;
+        }
+        let count = bytes.len().min(self.size - offset);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.dma.as_ptr::<u8>().add(offset),
+                count,
+            );
+        }
+        count
+    }
 }
 
 struct DrmFramebufferState {
@@ -373,7 +392,7 @@ struct DrmState {
     crtc_h: u32,
     crtc_mode_valid: bool,
     crtc_mode: DrmModeInfo,
-    master_pid: Option<u32>,
+    master_file_id: Option<u64>,
     universal_planes: bool,
     dumb_buffers: BTreeMap<u32, Arc<DumbBuffer>>,
     framebuffers: BTreeMap<u32, DrmFramebufferState>,
@@ -607,7 +626,7 @@ impl DrmDevice {
                 crtc_h: u32::from(mode.vdisplay),
                 crtc_mode_valid: true,
                 crtc_mode: mode,
-                master_pid: None,
+                master_file_id: None,
                 universal_planes: false,
                 dumb_buffers: BTreeMap::new(),
                 framebuffers: BTreeMap::new(),
@@ -646,6 +665,9 @@ impl DrmDevice {
             DRM_CAP_DUMB_PREFER_SHADOW => 1,
             DRM_CAP_TIMESTAMP_MONOTONIC => 1,
             DRM_CAP_CRTC_IN_VBLANK_EVENT => 1,
+            DRM_CAP_PRIME => {
+                super::ioctl::DRM_PRIME_CAP_IMPORT | super::ioctl::DRM_PRIME_CAP_EXPORT
+            }
             DRM_CAP_ADDFB2_MODIFIERS => 0,
             DRM_CAP_PAGE_FLIP_TARGET => 0,
             DRM_CAP_CURSOR_WIDTH | DRM_CAP_CURSOR_HEIGHT => 0,
@@ -680,27 +702,31 @@ impl DrmDevice {
         }
     }
 
-    pub fn set_master(&self, pid: u32) -> Result<(), DrmIoctlError> {
+    pub fn set_master(&self, file_id: u64) -> Result<(), DrmIoctlError> {
         let mut state = self.state.lock();
-        match state.master_pid {
-            Some(owner) if owner != pid => Err(DrmIoctlError::Busy),
+        match state.master_file_id {
+            Some(owner) if owner != file_id => Err(DrmIoctlError::Busy),
             _ => {
-                state.master_pid = Some(pid);
+                state.master_file_id = Some(file_id);
                 Ok(())
             }
         }
     }
 
-    pub fn drop_master(&self, pid: u32) -> Result<(), DrmIoctlError> {
+    pub fn drop_master(&self, file_id: u64) -> Result<(), DrmIoctlError> {
         let mut state = self.state.lock();
-        match state.master_pid {
-            Some(owner) if owner == pid => {
-                state.master_pid = None;
+        match state.master_file_id {
+            Some(owner) if owner == file_id => {
+                state.master_file_id = None;
                 Ok(())
             }
             Some(_) => Err(DrmIoctlError::Permission),
             None => Ok(()),
         }
+    }
+
+    pub fn is_master(&self, file_id: u64) -> bool {
+        self.state.lock().master_file_id == Some(file_id)
     }
 
     pub fn resources(&self) -> DrmResourcesSnapshot {
@@ -1347,6 +1373,19 @@ impl DrmDevice {
             .ok_or(DrmIoctlError::NotFound)
     }
 
+    pub fn dumb_buffer_info(&self, handle: u32) -> Result<(u64, usize), DrmIoctlError> {
+        let state = self.state.lock();
+        let dumb = state
+            .dumb_buffers
+            .get(&handle)
+            .ok_or(DrmIoctlError::NotFound)?;
+        Ok((dumb.phys_addr(), dumb.size))
+    }
+
+    pub fn has_dumb_buffer(&self, handle: u32) -> bool {
+        self.state.lock().dumb_buffers.contains_key(&handle)
+    }
+
     pub fn destroy_dumb(&self, handle: u32) -> Result<(), DrmIoctlError> {
         let mut state = self.state.lock();
         if state.current_fb_id != 0
@@ -1754,22 +1793,54 @@ impl DrmDevice {
 }
 
 pub struct DrmFile {
+    id: u64,
     device: Arc<DrmDevice>,
+    node_type: DrmNodeType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrmNodeType {
+    Primary,
+    Render,
 }
 
 impl DrmFile {
     pub fn new(device: Arc<DrmDevice>) -> Arc<Self> {
-        Arc::new(Self { device })
+        Self::new_primary(device)
+    }
+
+    pub fn new_primary(device: Arc<DrmDevice>) -> Arc<Self> {
+        Arc::new(Self {
+            id: NEXT_DRM_FILE_ID.fetch_add(1, Ordering::AcqRel),
+            device,
+            node_type: DrmNodeType::Primary,
+        })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn device(&self) -> &Arc<DrmDevice> {
         &self.device
+    }
+
+    pub fn node_type(&self) -> DrmNodeType {
+        self.node_type
     }
 }
 
 impl FileOperations for DrmFile {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn open_file(&self, _flags: OpenFlags) -> FsResult<Option<Arc<dyn FileOperations>>> {
+        Ok(Some(Arc::new(Self {
+            id: NEXT_DRM_FILE_ID.fetch_add(1, Ordering::AcqRel),
+            device: self.device.clone(),
+            node_type: self.node_type,
+        })))
     }
 
     fn read(&self, _offset: usize, buffer: &mut [u8]) -> FsResult<usize> {
@@ -1806,6 +1877,82 @@ impl FileOperations for DrmFile {
     }
 }
 
+pub struct DrmPrimeFile {
+    device: Arc<DrmDevice>,
+    handle: u32,
+    physical_address: u64,
+    size: usize,
+}
+
+impl DrmPrimeFile {
+    pub fn new(
+        device: Arc<DrmDevice>,
+        handle: u32,
+        physical_address: u64,
+        size: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            device,
+            handle,
+            physical_address,
+            size,
+        })
+    }
+
+    pub fn device(&self) -> &Arc<DrmDevice> {
+        &self.device
+    }
+
+    pub fn handle(&self) -> u32 {
+        self.handle
+    }
+}
+
+impl FileOperations for DrmPrimeFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn read(&self, offset: usize, buffer: &mut [u8]) -> FsResult<usize> {
+        let state = self.device.state.lock();
+        let dumb = state
+            .dumb_buffers
+            .get(&self.handle)
+            .ok_or(FsError::NotFound)?;
+        if offset >= dumb.size {
+            return Ok(0);
+        }
+        let count = buffer.len().min(dumb.size - offset);
+        buffer[..count].copy_from_slice(&dumb.bytes()[offset..offset + count]);
+        Ok(count)
+    }
+
+    fn write(&self, offset: usize, buffer: &[u8]) -> FsResult<usize> {
+        let state = self.device.state.lock();
+        let dumb = state
+            .dumb_buffers
+            .get(&self.handle)
+            .ok_or(FsError::NotFound)?;
+        Ok(dumb.write(offset, buffer))
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn mmap(&self, request: MmapRequest) -> FsResult<MmapResponse> {
+        if request.offset > self.size as u64
+            || request.length > (self.size as u64).saturating_sub(request.offset)
+        {
+            return Err(FsError::InvalidInput);
+        }
+        Ok(MmapResponse::direct_physical(
+            self.physical_address.saturating_add(request.offset),
+            MmapCachePolicy::Cached,
+        ))
+    }
+}
+
 struct DrmPrimaryDeviceNode {
     name: String,
     minor: u16,
@@ -1830,6 +1977,23 @@ impl KernelDevice for DrmPrimaryDeviceNode {
         );
         alloc::vec![DeviceNode::new(alloc::format!("dri/{}", self.name), node)]
     }
+
+    fn sysfs_devpath_under_devices(&self) -> Option<String> {
+        Some(alloc::format!("virtual/drm/{}", self.name))
+    }
+
+    fn sysfs_entries(&self) -> Vec<SysfsEntry> {
+        let device_path = alloc::format!("devices/virtual/drm/{}", self.name);
+        alloc::vec![
+            SysfsEntry::symlink(alloc::format!("{device_path}/device"), "."),
+            SysfsEntry::directory(alloc::format!("{device_path}/drm"), 0o040755),
+            SysfsEntry::symlink(alloc::format!("{device_path}/drm/{}", self.name), "..",),
+        ]
+    }
+
+    fn uevent_fields(&self) -> Vec<String> {
+        alloc::vec![alloc::format!("DEVNAME=dri/{}", self.name)]
+    }
 }
 
 pub fn probe(registry: &mut DeviceRegistry) {
@@ -1838,7 +2002,7 @@ pub fn probe(registry: &mut DeviceRegistry) {
     {
         let backend: Arc<dyn DrmScanoutBackend> = Arc::new(PlainFbBackend::new(surface));
         let device = DrmDevice::new(0, backend);
-        let primary = DrmFile::new(device);
+        let primary = DrmFile::new_primary(device);
         registry.register(Arc::new(DrmPrimaryDeviceNode {
             name: "card0".to_string(),
             minor: 0,

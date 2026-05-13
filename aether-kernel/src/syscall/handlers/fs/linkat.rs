@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext, resolve_at_path};
+use crate::process::{ProcessSyscallContext, resolve_at_path};
 use crate::syscall::SyscallDisposition;
 use crate::syscall::abi::{arg_i64_from_i32, read_path};
 
@@ -24,8 +24,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_linkat(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn linkat(
         &mut self,
         olddirfd: i64,
         old_path: &str,

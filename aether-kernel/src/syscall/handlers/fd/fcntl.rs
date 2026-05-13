@@ -2,8 +2,8 @@ use aether_vfs::SharedMemoryFile;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::process::ProcessSyscallContext;
+use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
     pub struct FcntlSyscall => nr::FCNTL, "fcntl", |ctx, args| { SyscallDisposition::Return(ctx.fcntl(args.get(0), args.get(1), args.get(2))) }
@@ -21,11 +21,8 @@ struct LinuxFlock {
 impl LinuxFlock {
     const SIZE: usize = 24;
 
-    fn read_from<S: ProcessServices>(
-        ctx: &ProcessSyscallContext<'_, S>,
-        address: u64,
-    ) -> SysResult<Self> {
-        let bytes = ctx.syscall_read_user_exact_buffer(address, Self::SIZE)?;
+    fn read_from(ctx: &ProcessSyscallContext<'_>, address: u64) -> SysResult<Self> {
+        let bytes = ctx.read_user_exact_buffer(address, Self::SIZE)?;
         Ok(Self {
             l_type: i16::from_ne_bytes(bytes[0..2].try_into().map_err(|_| SysErr::Fault)?),
             l_whence: i16::from_ne_bytes(bytes[2..4].try_into().map_err(|_| SysErr::Fault)?),
@@ -35,11 +32,7 @@ impl LinuxFlock {
         })
     }
 
-    fn write_to<S: ProcessServices>(
-        self,
-        ctx: &mut ProcessSyscallContext<'_, S>,
-        address: u64,
-    ) -> SysResult<()> {
+    fn write_to(self, ctx: &mut ProcessSyscallContext<'_>, address: u64) -> SysResult<()> {
         let mut bytes = [0u8; Self::SIZE];
         bytes[0..2].copy_from_slice(&self.l_type.to_ne_bytes());
         bytes[2..4].copy_from_slice(&self.l_whence.to_ne_bytes());
@@ -50,8 +43,8 @@ impl LinuxFlock {
     }
 }
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_fcntl(&mut self, fd: u64, command: u64, arg: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn fcntl(&mut self, fd: u64, command: u64, arg: u64) -> SysResult<u64> {
         const F_DUPFD: u64 = 0;
         const F_GETFD: u64 = 1;
         const F_SETFD: u64 = 2;

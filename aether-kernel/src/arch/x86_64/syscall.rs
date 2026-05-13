@@ -16,6 +16,7 @@ pub mod nr {
     pub const MPROTECT: u64 = 10;
     pub const MUNMAP: u64 = 11;
     pub const BRK: u64 = 12;
+    pub const MADVISE: u64 = 28;
     pub const RT_SIGACTION: u64 = 13;
     pub const RT_SIGPROCMASK: u64 = 14;
     pub const RT_SIGRETURN: u64 = 15;
@@ -60,6 +61,7 @@ pub mod nr {
     pub const SHMDT: u64 = 67;
     pub const FLOCK: u64 = 73;
     pub const FCNTL: u64 = 72;
+    pub const FSYNC: u64 = 74;
     pub const FTRUNCATE: u64 = 77;
     pub const GETCWD: u64 = 79;
     pub const CHDIR: u64 = 80;
@@ -134,12 +136,14 @@ pub mod nr {
     pub const FACCESSAT: u64 = 269;
     pub const PSELECT6: u64 = 270;
     pub const PPOLL: u64 = 271;
+    pub const UTIMENSAT: u64 = 280;
     pub const SET_ROBUST_LIST: u64 = 273;
     pub const DUP3: u64 = 292;
     pub const PIPE2: u64 = 293;
     pub const INOTIFY_INIT1: u64 = 294;
     pub const PREADV64: u64 = 295;
     pub const PWRITEV64: u64 = 296;
+    pub const COPY_FILE_RANGE: u64 = 326;
     pub const EPOLL_PWAIT: u64 = 281;
     pub const SIGNALFD: u64 = 282;
     pub const TIMERFD_CREATE: u64 = 283;

@@ -2,8 +2,8 @@ use alloc::vec;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::process::ProcessSyscallContext;
+use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
     pub struct GetrandomSyscall => nr::GETRANDOM, "getrandom", |ctx, args| {
@@ -11,13 +11,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_getrandom(
-        &mut self,
-        address: u64,
-        len: usize,
-        flags: u64,
-    ) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn getrandom(&mut self, address: u64, len: usize, flags: u64) -> SysResult<u64> {
         const GRND_NONBLOCK: u64 = 0x1;
         const GRND_RANDOM: u64 = 0x2;
         const GRND_INSECURE: u64 = 0x4;

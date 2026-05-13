@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::SysResult;
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(pub struct LchownSyscall => nr::LCHOWN, "lchown", |ctx, args| {
@@ -10,9 +10,9 @@ crate::declare_syscall!(pub struct LchownSyscall => nr::LCHOWN, "lchown", |ctx, 
     }
 });
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_lchown(&mut self, path: &str, owner: u64, group: u64) -> SysResult<u64> {
-        self.syscall_fchownat(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn lchown(&mut self, path: &str, owner: u64, group: u64) -> SysResult<u64> {
+        self.fchownat(
             crate::syscall::abi::AT_FDCWD,
             path,
             owner,

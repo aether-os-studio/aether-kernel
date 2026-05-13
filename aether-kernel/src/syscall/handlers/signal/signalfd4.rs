@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(pub struct Signalfd4Syscall => nr::SIGNALFD4, "signalfd4", |ctx, args| {
@@ -12,8 +12,8 @@ crate::declare_syscall!(pub struct Signalfd4Syscall => nr::SIGNALFD4, "signalfd4
     ))
 });
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_signalfd4(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn signalfd4(
         &mut self,
         fd: i32,
         mask: u64,
@@ -33,7 +33,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         if mask == 0 {
             return Err(SysErr::Fault);
         }
-        let raw_mask = self.syscall_read_user_exact_buffer(mask, core::mem::size_of::<u64>())?;
+        let raw_mask = self.read_user_exact_buffer(mask, core::mem::size_of::<u64>())?;
         let mask = u64::from_ne_bytes(raw_mask.try_into().map_err(|_| SysErr::Fault)?)
             & !(crate::signal::sigbit(crate::signal::SIGKILL)
                 | crate::signal::sigbit(crate::signal::SIGSTOP));

@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::SysResult;
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(pub struct ChmodSyscall => nr::CHMOD, "chmod", |ctx, args| {
@@ -10,8 +10,8 @@ crate::declare_syscall!(pub struct ChmodSyscall => nr::CHMOD, "chmod", |ctx, arg
     }
 });
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_chmod(&mut self, path: &str, mode: u64) -> SysResult<u64> {
-        self.syscall_fchmodat(-100, path, mode)
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn chmod(&mut self, path: &str, mode: u64) -> SysResult<u64> {
+        self.fchmodat(-100, path, mode)
     }
 }

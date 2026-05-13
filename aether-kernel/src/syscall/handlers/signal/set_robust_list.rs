@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -9,8 +9,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_set_robust_list(&mut self, head: u64, len: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn set_robust_list(&mut self, head: u64, len: u64) -> SysResult<u64> {
         const ROBUST_LIST_HEAD_LEN: u64 = 24;
 
         if len != ROBUST_LIST_HEAD_LEN {

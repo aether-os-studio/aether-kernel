@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -9,8 +9,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_inotify_init1(&mut self, flags: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn inotify_init1(&mut self, flags: u64) -> SysResult<u64> {
         const IN_CLOEXEC: u64 = 0o2000000;
         const IN_NONBLOCK: u64 = 0o4000;
 

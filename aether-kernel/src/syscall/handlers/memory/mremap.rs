@@ -5,7 +5,7 @@ use alloc::vec;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{MmapRegion, MmapRegionBacking, ProcessServices, ProcessSyscallContext};
+use crate::process::{MmapRegion, MmapRegionBacking, ProcessSyscallContext};
 use crate::syscall::SyscallDisposition;
 
 const MREMAP_MAYMOVE: u64 = 0x1;
@@ -28,7 +28,7 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
+impl ProcessSyscallContext<'_> {
     fn mmap_prot_from_page_flags(flags: MapFlags) -> u64 {
         let mut prot = PROT_READ;
         if flags.contains(MapFlags::WRITE) {
@@ -115,7 +115,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             .remove_mmap_region_range(address, address.saturating_add(len));
     }
 
-    pub(crate) fn syscall_mremap(
+    pub(crate) fn mremap(
         &mut self,
         old_address: u64,
         old_size: u64,

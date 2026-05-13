@@ -1,7 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::KernelSyscallContext;
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -10,8 +9,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_getresuid(&mut self, ruid: u64, euid: u64, suid: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn getresuid(&mut self, ruid: u64, euid: u64, suid: u64) -> SysResult<u64> {
         if ruid == 0 || euid == 0 || suid == 0 {
             return Err(SysErr::Fault);
         }

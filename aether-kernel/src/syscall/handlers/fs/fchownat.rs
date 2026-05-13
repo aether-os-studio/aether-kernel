@@ -1,7 +1,7 @@
 use crate::arch::syscall::nr;
 use crate::credentials::Credentials;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 use crate::syscall::abi::{arg_i64_from_i32, read_path_allow_empty};
 
@@ -21,7 +21,7 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
+impl ProcessSyscallContext<'_> {
     pub(crate) fn read_optional_chown_id(raw: u64) -> SysResult<Option<u32>> {
         let value = u32::try_from(raw).map_err(|_| SysErr::Inval)?;
         Ok((value != u32::MAX).then_some(value))
@@ -67,7 +67,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(())
     }
 
-    pub(crate) fn syscall_fchownat(
+    pub(crate) fn fchownat(
         &mut self,
         dirfd: i64,
         path: &str,

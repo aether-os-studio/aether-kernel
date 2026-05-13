@@ -1,7 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::KernelSyscallContext;
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 use crate::syscall::abi::arg_i64_from_i32;
 
@@ -31,8 +30,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_statx(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn statx(
         &mut self,
         dirfd: i64,
         path: &str,

@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -9,13 +9,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_close_range(
-        &mut self,
-        first: u64,
-        last: u64,
-        flags: u64,
-    ) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn close_range(&mut self, first: u64, last: u64, flags: u64) -> SysResult<u64> {
         const CLOSE_RANGE_CLOEXEC: u64 = 0x4;
         const CLOSE_RANGE_UNSHARE: u64 = 0x2;
 

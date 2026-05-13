@@ -1,7 +1,7 @@
 use crate::arch::{ArchContext, syscall::nr};
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::process::ProcessSyscallContext;
+use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
     pub struct ArchPrctlSyscall => nr::ARCH_PRCTL, "arch_prctl", |ctx, args| {
@@ -9,8 +9,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_arch_prctl(&mut self, code: u64, address: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn arch_prctl(&mut self, code: u64, address: u64) -> SysResult<u64> {
         const ARCH_SET_GS: u64 = 0x1001;
         const ARCH_SET_FS: u64 = 0x1002;
         const ARCH_GET_FS: u64 = 0x1003;

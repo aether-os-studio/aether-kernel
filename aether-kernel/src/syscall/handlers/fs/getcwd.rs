@@ -1,7 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::KernelSyscallContext;
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -10,8 +9,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_getcwd(&mut self, address: u64, len: usize) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn getcwd(&mut self, address: u64, len: usize) -> SysResult<u64> {
         let mut cwd = self.services.getcwd(&self.process.fs).into_bytes();
         cwd.push(0);
         if len < cwd.len() {

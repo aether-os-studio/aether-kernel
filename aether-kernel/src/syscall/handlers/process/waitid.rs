@@ -1,8 +1,8 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ChildEvent, ChildEventKind, ProcessServices, ProcessSyscallContext};
+use crate::process::{ChildEvent, ChildEventKind, ProcessSyscallContext};
 use crate::signal::{self, CLD_CONTINUED, CLD_EXITED, CLD_KILLED, CLD_STOPPED};
-use crate::syscall::{BlockResult, KernelSyscallContext, SyscallDisposition};
+use crate::syscall::{BlockResult, SyscallDisposition};
 
 const P_ALL: i32 = 0;
 const P_PID: i32 = 1;
@@ -28,7 +28,7 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
+impl ProcessSyscallContext<'_> {
     fn waitid_selector(
         &mut self,
         idtype: i32,
@@ -113,7 +113,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(())
     }
 
-    pub(crate) fn syscall_waitid(
+    pub(crate) fn waitid(
         &mut self,
         idtype: i32,
         id: u64,
@@ -159,7 +159,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Err(SysErr::Child)
     }
 
-    pub(crate) fn syscall_waitid_blocking(
+    pub(crate) fn waitid_blocking(
         &mut self,
         idtype: i32,
         id: u64,
@@ -178,7 +178,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 }
             }
 
-            match self.syscall_waitid(idtype, id, infop, options, rusage) {
+            match self.waitid(idtype, id, infop, options, rusage) {
                 Ok(value) => return SyscallDisposition::ok(value),
                 Err(SysErr::Again) => {
                     let selector = match self.waitid_selector(idtype, id) {

@@ -16,7 +16,7 @@ use aether_frame::mm::{FrameAllocator, PAGE_SIZE, PhysFrame, frame_allocator};
 
 use crate::{
     FileAdvice, Inode, InodeOperations, IoctlResponse, MmapCachePolicy, MmapRequest, MmapResponse,
-    NodeRef, PollEvents, SharedWaitListener,
+    NodeRef, OpenFlags, PollEvents, SharedWaitListener,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,10 @@ pub type FsResult<T> = Result<T, FsError>;
 
 pub trait FileOperations: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
+
+    fn open_file(&self, _flags: OpenFlags) -> FsResult<Option<Arc<dyn FileOperations>>> {
+        Ok(None)
+    }
 
     fn open(&self) {}
 
@@ -367,7 +371,7 @@ impl InodeOperations for DirectoryNode {
 
     fn create_file(&self, name: String, mode: u32) -> FsResult<NodeRef> {
         let node =
-            FileNode::new_with_mode(name.clone(), mode, 0, Arc::new(MutableMemoryFile::new(&[])));
+            FileNode::new_with_mode(name.clone(), mode, 0, Arc::new(SharedMemoryFile::new()));
         self.insert(name, node.clone())?;
         Ok(node)
     }
@@ -418,6 +422,23 @@ impl InodeOperations for DirectoryNode {
         let mut metadata = self.metadata.lock();
         metadata.uid = uid;
         metadata.gid = gid;
+        Ok(())
+    }
+
+    fn set_times(
+        &self,
+        atime: Option<NodeTimestamp>,
+        mtime: Option<NodeTimestamp>,
+        ctime: NodeTimestamp,
+    ) -> FsResult<()> {
+        let mut metadata = self.metadata.lock();
+        if let Some(atime) = atime {
+            metadata.atime = atime;
+        }
+        if let Some(mtime) = mtime {
+            metadata.mtime = mtime;
+        }
+        metadata.ctime = ctime;
         Ok(())
     }
 
@@ -521,8 +542,11 @@ impl InodeOperations for FileNode {
         Some(self.operations.as_ref())
     }
 
-    fn open_file(&self, _flags: crate::OpenFlags) -> FsResult<Arc<dyn FileOperations>> {
-        Ok(self.operations.clone())
+    fn open_file(&self, flags: crate::OpenFlags) -> FsResult<Arc<dyn FileOperations>> {
+        Ok(self
+            .operations
+            .open_file(flags)?
+            .unwrap_or_else(|| self.operations.clone()))
     }
 
     fn device_numbers(&self) -> Option<(u32, u32)> {
@@ -544,6 +568,23 @@ impl InodeOperations for FileNode {
         let mut metadata = self.metadata.lock();
         metadata.uid = uid;
         metadata.gid = gid;
+        Ok(())
+    }
+
+    fn set_times(
+        &self,
+        atime: Option<NodeTimestamp>,
+        mtime: Option<NodeTimestamp>,
+        ctime: NodeTimestamp,
+    ) -> FsResult<()> {
+        let mut metadata = self.metadata.lock();
+        if let Some(atime) = atime {
+            metadata.atime = atime;
+        }
+        if let Some(mtime) = mtime {
+            metadata.mtime = mtime;
+        }
+        metadata.ctime = ctime;
         Ok(())
     }
 
@@ -797,7 +838,8 @@ impl SharedMemoryFile {
         let end = offset.checked_add(len).ok_or(FsError::InvalidInput)?;
         let page_size = PAGE_SIZE as usize;
         let first_page = offset / page_size;
-        let page_count = len.div_ceil(page_size);
+        let page_offset = offset % page_size;
+        let page_count = page_offset.saturating_add(len).div_ceil(page_size);
         if end > state.size.saturating_add(page_size.saturating_sub(1))
             || first_page.saturating_add(page_count) > state.pages.len()
         {
@@ -1095,6 +1137,23 @@ impl InodeOperations for SymlinkNode {
         let mut metadata = self.metadata.lock();
         metadata.uid = uid;
         metadata.gid = gid;
+        Ok(())
+    }
+
+    fn set_times(
+        &self,
+        atime: Option<NodeTimestamp>,
+        mtime: Option<NodeTimestamp>,
+        ctime: NodeTimestamp,
+    ) -> FsResult<()> {
+        let mut metadata = self.metadata.lock();
+        if let Some(atime) = atime {
+            metadata.atime = atime;
+        }
+        if let Some(mtime) = mtime {
+            metadata.mtime = mtime;
+        }
+        metadata.ctime = ctime;
         Ok(())
     }
 

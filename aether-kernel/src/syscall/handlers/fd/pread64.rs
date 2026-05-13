@@ -2,8 +2,7 @@ use alloc::vec;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::KernelSyscallContext;
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -17,8 +16,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_pread64(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn pread64(
         &mut self,
         fd: u64,
         address: u64,

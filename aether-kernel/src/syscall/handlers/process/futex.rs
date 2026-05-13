@@ -2,7 +2,7 @@ use aether_frame::time;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{FutexKey, ProcessServices, ProcessSyscallContext};
+use crate::process::{FutexKey, ProcessSyscallContext};
 use crate::syscall::abi::LinuxTimespec;
 use crate::syscall::{BlockResult, SyscallDisposition};
 
@@ -19,8 +19,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_futex(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn futex(
         &mut self,
         uaddr: u64,
         operation: u64,
@@ -95,7 +95,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
     }
 
-    pub(crate) fn syscall_futex_blocking(
+    pub(crate) fn futex_blocking(
         &mut self,
         uaddr: u64,
         operation: u64,
@@ -127,7 +127,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
 
         if command != FUTEX_WAIT && command != FUTEX_WAIT_BITSET {
             return SyscallDisposition::Return(
-                self.syscall_futex(uaddr, operation, val, timeout, uaddr2, val3),
+                self.futex(uaddr, operation, val, timeout, uaddr2, val3),
             );
         }
         let bitset = if command == FUTEX_WAIT_BITSET {

@@ -2,7 +2,7 @@ use aether_vfs::{FlockOperation, PollEvents};
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::{BlockResult, SyscallDisposition};
 
 const LOCK_SH: u64 = 1;
@@ -31,8 +31,8 @@ fn parse_flock_operation(operation: u64) -> SysResult<(FlockOperation, bool)> {
     Ok((flock_operation, nonblock))
 }
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_flock(&mut self, fd: u64, operation: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn flock(&mut self, fd: u64, operation: u64) -> SysResult<u64> {
         let (operation, _) = parse_flock_operation(operation)?;
         let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
         descriptor
@@ -43,18 +43,18 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(0)
     }
 
-    pub(crate) fn syscall_flock_blocking(&mut self, fd: u64, operation: u64) -> SyscallDisposition {
+    pub(crate) fn flock_blocking(&mut self, fd: u64, operation: u64) -> SyscallDisposition {
         let (flock_operation, nonblock) = match parse_flock_operation(operation) {
             Ok(parsed) => parsed,
             Err(error) => return SyscallDisposition::err(error),
         };
 
         if nonblock || matches!(flock_operation, FlockOperation::Unlock) {
-            return SyscallDisposition::Return(self.syscall_flock(fd, operation));
+            return SyscallDisposition::Return(self.flock(fd, operation));
         }
 
         loop {
-            match self.syscall_flock(fd, operation) {
+            match self.flock(fd, operation) {
                 Ok(value) => return SyscallDisposition::ok(value),
                 Err(SysErr::Again) => match self.wait_file(fd as u32, PollEvents::LOCK) {
                     Ok(BlockResult::File { ready: true }) => {}

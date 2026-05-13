@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{Pid, ProcessServices, ProcessSyscallContext};
+use crate::process::{Pid, ProcessSyscallContext};
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -12,8 +12,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_setpgid(&mut self, pid: i32, pgid: i32) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn setpgid(&mut self, pid: i32, pgid: i32) -> SysResult<u64> {
         if pid < 0 || pgid < 0 {
             return Err(SysErr::Inval);
         }

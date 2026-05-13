@@ -5,6 +5,8 @@ mod iopl;
 
 #[path = "memory/brk.rs"]
 mod brk;
+#[path = "memory/madvise.rs"]
+mod madvise;
 #[path = "memory/mincore.rs"]
 mod mincore;
 #[path = "memory/mmap.rs"]
@@ -152,11 +154,15 @@ mod umount2;
 mod unlink;
 #[path = "fs/unlinkat.rs"]
 mod unlinkat;
+#[path = "fs/utimensat.rs"]
+mod utimensat;
 
 #[path = "fd/close.rs"]
 mod close;
 #[path = "fd/close_range.rs"]
 mod close_range;
+#[path = "fd/copy_file_range.rs"]
+mod copy_file_range;
 #[path = "fd/dup.rs"]
 mod dup;
 #[path = "fd/dup2.rs"]
@@ -185,6 +191,8 @@ mod flock;
 mod fstat;
 #[path = "fd/fstatfs.rs"]
 mod fstatfs;
+#[path = "fd/fsync.rs"]
+mod fsync;
 #[path = "fd/ftruncate.rs"]
 mod ftruncate;
 #[path = "fd/getdents64.rs"]
@@ -323,8 +331,6 @@ mod uname;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::KernelSyscallContext;
-
 pub fn init() {
     crate::register_syscalls!(
         super::registry::registry(),
@@ -356,6 +362,8 @@ pub fn init() {
             faccessat::FaccessAtSyscall,
             faccessat2::FaccessAt2Syscall,
             fadvise64::Fadvise64Syscall,
+            copy_file_range::CopyFileRangeSyscall,
+            fsync::FsyncSyscall,
             pread64::Pread64Syscall,
             pwrite64::Pwrite64Syscall,
             read::ReadSyscall,
@@ -433,6 +441,7 @@ pub fn init() {
             mkdir::MkdirSyscall,
             rmdir::RmdirSyscall,
             mmap::MmapSyscall,
+            madvise::MadviseSyscall,
             mprotect::MprotectSyscall,
             mremap::MremapSyscall,
             munmap::MunmapSyscall,
@@ -486,6 +495,7 @@ pub fn init() {
             renameat::RenameAtSyscall,
             symlink::SymlinkSyscall,
             umask::UmaskSyscall,
+            utimensat::UtimensatSyscall,
             setuid::SetUidSyscall,
             setgid::SetGidSyscall,
             setgroups::SetGroupsSyscall,
@@ -498,7 +508,7 @@ pub fn init() {
 }
 
 fn read_string_vector(
-    ctx: &dyn KernelSyscallContext,
+    ctx: &crate::process::ProcessSyscallContext<'_>,
     pointers: &[u64],
 ) -> Result<Vec<String>, crate::errno::SysErr> {
     let mut values = Vec::with_capacity(pointers.len());

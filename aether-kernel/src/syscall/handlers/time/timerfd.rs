@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext, anonymous_filesystem_identity};
+use crate::process::{ProcessSyscallContext, anonymous_filesystem_identity};
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -26,8 +26,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_timerfd_create(&mut self, clockid: i32, flags: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn timerfd_create(&mut self, clockid: i32, flags: u64) -> SysResult<u64> {
         if (flags & !crate::fs::TFD_CREATE_FLAGS) != 0 {
             return Err(SysErr::Inval);
         }
@@ -51,7 +51,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         ) as u64)
     }
 
-    pub(crate) fn syscall_timerfd_settime(
+    pub(crate) fn timerfd_settime(
         &mut self,
         fd: i32,
         flags: u64,
@@ -84,7 +84,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(0)
     }
 
-    pub(crate) fn syscall_timerfd_gettime(&mut self, fd: i32, curr_value: u64) -> SysResult<u64> {
+    pub(crate) fn timerfd_gettime(&mut self, fd: i32, curr_value: u64) -> SysResult<u64> {
         if fd < 0 {
             return Err(SysErr::BadFd);
         }

@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -12,13 +12,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_inotify_add_watch(
-        &mut self,
-        fd: u64,
-        path: &str,
-        mask: u64,
-    ) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn inotify_add_watch(&mut self, fd: u64, path: &str, mask: u64) -> SysResult<u64> {
         let mask = u32::try_from(mask).map_err(|_| SysErr::Inval)?;
         if (mask & !crate::fs::INOTIFY_ADD_WATCH_VALID_MASK) != 0 {
             return Err(SysErr::Inval);

@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use aether_frame::libs::spin::PreemptDisabled;
+use aether_frame::time::realtime_seconds;
 use aether_vfs::{
     DirectoryEntry, FsError, FsResult, InodeOperations, NodeKind, NodeMetadata, NodeRef,
 };
@@ -174,7 +175,7 @@ impl InodeOperations for ExtInodeNode {
             path_target,
             0,
             0,
-            Duration::ZERO,
+            Duration::from_secs(realtime_seconds() as u64),
         ))
         .map_err(map_ext_error)?;
         self.store_inode(parent.inode().clone());

@@ -2,7 +2,7 @@ use aether_frame::mm::PAGE_SIZE;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -11,9 +11,9 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_mprotect(&mut self, address: u64, len: u64, prot: u64) -> SysResult<u64> {
-        let page_flags = crate::process::ProcessSyscallContext::<S>::mmap_page_flags(prot);
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn mprotect(&mut self, address: u64, len: u64, prot: u64) -> SysResult<u64> {
+        let page_flags = crate::process::ProcessSyscallContext::mmap_page_flags(prot);
 
         self.process
             .task

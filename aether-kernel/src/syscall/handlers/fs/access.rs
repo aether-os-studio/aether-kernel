@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 use crate::syscall::abi::read_path;
 use aether_vfs::NodeRef;
@@ -14,12 +14,12 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_access(&mut self, path: &str, mode: u64) -> SysResult<u64> {
-        self.syscall_faccessat(-100, path, mode, 0)
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn access(&mut self, path: &str, mode: u64) -> SysResult<u64> {
+        self.faccessat(-100, path, mode, 0)
     }
 
-    pub(crate) fn syscall_faccessat(
+    pub(crate) fn faccessat(
         &mut self,
         dirfd: i64,
         path: &str,

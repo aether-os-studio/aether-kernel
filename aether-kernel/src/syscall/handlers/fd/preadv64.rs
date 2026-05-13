@@ -2,8 +2,7 @@ use alloc::vec;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext, read_iovec_array};
-use crate::syscall::KernelSyscallContext;
+use crate::process::{ProcessSyscallContext, read_iovec_array};
 use crate::syscall::SyscallDisposition;
 
 fn join_offset(low: u64, high: u64) -> u64 {
@@ -21,8 +20,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_preadv64(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn preadv64(
         &mut self,
         fd: u64,
         iov: u64,

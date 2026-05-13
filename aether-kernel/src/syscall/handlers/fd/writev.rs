@@ -2,8 +2,8 @@ use crate::arch::syscall::nr;
 use aether_vfs::{FsError, PollEvents};
 
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext, read_iovec_array};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::process::{ProcessSyscallContext, read_iovec_array};
+use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
     pub struct WritevSyscall => nr::WRITEV, "writev", |ctx, args| {
@@ -11,8 +11,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_writev_fd(&mut self, fd: u64, iov: u64, iovcnt: usize) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn writev_fd(&mut self, fd: u64, iov: u64, iovcnt: usize) -> SysResult<u64> {
         const IOV_MAX: usize = 1024;
 
         let file_ref = self
@@ -74,14 +74,14 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(total as u64)
     }
 
-    pub(crate) fn syscall_writev_fd_blocking(
+    pub(crate) fn writev_fd_blocking(
         &mut self,
         fd: u64,
         iov: u64,
         iovcnt: usize,
     ) -> SyscallDisposition {
         self.file_blocking_syscall(fd as u32, PollEvents::WRITE, |ctx| {
-            ctx.syscall_writev_fd(fd, iov, iovcnt)
+            ctx.writev_fd(fd, iov, iovcnt)
         })
     }
 }

@@ -1,8 +1,8 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext, decode_sigset};
+use crate::process::{ProcessSyscallContext, decode_sigset};
 use crate::signal::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
     pub struct RtSigprocmaskSyscall => nr::RT_SIGPROCMASK, "rt_sigprocmask", |ctx, args| {
@@ -10,8 +10,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_rt_sigprocmask(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn rt_sigprocmask(
         &mut self,
         how: u64,
         set: u64,

@@ -2,7 +2,7 @@ use crate::arch::syscall::nr;
 use aether_vfs::NodeKind;
 
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -11,8 +11,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_lseek(&mut self, fd: u64, offset: i64, whence: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn lseek(&mut self, fd: u64, offset: i64, whence: u64) -> SysResult<u64> {
         const SEEK_SET: u64 = 0;
         const SEEK_CUR: u64 = 1;
         const SEEK_END: u64 = 2;

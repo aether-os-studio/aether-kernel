@@ -3,8 +3,8 @@ use alloc::vec;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::process::ProcessSyscallContext;
+use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
     pub struct MincoreSyscall => nr::MINCORE, "mincore", |ctx, args| {
@@ -12,8 +12,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_mincore(&mut self, address: u64, len: u64, vec: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn mincore(&mut self, address: u64, len: u64, vec: u64) -> SysResult<u64> {
         if len == 0 {
             return Ok(0);
         }

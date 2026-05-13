@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 use crate::syscall::abi::arg_i64_from_i32;
 
@@ -17,8 +17,8 @@ crate::declare_syscall!(pub struct FchmodatSyscall => nr::FCHMODAT, "fchmodat", 
     }
 });
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_fchmodat(&mut self, dirfd: i64, path: &str, mode: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn fchmodat(&mut self, dirfd: i64, path: &str, mode: u64) -> SysResult<u64> {
         if path.is_empty() {
             return Err(SysErr::NoEnt);
         }
@@ -27,7 +27,8 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let (node, _) = self
             .services
             .lookup_node_with_identity(&fs_view, path, true)?;
-        node.set_mode(self.masked_mode(mode, node.metadata().mode))
+        let current_mode = node.metadata().mode;
+        node.set_mode((current_mode & !0o7777) | ((mode as u32) & 0o7777))
             .map_err(SysErr::from)?;
         crate::fs::notify_attrib(&node);
         Ok(0)

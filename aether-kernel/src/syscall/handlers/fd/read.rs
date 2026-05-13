@@ -4,8 +4,8 @@ use crate::arch::syscall::nr;
 use aether_vfs::{FsError, PollEvents};
 
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::process::ProcessSyscallContext;
+use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
     pub struct ReadSyscall => nr::READ, "read", |ctx, args| {
@@ -13,19 +13,19 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_read_fd_blocking(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn read_fd_blocking(
         &mut self,
         fd: u64,
         address: u64,
         len: usize,
     ) -> SyscallDisposition {
         self.file_blocking_syscall(fd as u32, PollEvents::READ, |ctx| {
-            ctx.syscall_read_fd(fd, address, len)
+            ctx.read_fd(fd, address, len)
         })
     }
 
-    pub(crate) fn syscall_read_fd(&mut self, fd: u64, address: u64, len: usize) -> SysResult<u64> {
+    pub(crate) fn read_fd(&mut self, fd: u64, address: u64, len: usize) -> SysResult<u64> {
         if let Ok((_file_ref, socket)) = self.socket_from_fd(fd) {
             let mut bytes = vec![0; len];
             let received = socket.recv_from(bytes.as_mut_slice(), 0)?;

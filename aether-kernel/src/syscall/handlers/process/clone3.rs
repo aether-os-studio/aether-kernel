@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{CloneParams, LinuxCloneArgs, ProcessServices, ProcessSyscallContext};
+use crate::process::{CloneParams, LinuxCloneArgs, ProcessSyscallContext};
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -9,7 +9,7 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
+impl ProcessSyscallContext<'_> {
     fn parse_clone3_set_tid(&self, clone_args: LinuxCloneArgs) -> SysResult<Option<u32>> {
         if clone_args.set_tid_size == 0 {
             return Ok(None);
@@ -23,7 +23,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             return Err(SysErr::Perm);
         }
 
-        let bytes = self.syscall_read_user_exact_buffer(clone_args.set_tid, 4)?;
+        let bytes = self.read_user_exact_buffer(clone_args.set_tid, 4)?;
         let requested = i32::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| SysErr::Fault)?);
         if requested <= 0 {
             return Err(SysErr::Inval);
@@ -31,20 +31,12 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(Some(requested as u32))
     }
 
-    pub(crate) fn syscall_clone3(&mut self, args: u64, size: usize) -> SysResult<u64> {
-        let disposition = self.syscall_clone3_blocking(args, size);
-        match disposition {
-            SyscallDisposition::Return(result) => result,
-            _ => Err(SysErr::Again),
-        }
-    }
-
-    pub(crate) fn syscall_clone3_blocking(&mut self, args: u64, size: usize) -> SyscallDisposition {
+    pub(crate) fn clone3_blocking(&mut self, args: u64, size: usize) -> SyscallDisposition {
         if size < LinuxCloneArgs::SIZE_VER0 {
             return SyscallDisposition::err(SysErr::Inval);
         }
 
-        let header = self.syscall_read_user_exact_buffer(args, size.min(LinuxCloneArgs::SIZE));
+        let header = self.read_user_exact_buffer(args, size.min(LinuxCloneArgs::SIZE));
         let Ok(header) = header else {
             return SyscallDisposition::err(SysErr::Fault);
         };
@@ -78,6 +70,6 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             Err(error) => return SyscallDisposition::err(error),
         };
 
-        self.syscall_clone_process_blocking(CloneParams::from_clone3(clone_args, requested_pid))
+        self.clone_process_blocking(CloneParams::from_clone3(clone_args, requested_pid))
     }
 }

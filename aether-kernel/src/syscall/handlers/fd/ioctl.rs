@@ -1,16 +1,16 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
 use crate::fs::{DevPtsSlaveFile, FileSystemIdentity, PtmxMasterFile};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::BlockResult;
-use crate::syscall::KernelSyscallContext;
 use crate::syscall::SyscallDisposition;
 use crate::syscall::abi::TIMER_ABSTIME;
-use aether_drivers::drm::{DrmDevice, DrmModeInfo, ioctl as drm_abi};
+use aether_drivers::drm::{DrmDevice, DrmModeInfo, DrmNodeType, DrmPrimeFile, ioctl as drm_abi};
 use aether_drivers::{DrmFile, EvdevFile};
 use aether_frame::time;
 use aether_terminal::{ConsoleCore, LinuxTermios, LinuxTermios2, LinuxVtMode, LinuxWinSize};
-use aether_vfs::{FsError, IoctlResponse};
+use aether_vfs::{FileNode, FsError, IoctlResponse, OpenFlags};
+use alloc::sync::Arc;
 
 const DRM_USER_BLOB_MAX_SIZE: usize = 64 * 1024;
 const TCGETS: u64 = 0x5401;
@@ -53,15 +53,15 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_ioctl_fd_blocking(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn ioctl_fd_blocking(
         &mut self,
         fd: u64,
         command: u64,
         argument: u64,
     ) -> SyscallDisposition {
         if command != drm_abi::DRM_IOCTL_WAIT_VBLANK {
-            return SyscallDisposition::Return(self.syscall_ioctl_fd(fd, command, argument));
+            return SyscallDisposition::Return(self.ioctl_fd(fd, command, argument));
         }
 
         let descriptor = match self.process.files.get(fd as u32) {
@@ -78,26 +78,20 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             (device, file.flags().nonblock())
         };
         let Some(device) = device else {
-            return SyscallDisposition::Return(self.syscall_ioctl_fd(fd, command, argument));
+            return SyscallDisposition::Return(self.ioctl_fd(fd, command, argument));
         };
 
-        self.syscall_drm_wait_vblank_blocking(fd as u32, device.as_ref(), argument, nonblock)
+        self.drm_wait_vblank_blocking(fd as u32, device.as_ref(), argument, nonblock)
     }
 
-    pub(crate) fn syscall_ioctl_fd(
-        &mut self,
-        fd: u64,
-        command: u64,
-        argument: u64,
-    ) -> SysResult<u64> {
+    pub(crate) fn ioctl_fd(&mut self, fd: u64, command: u64, argument: u64) -> SysResult<u64> {
         let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
         let file_ref = descriptor.file.clone();
         let file = file_ref.lock();
         if let Some(ptmx) = file
             .file_ops()
             .and_then(|ops| ops.as_any().downcast_ref::<PtmxMasterFile>())
-            && let Some(result) =
-                self.syscall_ptmx_ioctl(ptmx, descriptor.filesystem, command, argument)?
+            && let Some(result) = self.ptmx_ioctl(ptmx, descriptor.filesystem, command, argument)?
         {
             drop(file);
             return self.finish_ioctl_result(argument, result);
@@ -105,7 +99,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         if let Some(console) = file
             .file_ops()
             .and_then(|ops| ops.as_any().downcast_ref::<ConsoleCore>())
-            && let Some(result) = self.syscall_tty_ioctl(console, command, argument)?
+            && let Some(result) = self.tty_ioctl(console, command, argument)?
         {
             drop(file);
             return self.finish_ioctl_result(argument, result);
@@ -113,23 +107,31 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         if let Some(slave) = file
             .file_ops()
             .and_then(|ops| ops.as_any().downcast_ref::<DevPtsSlaveFile>())
-            && let Some(result) = self.syscall_tty_ioctl(slave.tty(), command, argument)?
+            && let Some(result) = self.tty_ioctl(slave.tty(), command, argument)?
         {
             drop(file);
             return self.finish_ioctl_result(argument, result);
         }
-        if let Some(device) = file.file_ops_arc().and_then(|ops| {
+        if let Some((device, node_type, file_id)) = file.file_ops_arc().and_then(|ops| {
             ops.as_any()
                 .downcast_ref::<DrmFile>()
-                .map(|drm| drm.device().clone())
+                .map(|drm| (drm.device().clone(), drm.node_type(), Some(drm.id())))
         }) {
             drop(file);
-            return self.syscall_drm_ioctl(device.as_ref(), command, argument);
+            return self.drm_ioctl(&device, node_type, file_id, command, argument);
+        }
+        if let Some(device) = file.file_ops_arc().and_then(|ops| {
+            ops.as_any()
+                .downcast_ref::<DrmPrimeFile>()
+                .map(|prime| prime.device().clone())
+        }) {
+            drop(file);
+            return self.drm_ioctl(&device, DrmNodeType::Render, None, command, argument);
         }
         if let Some(evdev) = file
             .file_ops()
             .and_then(|ops| ops.as_any().downcast_ref::<EvdevFile>())
-            && let Some(result) = self.syscall_evdev_ioctl(evdev, command, argument)?
+            && let Some(result) = self.evdev_ioctl(evdev, command, argument)?
         {
             drop(file);
             return self.finish_ioctl_result(argument, result);
@@ -157,7 +159,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
     }
 
-    fn syscall_drm_wait_vblank_blocking(
+    fn drm_wait_vblank_blocking(
         &mut self,
         _fd: u32,
         device: &DrmDevice,
@@ -168,11 +170,10 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             return SyscallDisposition::err(SysErr::Fault);
         }
 
-        let mut bytes =
-            match self.syscall_read_user_exact_buffer(argument, drm_abi::DrmWaitVBlank::SIZE) {
-                Ok(bytes) => bytes,
-                Err(error) => return SyscallDisposition::err(error),
-            };
+        let mut bytes = match self.read_user_exact_buffer(argument, drm_abi::DrmWaitVBlank::SIZE) {
+            Ok(bytes) => bytes,
+            Err(error) => return SyscallDisposition::err(error),
+        };
         let request = match drm_abi::DrmWaitVBlank::from_bytes(&bytes) {
             Some(request) => request,
             None => return SyscallDisposition::err(SysErr::Fault),
@@ -214,7 +215,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
     }
 
-    fn syscall_tty_ioctl(
+    fn tty_ioctl(
         &mut self,
         console: &ConsoleCore,
         command: u64,
@@ -227,10 +228,9 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             TCGETS => Some(IoctlResponse::Data(console.termios().to_bytes().to_vec())),
             TCGETS2 => Some(IoctlResponse::Data(console.termios2().to_bytes().to_vec())),
             TCSETS | TCSETSW | TCSETSF => {
-                let termios = LinuxTermios::from_bytes(&self.syscall_read_user_exact_buffer(
-                    argument,
-                    core::mem::size_of::<LinuxTermios>(),
-                )?)
+                let termios = LinuxTermios::from_bytes(
+                    &self.read_user_exact_buffer(argument, core::mem::size_of::<LinuxTermios>())?,
+                )
                 .ok_or(SysErr::Fault)?;
                 console.set_termios(termios);
                 if command == TCSETSF {
@@ -241,10 +241,10 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 Some(IoctlResponse::success())
             }
             TCSETS2 | TCSETSW2 | TCSETSF2 => {
-                let termios = LinuxTermios2::from_bytes(&self.syscall_read_user_exact_buffer(
-                    argument,
-                    core::mem::size_of::<LinuxTermios2>(),
-                )?)
+                let termios = LinuxTermios2::from_bytes(
+                    &self
+                        .read_user_exact_buffer(argument, core::mem::size_of::<LinuxTermios2>())?,
+                )
                 .ok_or(SysErr::Fault)?;
                 console.set_termios2(termios);
                 if command == TCSETSF2 {
@@ -273,8 +273,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 {
                     return Err(SysErr::NoTty);
                 }
-                let bytes =
-                    self.syscall_read_user_exact_buffer(argument, core::mem::size_of::<i32>())?;
+                let bytes = self.read_user_exact_buffer(argument, core::mem::size_of::<i32>())?;
                 let process_group =
                     i32::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| SysErr::Fault)?);
                 if process_group <= 0 {
@@ -299,10 +298,9 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 Some(IoctlResponse::Data(session.to_ne_bytes().to_vec()))
             }
             TIOCSWINSZ => {
-                let winsize = LinuxWinSize::from_bytes(&self.syscall_read_user_exact_buffer(
-                    argument,
-                    core::mem::size_of::<LinuxWinSize>(),
-                )?)
+                let winsize = LinuxWinSize::from_bytes(
+                    &self.read_user_exact_buffer(argument, core::mem::size_of::<LinuxWinSize>())?,
+                )
                 .ok_or(SysErr::Fault)?;
                 console.set_winsize(winsize);
                 Some(IoctlResponse::success())
@@ -356,8 +354,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             TIOCOUTQ => Some(IoctlResponse::Data(0i32.to_ne_bytes().to_vec())),
             TIOCGETD => Some(IoctlResponse::Data(N_TTY.to_ne_bytes().to_vec())),
             TIOCSETD => {
-                let bytes =
-                    self.syscall_read_user_exact_buffer(argument, core::mem::size_of::<i32>())?;
+                let bytes = self.read_user_exact_buffer(argument, core::mem::size_of::<i32>())?;
                 let discipline =
                     i32::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| SysErr::Fault)?);
                 if discipline != N_TTY {
@@ -376,10 +373,9 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 Some(IoctlResponse::success())
             }
             VT_SETMODE => {
-                let mode = LinuxVtMode::from_bytes(&self.syscall_read_user_exact_buffer(
-                    argument,
-                    core::mem::size_of::<LinuxVtMode>(),
-                )?)
+                let mode = LinuxVtMode::from_bytes(
+                    &self.read_user_exact_buffer(argument, core::mem::size_of::<LinuxVtMode>())?,
+                )
                 .ok_or(SysErr::Fault)?;
                 console.set_vt_mode(mode);
                 Some(IoctlResponse::success())
@@ -395,7 +391,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(result)
     }
 
-    fn syscall_ptmx_ioctl(
+    fn ptmx_ioctl(
         &mut self,
         master: &PtmxMasterFile,
         filesystem: FileSystemIdentity,
@@ -417,8 +413,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 master.pty_number().to_ne_bytes().to_vec(),
             )),
             TIOCSPTLCK => {
-                let bytes =
-                    self.syscall_read_user_exact_buffer(argument, core::mem::size_of::<i32>())?;
+                let bytes = self.read_user_exact_buffer(argument, core::mem::size_of::<i32>())?;
                 let locked =
                     i32::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| SysErr::Fault)?)
                         != 0;
@@ -450,12 +445,12 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 }
                 Some(IoctlResponse::success())
             }
-            _ => self.syscall_tty_ioctl(master.slave(), command, argument)?,
+            _ => self.tty_ioctl(master.slave(), command, argument)?,
         };
         Ok(result)
     }
 
-    fn syscall_evdev_ioctl(
+    fn evdev_ioctl(
         &mut self,
         evdev: &EvdevFile,
         command: u64,
@@ -465,8 +460,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
 
         let result = match command {
             EVIOCSCLOCKID => {
-                let bytes =
-                    self.syscall_read_user_exact_buffer(argument, core::mem::size_of::<i32>())?;
+                let bytes = self.read_user_exact_buffer(argument, core::mem::size_of::<i32>())?;
                 let clock_id =
                     i32::from_ne_bytes(bytes.as_slice().try_into().map_err(|_| SysErr::Fault)?);
                 evdev.set_clock_id(clock_id).map_err(SysErr::from)?;
@@ -477,9 +471,11 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(result)
     }
 
-    fn syscall_drm_ioctl(
+    fn drm_ioctl(
         &mut self,
-        device: &DrmDevice,
+        device: &Arc<DrmDevice>,
+        node_type: DrmNodeType,
+        drm_file_id: Option<u64>,
         command: u64,
         argument: u64,
     ) -> SysResult<u64> {
@@ -490,7 +486,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         } else if argument == 0 {
             return Err(SysErr::Fault);
         } else if (dir & drm_abi::IOC_WRITE) != 0 {
-            self.syscall_read_user_exact_buffer(argument, size)?
+            self.read_user_exact_buffer(argument, size)?
         } else {
             alloc::vec![0u8; size]
         };
@@ -538,15 +534,45 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                     .set_client_cap(request.capability, request.value)
                     .map_err(SysErr::from)?;
             }
+            drm_abi::DRM_IOCTL_PRIME_HANDLE_TO_FD => {
+                let mut request =
+                    drm_abi::DrmPrimeHandle::from_bytes(&bytes).ok_or(SysErr::Fault)?;
+                request.fd = self.drm_prime_handle_to_fd(device, request.handle, request.flags)?;
+                if !request.write_to_bytes(&mut bytes) {
+                    return Err(SysErr::Fault);
+                }
+            }
+            drm_abi::DRM_IOCTL_PRIME_FD_TO_HANDLE => {
+                let mut request =
+                    drm_abi::DrmPrimeHandle::from_bytes(&bytes).ok_or(SysErr::Fault)?;
+                request.handle = self.drm_prime_fd_to_handle(device, request.fd)?;
+                if !request.write_to_bytes(&mut bytes) {
+                    return Err(SysErr::Fault);
+                }
+            }
+            drm_abi::DRM_IOCTL_GET_MAGIC => {
+                let file_id = drm_file_id.ok_or(SysErr::Inval)?;
+                let reply = drm_abi::DrmAuth {
+                    magic: file_id as u32,
+                };
+                if !reply.write_to_bytes(&mut bytes) {
+                    return Err(SysErr::Fault);
+                }
+            }
+            drm_abi::DRM_IOCTL_AUTH_MAGIC => {
+                let file_id = drm_file_id.ok_or(SysErr::Inval)?;
+                let _request = drm_abi::DrmAuth::from_bytes(&bytes).ok_or(SysErr::Fault)?;
+                if !device.is_master(file_id) {
+                    return Err(SysErr::Access);
+                }
+            }
             drm_abi::DRM_IOCTL_SET_MASTER => {
-                device
-                    .set_master(self.process.identity.pid)
-                    .map_err(SysErr::from)?;
+                let file_id = drm_file_id.ok_or(SysErr::Inval)?;
+                device.set_master(file_id).map_err(SysErr::from)?;
             }
             drm_abi::DRM_IOCTL_DROP_MASTER => {
-                device
-                    .drop_master(self.process.identity.pid)
-                    .map_err(SysErr::from)?;
+                let file_id = drm_file_id.ok_or(SysErr::Inval)?;
+                device.drop_master(file_id).map_err(SysErr::from)?;
             }
             drm_abi::DRM_IOCTL_MODE_GETRESOURCES => {
                 let mut request =
@@ -806,6 +832,9 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 }
             }
             drm_abi::DRM_IOCTL_MODE_CREATE_DUMB => {
+                if node_type != DrmNodeType::Primary {
+                    return Err(SysErr::NoTty);
+                }
                 let mut request =
                     drm_abi::DrmModeCreateDumb::from_bytes(&bytes).ok_or(SysErr::Fault)?;
                 let (handle, pitch, size) = device
@@ -819,6 +848,9 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 }
             }
             drm_abi::DRM_IOCTL_MODE_MAP_DUMB => {
+                if node_type != DrmNodeType::Primary {
+                    return Err(SysErr::NoTty);
+                }
                 let mut request =
                     drm_abi::DrmModeMapDumb::from_bytes(&bytes).ok_or(SysErr::Fault)?;
                 if request.pad != 0 {
@@ -830,6 +862,9 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 }
             }
             drm_abi::DRM_IOCTL_MODE_DESTROY_DUMB => {
+                if node_type != DrmNodeType::Primary {
+                    return Err(SysErr::NoTty);
+                }
                 let request =
                     drm_abi::DrmModeDestroyDumb::from_bytes(&bytes).ok_or(SysErr::Fault)?;
                 device.destroy_dumb(request.handle).map_err(SysErr::from)?;
@@ -865,7 +900,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 if request.data == 0 || length == 0 || length > DRM_USER_BLOB_MAX_SIZE {
                     return Err(SysErr::Inval);
                 }
-                let blob = self.syscall_read_user_exact_buffer(request.data, length)?;
+                let blob = self.read_user_exact_buffer(request.data, length)?;
                 request.blob_id = device
                     .create_property_blob(blob.as_slice())
                     .map_err(SysErr::from)?;
@@ -882,6 +917,41 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 device
                     .destroy_property_blob(request.blob_id)
                     .map_err(SysErr::from)?;
+            }
+            drm_abi::DRM_IOCTL_MODE_CREATE_LEASE => {
+                let mut request =
+                    drm_abi::DrmModeCreateLease::from_bytes(&bytes).ok_or(SysErr::Fault)?;
+                request.fd = self.drm_create_lease_fd(device, request.flags)? as u32;
+                request.lessee_id = request.fd;
+                if !request.write_to_bytes(&mut bytes) {
+                    return Err(SysErr::Fault);
+                }
+            }
+            drm_abi::DRM_IOCTL_MODE_LIST_LESSEES => {
+                let mut request =
+                    drm_abi::DrmModeListLessees::from_bytes(&bytes).ok_or(SysErr::Fault)?;
+                if request.pad != 0 {
+                    return Err(SysErr::Inval);
+                }
+                request.count_lessees = 0;
+                if !request.write_to_bytes(&mut bytes) {
+                    return Err(SysErr::Fault);
+                }
+            }
+            drm_abi::DRM_IOCTL_MODE_GET_LEASE => {
+                let mut request =
+                    drm_abi::DrmModeGetLease::from_bytes(&bytes).ok_or(SysErr::Fault)?;
+                if request.pad != 0 {
+                    return Err(SysErr::Inval);
+                }
+                request.count_objects = 0;
+                if !request.write_to_bytes(&mut bytes) {
+                    return Err(SysErr::Fault);
+                }
+            }
+            drm_abi::DRM_IOCTL_MODE_REVOKE_LEASE => {
+                let _request =
+                    drm_abi::DrmModeRevokeLease::from_bytes(&bytes).ok_or(SysErr::Fault)?;
             }
             drm_abi::DRM_IOCTL_MODE_CLOSEFB => {
                 let request = drm_abi::DrmModeCloseFb::from_bytes(&bytes).ok_or(SysErr::Fault)?;
@@ -985,7 +1055,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             return Err(SysErr::Fault);
         }
         decode_u32_array(
-            &self.syscall_read_user_exact_buffer(address, count * core::mem::size_of::<u32>())?,
+            &self.read_user_exact_buffer(address, count * core::mem::size_of::<u32>())?,
         )
     }
 
@@ -1001,17 +1071,76 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             return Err(SysErr::Fault);
         }
         decode_u64_array(
-            &self.syscall_read_user_exact_buffer(address, count * core::mem::size_of::<u64>())?,
+            &self.read_user_exact_buffer(address, count * core::mem::size_of::<u64>())?,
         )
+    }
+
+    fn drm_prime_handle_to_fd(
+        &mut self,
+        device: &Arc<DrmDevice>,
+        handle: u32,
+        flags: u32,
+    ) -> SysResult<i32> {
+        let allowed = drm_abi::DRM_CLOEXEC | drm_abi::DRM_RDWR;
+        if handle == 0 || (flags & !allowed) != 0 {
+            return Err(SysErr::Inval);
+        }
+        let (physical_address, size) = device.dumb_buffer_info(handle).map_err(SysErr::from)?;
+        let prime = DrmPrimeFile::new(device.clone(), handle, physical_address, size);
+        let node = FileNode::new("drm-prime", prime);
+        let fd = self.process.files.insert_node(
+            node,
+            OpenFlags::from_bits(OpenFlags::READ | OpenFlags::WRITE),
+            crate::process::anonymous_filesystem_identity(),
+            None,
+            (flags & drm_abi::DRM_CLOEXEC) != 0,
+        );
+        Ok(fd as i32)
+    }
+
+    fn drm_prime_fd_to_handle(&self, device: &Arc<DrmDevice>, fd: i32) -> SysResult<u32> {
+        if fd < 0 {
+            return Err(SysErr::BadFd);
+        }
+        let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
+        let file = descriptor.file.lock();
+        let prime = file
+            .file_ops()
+            .and_then(|ops| ops.as_any().downcast_ref::<DrmPrimeFile>())
+            .ok_or(SysErr::BadFd)?;
+        if prime.device().index() != device.index() || !device.has_dumb_buffer(prime.handle()) {
+            return Err(SysErr::BadFd);
+        }
+        Ok(prime.handle())
+    }
+
+    fn drm_create_lease_fd(&mut self, device: &Arc<DrmDevice>, flags: u32) -> SysResult<i32> {
+        if (flags & !drm_abi::DRM_CLOEXEC) != 0 {
+            return Err(SysErr::Inval);
+        }
+        let node = FileNode::new_char_device(
+            "drm-lease",
+            u32::from(aether_drivers::drm::DRM_MAJOR),
+            device.index() as u32,
+            DrmFile::new_primary(device.clone()),
+        );
+        let fd = self.process.files.insert_node(
+            node,
+            OpenFlags::from_bits(OpenFlags::READ | OpenFlags::WRITE),
+            crate::process::anonymous_filesystem_identity(),
+            None,
+            (flags & drm_abi::DRM_CLOEXEC) != 0,
+        );
+        Ok(fd as i32)
     }
 }
 
-struct DrmUserWriter<'ctx, 'proc, S: ProcessServices> {
-    ctx: &'ctx mut ProcessSyscallContext<'proc, S>,
+struct DrmUserWriter<'ctx, 'proc> {
+    ctx: &'ctx mut ProcessSyscallContext<'proc>,
 }
 
-impl<'ctx, 'proc, S: ProcessServices> DrmUserWriter<'ctx, 'proc, S> {
-    fn new(ctx: &'ctx mut ProcessSyscallContext<'proc, S>) -> Self {
+impl<'ctx, 'proc> DrmUserWriter<'ctx, 'proc> {
+    fn new(ctx: &'ctx mut ProcessSyscallContext<'proc>) -> Self {
         Self { ctx }
     }
 

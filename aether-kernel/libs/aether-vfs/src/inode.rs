@@ -10,8 +10,8 @@ use aether_frame::libs::spin::SpinLock;
 use crate::file::{FlockOperation, FlockState};
 use crate::{
     DirectoryEntry, FileAdvice, FileOperations, FsError, FsResult, IoctlResponse, MmapRequest,
-    MmapResponse, NodeKind, NodeMetadata, OpenFlags, PollEvents, SharedWaitListener, SuperBlock,
-    SuperBlockRef, WaitQueue,
+    MmapResponse, NodeKind, NodeMetadata, NodeTimestamp, OpenFlags, PollEvents, SharedWaitListener,
+    SuperBlock, SuperBlockRef, WaitQueue,
 };
 
 pub type NodeRef = Arc<Inode>;
@@ -94,6 +94,15 @@ pub trait InodeOperations: Any + Send + Sync {
     }
 
     fn set_owner(&self, _uid: u32, _gid: u32) -> FsResult<()> {
+        Err(FsError::Unsupported)
+    }
+
+    fn set_times(
+        &self,
+        _atime: Option<NodeTimestamp>,
+        _mtime: Option<NodeTimestamp>,
+        _ctime: NodeTimestamp,
+    ) -> FsResult<()> {
         Err(FsError::Unsupported)
     }
 
@@ -371,6 +380,15 @@ impl Inode {
 
     pub fn set_owner(&self, uid: u32, gid: u32) -> FsResult<()> {
         self.operations.set_owner(uid, gid)
+    }
+
+    pub fn set_times(
+        &self,
+        atime: Option<NodeTimestamp>,
+        mtime: Option<NodeTimestamp>,
+        ctime: NodeTimestamp,
+    ) -> FsResult<()> {
+        self.operations.set_times(atime, mtime, ctime)
     }
 
     pub fn metadata(&self) -> NodeMetadata {

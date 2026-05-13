@@ -2,7 +2,7 @@ use aether_frame::time;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 use crate::syscall::abi::{ITIMER_REAL, LinuxItimerval};
 
@@ -12,8 +12,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_setitimer(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn setitimer(
         &mut self,
         which: i32,
         new_value: u64,

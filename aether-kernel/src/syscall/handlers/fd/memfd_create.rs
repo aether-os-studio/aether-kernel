@@ -4,7 +4,7 @@ use aether_vfs::{FileNode, MemfdOptions, OpenFlags, SharedMemoryFile};
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext, anonymous_filesystem_identity};
+use crate::process::{ProcessSyscallContext, anonymous_filesystem_identity};
 use crate::syscall::SyscallDisposition;
 use crate::syscall::abi::read_path;
 
@@ -17,8 +17,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_memfd_create(&mut self, name: &str, flags: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn memfd_create(&mut self, name: &str, flags: u64) -> SysResult<u64> {
         const MFD_CLOEXEC: u64 = 0x0001;
         const MFD_ALLOW_SEALING: u64 = 0x0002;
         const MFD_HUGETLB: u64 = 0x0004;

@@ -6,9 +6,7 @@ use alloc::sync::Arc;
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
 use crate::fs::NodeImageSource;
-use crate::process::{
-    KernelProcess, MmapRegion, MmapRegionBacking, ProcessServices, ProcessSyscallContext,
-};
+use crate::process::{KernelProcess, MmapRegion, MmapRegionBacking, ProcessSyscallContext};
 use crate::syscall::SyscallDisposition;
 
 const PROT_WRITE: u64 = 0x2;
@@ -28,7 +26,7 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
+impl ProcessSyscallContext<'_> {
     pub(crate) fn mmap_page_flags(prot: u64) -> MapFlags {
         let mut page_flags = MapFlags::READ | MapFlags::USER;
         if (prot & PROT_WRITE) != 0 {
@@ -213,7 +211,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(mapped)
     }
 
-    pub(crate) fn syscall_mmap(
+    pub(crate) fn mmap(
         &mut self,
         address: u64,
         len: u64,

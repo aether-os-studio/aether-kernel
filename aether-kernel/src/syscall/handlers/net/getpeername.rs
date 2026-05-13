@@ -1,14 +1,14 @@
 use crate::arch::syscall::nr;
 use crate::errno::SysResult;
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(pub struct GetpeernameSyscall => nr::GETPEERNAME, "getpeername", |ctx, args| {
     SyscallDisposition::Return(ctx.getpeername(args.get(0), args.get(1), args.get(2)))
 });
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_getpeername(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn getpeername(
         &mut self,
         fd: u64,
         address: u64,

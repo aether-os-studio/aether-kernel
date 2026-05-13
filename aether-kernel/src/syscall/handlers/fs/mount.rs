@@ -1,7 +1,7 @@
 use crate::arch::syscall::nr;
 use crate::errno::SysErr;
 use crate::errno::SysResult;
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -35,8 +35,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_mount(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn mount(
         &mut self,
         source: Option<&str>,
         target: &str,
@@ -47,7 +47,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             .mount(&mut self.process.fs, source, target, fstype, flags)
     }
 
-    pub(crate) fn syscall_umount(&mut self, target: &str, flags: u64) -> SysResult<u64> {
+    pub(crate) fn umount(&mut self, target: &str, flags: u64) -> SysResult<u64> {
         self.services.umount(&self.process.fs, target, flags)
     }
 }

@@ -1,8 +1,7 @@
 use crate::arch::syscall::nr;
 use crate::declare_syscall;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::KernelSyscallContext;
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 declare_syscall! {
@@ -11,8 +10,8 @@ declare_syscall! {
     }
 }
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_pipe(&mut self, pipefd: u64, flags: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn pipe(&mut self, pipefd: u64, flags: u64) -> SysResult<u64> {
         const O_CLOEXEC: u64 = 0o2000000;
         const O_NONBLOCK: u64 = 0o4000;
 

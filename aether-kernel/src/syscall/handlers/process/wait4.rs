@@ -1,9 +1,7 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{
-    ProcessServices, ProcessSyscallContext, WaitChildApi, WaitChildSelector, wait_status,
-};
-use crate::syscall::{BlockResult, KernelSyscallContext, SyscallDisposition};
+use crate::process::{ProcessSyscallContext, WaitChildApi, WaitChildSelector, wait_status};
+use crate::syscall::{BlockResult, SyscallDisposition};
 
 crate::declare_syscall!(
     pub struct Wait4Syscall => nr::WAIT4, "wait4", |ctx, args| {
@@ -11,7 +9,7 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
+impl ProcessSyscallContext<'_> {
     fn wait4_selector(&self, pid: i32) -> SysResult<WaitChildSelector> {
         Ok(match pid {
             -1 => WaitChildSelector::Any,
@@ -21,7 +19,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         })
     }
 
-    pub(crate) fn syscall_wait4(
+    pub(crate) fn wait4(
         &mut self,
         pid: i32,
         status: u64,
@@ -59,7 +57,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Err(SysErr::Child)
     }
 
-    pub(crate) fn syscall_wait4_blocking(
+    pub(crate) fn wait4_blocking(
         &mut self,
         pid: i32,
         status: u64,
@@ -71,7 +69,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             Err(error) => return SyscallDisposition::err(error),
         };
         let _ = rusage;
-        match self.syscall_wait4(pid, status, options, rusage) {
+        match self.wait4(pid, status, options, rusage) {
             Ok(value) => {
                 // TODO: populate `rusage` with real child resource usage once the kernel tracks it.
                 SyscallDisposition::ok(value)

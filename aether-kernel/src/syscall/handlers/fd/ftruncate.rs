@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -9,8 +9,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_ftruncate(&mut self, fd: u64, length: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn ftruncate(&mut self, fd: u64, length: u64) -> SysResult<u64> {
         let length = usize::try_from(length).map_err(|_| SysErr::Inval)?;
         let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
         descriptor

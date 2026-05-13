@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -13,8 +13,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_setsockopt(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn setsockopt(
         &mut self,
         fd: u64,
         level: u64,
@@ -30,7 +30,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             if optval == 0 {
                 return Err(SysErr::Fault);
             }
-            self.syscall_read_user_exact_buffer(optval, optlen)?
+            self.read_user_exact_buffer(optval, optlen)?
         };
         socket.setsockopt(
             i32::try_from(level).map_err(|_| SysErr::Inval)?,

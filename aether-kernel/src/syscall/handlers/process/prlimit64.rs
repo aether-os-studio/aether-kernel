@@ -1,7 +1,7 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::process::ProcessSyscallContext;
+use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
     pub struct Prlimit64Syscall => nr::PRLIMIT64, "prlimit64", |ctx, args| {
@@ -13,8 +13,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_prlimit64(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn prlimit64(
         &mut self,
         pid: i32,
         resource: u64,
@@ -74,7 +74,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
 
         if new_limit != 0 {
-            let new_bytes = self.syscall_read_user_exact_buffer(new_limit, 16)?;
+            let new_bytes = self.read_user_exact_buffer(new_limit, 16)?;
             let new_cur = u64::from_ne_bytes(new_bytes[..8].try_into().unwrap_or([0; 8]));
             let new_max = u64::from_ne_bytes(new_bytes[8..].try_into().unwrap_or([0; 8]));
 

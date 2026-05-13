@@ -49,11 +49,8 @@ struct LinuxPollFd {
 }
 
 impl LinuxPollFd {
-    fn read_from(
-        ctx: &ProcessSyscallContext<'_, impl ProcessServices>,
-        address: u64,
-    ) -> SysResult<Self> {
-        let bytes = ctx.syscall_read_user_exact_buffer(address, POLLFD_SIZE)?;
+    fn read_from(ctx: &ProcessSyscallContext<'_>, address: u64) -> SysResult<Self> {
+        let bytes = ctx.read_user_exact_buffer(address, POLLFD_SIZE)?;
         Ok(Self {
             fd: i32::from_ne_bytes(bytes[0..4].try_into().map_err(|_| SysErr::Fault)?),
             events: i16::from_ne_bytes(bytes[4..6].try_into().map_err(|_| SysErr::Fault)?),
@@ -87,11 +84,8 @@ struct LinuxPselectSigmaskArg {
 impl LinuxPselectSigmaskArg {
     const SIZE: usize = 16;
 
-    fn read_from(
-        ctx: &ProcessSyscallContext<'_, impl ProcessServices>,
-        address: u64,
-    ) -> SysResult<Self> {
-        let bytes = ctx.syscall_read_user_exact_buffer(address, Self::SIZE)?;
+    fn read_from(ctx: &ProcessSyscallContext<'_>, address: u64) -> SysResult<Self> {
+        let bytes = ctx.read_user_exact_buffer(address, Self::SIZE)?;
         Ok(Self {
             sigmask: u64::from_ne_bytes(bytes[0..8].try_into().map_err(|_| SysErr::Fault)?),
             sigsetsize: u64::from_ne_bytes(bytes[8..16].try_into().map_err(|_| SysErr::Fault)?)
@@ -114,11 +108,8 @@ struct LinuxMsghdr {
 impl LinuxMsghdr {
     const SIZE: usize = 56;
 
-    fn read_from(
-        ctx: &ProcessSyscallContext<'_, impl ProcessServices>,
-        address: u64,
-    ) -> SysResult<Self> {
-        let bytes = ctx.syscall_read_user_exact_buffer(address, Self::SIZE)?;
+    fn read_from(ctx: &ProcessSyscallContext<'_>, address: u64) -> SysResult<Self> {
+        let bytes = ctx.read_user_exact_buffer(address, Self::SIZE)?;
         Ok(Self {
             name: u64::from_ne_bytes(bytes[0..8].try_into().map_err(|_| SysErr::Fault)?),
             name_len: u32::from_ne_bytes(bytes[8..12].try_into().map_err(|_| SysErr::Fault)?),
@@ -132,11 +123,7 @@ impl LinuxMsghdr {
         })
     }
 
-    fn write_back(
-        self,
-        ctx: &mut ProcessSyscallContext<'_, impl ProcessServices>,
-        address: u64,
-    ) -> SysResult<()> {
+    fn write_back(self, ctx: &mut ProcessSyscallContext<'_>, address: u64) -> SysResult<()> {
         let mut bytes = [0u8; Self::SIZE];
         bytes[0..8].copy_from_slice(&self.name.to_ne_bytes());
         bytes[8..12].copy_from_slice(&self.name_len.to_ne_bytes());
@@ -179,7 +166,7 @@ fn serialize_cmsg(level: i32, kind: i32, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
+impl ProcessSyscallContext<'_> {
     pub(crate) fn should_not_block_socket_io(&self, fd: u32, flags: u64) -> bool {
         (flags & MSG_DONTWAIT) != 0
             || self
@@ -190,7 +177,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 .unwrap_or(false)
     }
 
-    pub(super) fn syscall_poll(&mut self, fds: u64, nfds: usize, _timeout: i32) -> SysResult<u64> {
+    pub(crate) fn poll(&mut self, fds: u64, nfds: usize, _timeout: i32) -> SysResult<u64> {
         let mut poll_fds = self.read_poll_fds(fds, nfds)?;
         let ready = self.evaluate_poll_fds(&mut poll_fds)?;
         self.write_poll_fds(fds, &poll_fds)?;
@@ -200,7 +187,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(ready as u64)
     }
 
-    pub(super) fn syscall_poll_blocking(
+    pub(crate) fn poll_blocking(
         &mut self,
         fds: u64,
         nfds: usize,
@@ -226,7 +213,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         )
     }
 
-    pub(super) fn syscall_ppoll(
+    pub(crate) fn ppoll(
         &mut self,
         fds: u64,
         nfds: usize,
@@ -251,7 +238,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         result
     }
 
-    pub(super) fn syscall_ppoll_blocking(
+    pub(crate) fn ppoll_blocking(
         &mut self,
         fds: u64,
         nfds: usize,
@@ -283,7 +270,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         self.poll_wait_loop(fds, poll_fds, options)
     }
 
-    pub(super) fn syscall_pselect6(
+    pub(crate) fn pselect6(
         &mut self,
         nfds: i32,
         readfds: u64,
@@ -323,7 +310,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         result
     }
 
-    pub(super) fn syscall_pselect6_blocking(
+    pub(crate) fn pselect6_blocking(
         &mut self,
         nfds: i32,
         readfds: u64,
@@ -687,7 +674,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         }
     }
 
-    pub(super) fn syscall_sendto(
+    pub(crate) fn sendto(
         &mut self,
         fd: u64,
         buffer: u64,
@@ -709,7 +696,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             .map(|written| written as u64)
     }
 
-    pub(super) fn syscall_sendto_blocking(
+    pub(crate) fn sendto_blocking(
         &mut self,
         fd: u64,
         buffer: u64,
@@ -719,7 +706,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         address_len: usize,
     ) -> SyscallDisposition {
         if self.should_not_block_socket_io(fd as u32, flags) {
-            return SyscallDisposition::Return(self.syscall_sendto(
+            return SyscallDisposition::Return(self.sendto(
                 fd,
                 buffer,
                 len,
@@ -729,11 +716,11 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             ));
         }
         self.file_blocking_syscall(fd as u32, PollEvents::WRITE, |ctx| {
-            ctx.syscall_sendto(fd, buffer, len, flags, address, address_len)
+            ctx.sendto(fd, buffer, len, flags, address, address_len)
         })
     }
 
-    pub(super) fn syscall_recvfrom(
+    pub(crate) fn recvfrom(
         &mut self,
         fd: u64,
         buffer: u64,
@@ -753,7 +740,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(received.bytes_read as u64)
     }
 
-    pub(super) fn syscall_recvfrom_blocking(
+    pub(crate) fn recvfrom_blocking(
         &mut self,
         fd: u64,
         buffer: u64,
@@ -763,7 +750,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         address_len: u64,
     ) -> SyscallDisposition {
         if self.should_not_block_socket_io(fd as u32, flags) {
-            return SyscallDisposition::Return(self.syscall_recvfrom(
+            return SyscallDisposition::Return(self.recvfrom(
                 fd,
                 buffer,
                 len,
@@ -773,11 +760,11 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             ));
         }
         self.file_blocking_syscall(fd as u32, PollEvents::READ, |ctx| {
-            ctx.syscall_recvfrom(fd, buffer, len, flags, address, address_len)
+            ctx.recvfrom(fd, buffer, len, flags, address, address_len)
         })
     }
 
-    pub(super) fn syscall_sendmsg(&mut self, fd: u64, message: u64, flags: u64) -> SysResult<u64> {
+    pub(crate) fn sendmsg(&mut self, fd: u64, message: u64, flags: u64) -> SysResult<u64> {
         let (_file_ref, socket) = self.socket_from_fd(fd)?;
         let message = self.read_socket_message(message)?;
         let peer = message
@@ -791,7 +778,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             .map(|written| written as u64)
     }
 
-    pub(super) fn syscall_recvmsg(&mut self, fd: u64, message: u64, flags: u64) -> SysResult<u64> {
+    pub(crate) fn recvmsg(&mut self, fd: u64, message: u64, flags: u64) -> SysResult<u64> {
         let (_file_ref, socket) = self.socket_from_fd(fd)?;
         let mut header = LinuxMsghdr::read_from(self, message)?;
         if header.iov_len > IOV_MAX {
@@ -833,31 +820,31 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(received.bytes_read as u64)
     }
 
-    pub(super) fn syscall_sendmsg_blocking(
+    pub(crate) fn sendmsg_blocking(
         &mut self,
         fd: u64,
         message: u64,
         flags: u64,
     ) -> SyscallDisposition {
         if self.should_not_block_socket_io(fd as u32, flags) {
-            return SyscallDisposition::Return(self.syscall_sendmsg(fd, message, flags));
+            return SyscallDisposition::Return(self.sendmsg(fd, message, flags));
         }
         self.file_blocking_syscall(fd as u32, PollEvents::WRITE, |ctx| {
-            ctx.syscall_sendmsg(fd, message, flags)
+            ctx.sendmsg(fd, message, flags)
         })
     }
 
-    pub(super) fn syscall_recvmsg_blocking(
+    pub(crate) fn recvmsg_blocking(
         &mut self,
         fd: u64,
         message: u64,
         flags: u64,
     ) -> SyscallDisposition {
         if self.should_not_block_socket_io(fd as u32, flags) {
-            return SyscallDisposition::Return(self.syscall_recvmsg(fd, message, flags));
+            return SyscallDisposition::Return(self.recvmsg(fd, message, flags));
         }
         self.file_blocking_syscall(fd as u32, PollEvents::READ, |ctx| {
-            ctx.syscall_recvmsg(fd, message, flags)
+            ctx.recvmsg(fd, message, flags)
         })
     }
 
@@ -874,14 +861,14 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         ) as u64)
     }
 
-    pub(super) fn syscall_epoll_create(&mut self, size: u64) -> SysResult<u64> {
+    pub(crate) fn epoll_create(&mut self, size: u64) -> SysResult<u64> {
         if size == 0 {
             return Err(SysErr::Inval);
         }
         self.create_epoll_fd(false)
     }
 
-    pub(super) fn syscall_epoll_create1(&mut self, flags: u64) -> SysResult<u64> {
+    pub(crate) fn epoll_create1(&mut self, flags: u64) -> SysResult<u64> {
         const EPOLL_CLOEXEC: u64 = 0o2000000;
 
         if (flags & !EPOLL_CLOEXEC) != 0 {
@@ -890,13 +877,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         self.create_epoll_fd((flags & EPOLL_CLOEXEC) != 0)
     }
 
-    pub(super) fn syscall_epoll_ctl(
-        &mut self,
-        epfd: u64,
-        op: i32,
-        fd: u64,
-        event: u64,
-    ) -> SysResult<u64> {
+    pub(crate) fn epoll_ctl(&mut self, epfd: u64, op: i32, fd: u64, event: u64) -> SysResult<u64> {
         let epoll_op = aether_vfs::EpollCtlOp::from_raw(op).ok_or(SysErr::Inval)?;
 
         let epoll_descriptor = self.process.files.get(epfd as u32).ok_or(SysErr::BadFd)?;
@@ -910,7 +891,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let target_file = target_descriptor.file.clone();
 
         let epoll_event = if event != 0 {
-            let event_bytes = self.syscall_read_user_exact_buffer(event, 12)?;
+            let event_bytes = self.read_user_exact_buffer(event, 12)?;
             aether_vfs::EpollEvent::from_bytes(&event_bytes.try_into().unwrap_or([0; 12]))
         } else {
             aether_vfs::EpollEvent::default()
@@ -920,27 +901,27 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(0)
     }
 
-    pub(super) fn syscall_epoll_wait(
+    pub(crate) fn epoll_wait(
         &mut self,
         epfd: u64,
         events: u64,
         maxevents: usize,
         timeout: i32,
     ) -> SysResult<u64> {
-        self.syscall_epoll_pwait(epfd, events, maxevents, timeout, 0)
+        self.epoll_pwait(epfd, events, maxevents, timeout, 0)
     }
 
-    pub(super) fn syscall_epoll_wait_blocking(
+    pub(crate) fn epoll_wait_blocking(
         &mut self,
         epfd: u64,
         events: u64,
         maxevents: usize,
         timeout: i32,
     ) -> SyscallDisposition {
-        self.syscall_epoll_pwait_blocking(epfd, events, maxevents, timeout, 0)
+        self.epoll_pwait_blocking(epfd, events, maxevents, timeout, 0)
     }
 
-    pub(super) fn syscall_epoll_pwait(
+    pub(crate) fn epoll_pwait(
         &mut self,
         epfd: u64,
         events: u64,
@@ -986,7 +967,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         result
     }
 
-    pub(super) fn syscall_epoll_pwait_blocking(
+    pub(crate) fn epoll_pwait_blocking(
         &mut self,
         epfd: u64,
         events: u64,
@@ -1270,7 +1251,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         if bytes == 0 || address == 0 {
             return Ok(vec![0; bytes]);
         }
-        self.syscall_read_user_exact_buffer(address, bytes)
+        self.read_user_exact_buffer(address, bytes)
     }
 
     fn write_select_fd_sets(
@@ -1459,7 +1440,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         if address == 0 {
             return Err(SysErr::Fault);
         }
-        self.syscall_read_user_exact_buffer(address, address_len)
+        self.read_user_exact_buffer(address, address_len)
     }
 
     fn read_optional_socket_address(
@@ -1484,7 +1465,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let control = if header.control == 0 || header.control_len == 0 {
             Vec::new()
         } else {
-            self.syscall_read_user_exact_buffer(header.control, header.control_len)?
+            self.read_user_exact_buffer(header.control, header.control_len)?
         };
         let (rights, explicit_credentials) = self.parse_socket_send_control(&control)?;
 
@@ -1775,7 +1756,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
 
         let actual_len = returned.map(|name| name.len()).unwrap_or(0);
         let requested = u32::from_ne_bytes(
-            self.syscall_read_user_exact_buffer(address_len, 4)?
+            self.read_user_exact_buffer(address_len, 4)?
                 .as_slice()
                 .try_into()
                 .map_err(|_| SysErr::Fault)?,
@@ -1812,7 +1793,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok(fd)
     }
 
-    pub(super) fn syscall_fadvise64(
+    pub(crate) fn fadvise64(
         &mut self,
         fd: u64,
         offset: u64,

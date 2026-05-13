@@ -1,7 +1,7 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::process::ProcessSyscallContext;
+use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(pub struct PrctlSyscall => nr::PRCTL, "prctl", |ctx, args| {
     SyscallDisposition::Return(
@@ -15,8 +15,8 @@ crate::declare_syscall!(pub struct PrctlSyscall => nr::PRCTL, "prctl", |ctx, arg
     )
 });
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_prctl(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn prctl(
         &mut self,
         option: u64,
         arg2: u64,
@@ -89,7 +89,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
                 _ => Err(SysErr::Inval),
             },
             PR_SET_NAME => {
-                let name = self.syscall_read_user_exact_buffer(arg2, 16)?;
+                let name = self.read_user_exact_buffer(arg2, 16)?;
                 self.process.prctl.set_name_bytes(&name);
                 Ok(0)
             }

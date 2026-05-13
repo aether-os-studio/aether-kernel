@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::SysResult;
-use crate::process::{CloneParams, ProcessServices, ProcessSyscallContext};
+use crate::process::{CloneParams, ProcessSyscallContext};
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -16,16 +16,13 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_clone_process(&mut self, params: CloneParams) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn clone_process(&mut self, params: CloneParams) -> SysResult<u64> {
         let pid = self.services.clone_process(self.process, params)? as u64;
         Ok(pid)
     }
 
-    pub(crate) fn syscall_clone_process_blocking(
-        &mut self,
-        params: CloneParams,
-    ) -> SyscallDisposition {
+    pub(crate) fn clone_process_blocking(&mut self, params: CloneParams) -> SyscallDisposition {
         if params.is_vfork()
             && let Some(result) = self.process.wake_result.take()
         {

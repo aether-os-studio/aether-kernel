@@ -1,7 +1,7 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext, decode_sigset};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::process::{ProcessSyscallContext, decode_sigset};
+use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
     pub struct RtSigsuspendSyscall => nr::RT_SIGSUSPEND, "rt_sigsuspend", |ctx, args| {
@@ -9,8 +9,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_rt_sigsuspend(&mut self, mask: u64, sigsetsize: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn rt_sigsuspend(&mut self, mask: u64, sigsetsize: u64) -> SysResult<u64> {
         if sigsetsize < 8 {
             return Err(SysErr::Inval);
         }
@@ -29,12 +29,12 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Err(SysErr::Again)
     }
 
-    pub(crate) fn syscall_rt_sigsuspend_blocking(
+    pub(crate) fn rt_sigsuspend_blocking(
         &mut self,
         mask: u64,
         sigsetsize: u64,
     ) -> SyscallDisposition {
-        match self.syscall_rt_sigsuspend(mask, sigsetsize) {
+        match self.rt_sigsuspend(mask, sigsetsize) {
             Err(SysErr::Again) => {}
             Ok(value) => return SyscallDisposition::ok(value),
             Err(error) => return SyscallDisposition::err(error),

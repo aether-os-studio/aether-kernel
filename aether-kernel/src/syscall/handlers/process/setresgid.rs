@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -9,7 +9,7 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
+impl ProcessSyscallContext<'_> {
     fn can_set_gid_to(&self, gid: u32) -> bool {
         let cred = &self.process.credentials;
         cred.is_superuser() || gid == cred.gid || gid == cred.egid || gid == cred.sgid
@@ -20,7 +20,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok((value != u32::MAX).then_some(value))
     }
 
-    pub(crate) fn syscall_setresgid(&mut self, rgid: u64, egid: u64, sgid: u64) -> SysResult<u64> {
+    pub(crate) fn setresgid(&mut self, rgid: u64, egid: u64, sgid: u64) -> SysResult<u64> {
         let rgid = Self::read_optional_gid(rgid)?;
         let egid = Self::read_optional_gid(egid)?;
         let sgid = Self::read_optional_gid(sgid)?;

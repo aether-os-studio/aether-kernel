@@ -1,7 +1,7 @@
 use crate::arch::syscall::nr;
 use crate::declare_syscall;
 use crate::errno::SysResult;
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 declare_syscall! {
@@ -10,8 +10,8 @@ declare_syscall! {
     }
 }
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_dup3(&mut self, oldfd: u64, newfd: u64, flags: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn dup3(&mut self, oldfd: u64, newfd: u64, flags: u64) -> SysResult<u64> {
         self.dup_to(oldfd, newfd, flags, true)
     }
 }

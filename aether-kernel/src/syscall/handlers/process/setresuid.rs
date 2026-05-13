@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -9,7 +9,7 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
+impl ProcessSyscallContext<'_> {
     fn can_set_uid_to(&self, uid: u32) -> bool {
         let cred = &self.process.credentials;
         cred.is_superuser() || uid == cred.uid || uid == cred.euid || uid == cred.suid
@@ -20,7 +20,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         Ok((value != u32::MAX).then_some(value))
     }
 
-    pub(crate) fn syscall_setresuid(&mut self, ruid: u64, euid: u64, suid: u64) -> SysResult<u64> {
+    pub(crate) fn setresuid(&mut self, ruid: u64, euid: u64, suid: u64) -> SysResult<u64> {
         let ruid = Self::read_optional_uid(ruid)?;
         let euid = Self::read_optional_uid(euid)?;
         let suid = Self::read_optional_uid(suid)?;

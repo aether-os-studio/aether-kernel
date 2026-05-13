@@ -2,9 +2,9 @@ use core::mem::size_of;
 
 use crate::arch::syscall::nr;
 use crate::errno::SysResult;
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::signal::{SignalStack, parse_signal_stack, serialize_signal_stack};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
     pub struct SigaltstackSyscall => nr::SIGALTSTACK, "sigaltstack", |ctx, args| {
@@ -12,12 +12,12 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_sigaltstack(&mut self, uss: u64, uoss: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn sigaltstack(&mut self, uss: u64, uoss: u64) -> SysResult<u64> {
         let new_stack = if uss == 0 {
             None
         } else {
-            let raw = self.syscall_read_user_exact_buffer(uss, size_of::<SignalStack>())?;
+            let raw = self.read_user_exact_buffer(uss, size_of::<SignalStack>())?;
             Some(parse_signal_stack(&raw).ok_or(crate::errno::SysErr::Fault)?)
         };
 

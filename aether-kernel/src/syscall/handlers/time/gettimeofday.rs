@@ -2,8 +2,8 @@ use aether_frame::time;
 
 use crate::arch::syscall::nr;
 use crate::errno::SysResult;
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::process::ProcessSyscallContext;
+use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
     pub struct GettimeofdaySyscall => nr::GETTIMEOFDAY, "gettimeofday", |ctx, args| {
@@ -13,8 +13,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_gettimeofday(&mut self, tv: u64, tz: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn gettimeofday(&mut self, tv: u64, tz: u64) -> SysResult<u64> {
         if tz != 0 {
             let tz_bytes = [0u8; 8];
             self.write_user_buffer(tz, &tz_bytes)?;

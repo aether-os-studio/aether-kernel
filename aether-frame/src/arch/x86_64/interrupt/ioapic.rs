@@ -17,7 +17,9 @@ struct IoApicController {
 static CONTROLLERS: SpinLock<Option<Vec<IoApicController>>> = SpinLock::new(None);
 
 pub fn init_from_acpi(vector_base: u8) -> Result<usize, &'static str> {
-    let InterruptModel::Apic(apic) = crate::acpi::info().interrupt_model() else { return Err("APIC interrupt model is unavailable") };
+    let InterruptModel::Apic(apic) = crate::acpi::info().interrupt_model() else {
+        return Err("APIC interrupt model is unavailable");
+    };
 
     let mut controllers = Vec::new();
     for descriptor in &apic.io_apics {
@@ -72,7 +74,9 @@ pub fn configure_isa_irq(
 }
 
 fn isa_irq_route(irq: u8) -> Result<(u32, IrqFlags), &'static str> {
-    let InterruptModel::Apic(apic) = crate::acpi::info().interrupt_model() else { return Err("APIC interrupt model is unavailable") };
+    let InterruptModel::Apic(apic) = crate::acpi::info().interrupt_model() else {
+        return Err("APIC interrupt model is unavailable");
+    };
 
     if let Some(override_entry) = apic
         .interrupt_source_overrides

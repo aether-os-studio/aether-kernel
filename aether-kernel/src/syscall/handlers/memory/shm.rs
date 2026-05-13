@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::SysResult;
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -27,8 +27,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_shmget(&mut self, key: i32, size: usize, shmflg: i32) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn shmget(&mut self, key: i32, size: usize, shmflg: i32) -> SysResult<u64> {
         crate::fs::sysv_shmget(
             key,
             size,
@@ -38,20 +38,15 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         )
     }
 
-    pub(crate) fn syscall_shmat(
-        &mut self,
-        shmid: i32,
-        shmaddr: u64,
-        shmflg: i32,
-    ) -> SysResult<u64> {
+    pub(crate) fn shmat(&mut self, shmid: i32, shmaddr: u64, shmflg: i32) -> SysResult<u64> {
         crate::fs::sysv_shmat(self, shmid, shmaddr, shmflg)
     }
 
-    pub(crate) fn syscall_shmctl(&mut self, shmid: i32, cmd: i32, buf: u64) -> SysResult<u64> {
+    pub(crate) fn shmctl(&mut self, shmid: i32, cmd: i32, buf: u64) -> SysResult<u64> {
         crate::fs::sysv_shmctl(self, shmid, cmd, buf)
     }
 
-    pub(crate) fn syscall_shmdt(&mut self, shmaddr: u64) -> SysResult<u64> {
+    pub(crate) fn shmdt(&mut self, shmaddr: u64) -> SysResult<u64> {
         crate::fs::sysv_shmdt(self.process, shmaddr)
     }
 }

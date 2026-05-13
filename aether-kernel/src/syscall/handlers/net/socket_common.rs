@@ -1,5 +1,4 @@
 use crate::errno::SysErr;
-use crate::syscall::KernelSyscallContext;
 
 const SOCK_NONBLOCK: u64 = 0o0004000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
@@ -12,7 +11,7 @@ pub(super) fn validate_accept4_flags(flags: u64) -> Result<(), SysErr> {
 }
 
 pub(super) fn read_socklen(
-    ctx: &dyn KernelSyscallContext,
+    ctx: &crate::process::ProcessSyscallContext<'_>,
     optlen_ptr: u64,
 ) -> Result<usize, SysErr> {
     if optlen_ptr == 0 {
@@ -23,7 +22,7 @@ pub(super) fn read_socklen(
 }
 
 pub(super) fn write_length_result(
-    ctx: &mut dyn KernelSyscallContext,
+    ctx: &mut crate::process::ProcessSyscallContext<'_>,
     data_ptr: u64,
     len_ptr: u64,
     value: &[u8],

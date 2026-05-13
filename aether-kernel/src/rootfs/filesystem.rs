@@ -285,7 +285,7 @@ impl KernelFileSystem for TmpFs {
 
     fn mount(&self, request: &MountRequest) -> SysResult<FileSystemMount> {
         Ok(FileSystemMount {
-            root: tmpfs::directory(request.target_name.as_str()),
+            root: tmpfs::directory_with_mode(request.target_name.as_str(), 0o041777),
             statfs: LinuxStatFs::new(self.magic(), DEFAULT_BLOCK_SIZE, DEFAULT_NAME_LEN),
         })
     }

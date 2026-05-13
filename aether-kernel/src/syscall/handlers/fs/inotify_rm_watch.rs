@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -9,8 +9,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_inotify_rm_watch(&mut self, fd: u64, wd: i32) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn inotify_rm_watch(&mut self, fd: u64, wd: i32) -> SysResult<u64> {
         let descriptor = self.process.files.get(fd as u32).ok_or(SysErr::BadFd)?;
         let file = descriptor.file.lock();
         let inotify = file

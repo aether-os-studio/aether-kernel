@@ -12,8 +12,7 @@ use aether_vfs::{FileNode, OpenFileDescription, OpenFlags, SharedMemoryFile, Sha
 
 use crate::credentials::Credentials;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{KernelProcess, ProcessServices, ProcessSyscallContext};
-use crate::syscall::KernelSyscallContext;
+use crate::process::{KernelProcess, ProcessSyscallContext};
 
 const IPC_PRIVATE: i32 = 0;
 const IPC_CREAT: i32 = 0o1000;
@@ -304,8 +303,8 @@ pub(crate) fn shmget(
     Ok(shmid as u64)
 }
 
-pub(crate) fn shmat<S: ProcessServices>(
-    ctx: &mut ProcessSyscallContext<'_, S>,
+pub(crate) fn shmat(
+    ctx: &mut ProcessSyscallContext<'_>,
     shmid: i32,
     shmaddr: u64,
     shmflg: i32,
@@ -343,7 +342,7 @@ pub(crate) fn shmat<S: ProcessServices>(
         };
     }
 
-    let mapped = ProcessSyscallContext::<S>::map_file_region(
+    let mapped = ProcessSyscallContext::map_file_region(
         ctx.process,
         file,
         requested_address,
@@ -425,8 +424,8 @@ pub(crate) fn shmdt(process: &mut KernelProcess, shmaddr: u64) -> SysResult<u64>
     Ok(0)
 }
 
-pub(crate) fn shmctl<S: ProcessServices>(
-    ctx: &mut ProcessSyscallContext<'_, S>,
+pub(crate) fn shmctl(
+    ctx: &mut ProcessSyscallContext<'_>,
     shmid: i32,
     cmd: i32,
     buf: u64,

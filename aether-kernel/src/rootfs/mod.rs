@@ -205,6 +205,9 @@ impl RootfsManager {
             .install(&vfs, "pts", DirectoryNode::new("pts"))
             .map_err(RootfsError::from)?;
         device_namespace
+            .install(&vfs, "shm", DirectoryNode::new("shm"))
+            .map_err(RootfsError::from)?;
+        device_namespace
             .install(&vfs, "ptmx", devpts_fs.ptmx_node())
             .map_err(RootfsError::from)?;
 

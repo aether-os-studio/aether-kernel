@@ -1,8 +1,7 @@
 use crate::arch::syscall::nr;
 use crate::errno::SysResult;
 use crate::fs::{make_stat, serialize_stat};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::KernelSyscallContext;
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 use crate::syscall::abi::read_path;
 
@@ -15,8 +14,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_lstat_path(&mut self, path: &str, address: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn lstat_path(&mut self, path: &str, address: u64) -> SysResult<u64> {
         let (node, _) = self
             .services
             .lookup_node_with_identity(&self.process.fs, path, false)?;

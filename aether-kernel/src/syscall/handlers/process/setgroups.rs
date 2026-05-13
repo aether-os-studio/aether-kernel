@@ -1,6 +1,6 @@
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
+use crate::process::ProcessSyscallContext;
 use crate::syscall::SyscallDisposition;
 
 crate::declare_syscall!(
@@ -9,8 +9,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_setgroups(&mut self, size: usize, list: u64) -> SysResult<u64> {
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn setgroups(&mut self, size: usize, list: u64) -> SysResult<u64> {
         const NGROUPS_MAX: usize = 65536;
 
         if size > NGROUPS_MAX {
@@ -27,7 +27,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             return Err(SysErr::Fault);
         }
 
-        let bytes = self.syscall_read_user_exact_buffer(
+        let bytes = self.read_user_exact_buffer(
             list,
             size.checked_mul(core::mem::size_of::<u32>())
                 .ok_or(SysErr::Inval)?,

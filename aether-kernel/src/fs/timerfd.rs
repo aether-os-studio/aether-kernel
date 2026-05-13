@@ -71,8 +71,8 @@ pub struct LinuxItimerSpec {
 impl LinuxItimerSpec {
     pub const SIZE: usize = LinuxTimespec::SIZE * 2;
 
-    pub fn read_from(
-        ctx: &dyn crate::syscall::KernelSyscallContext,
+    pub(crate) fn read_from(
+        ctx: &crate::process::ProcessSyscallContext<'_>,
         address: u64,
     ) -> SysResult<Self> {
         let bytes = ctx.read_user_buffer(address, Self::SIZE)?;
@@ -94,9 +94,9 @@ impl LinuxItimerSpec {
         })
     }
 
-    pub fn write_to(
+    pub(crate) fn write_to(
         self,
-        ctx: &mut dyn crate::syscall::KernelSyscallContext,
+        ctx: &mut crate::process::ProcessSyscallContext<'_>,
         address: u64,
     ) -> SysResult<()> {
         let mut bytes = [0u8; Self::SIZE];

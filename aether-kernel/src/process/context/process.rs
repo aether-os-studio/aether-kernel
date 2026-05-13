@@ -1,8 +1,8 @@
 use super::*;
 use crate::arch::ArchContext;
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(super) fn syscall_log_unimplemented(
+impl ProcessSyscallContext<'_> {
+    pub fn log_unimplemented(
         &mut self,
         number: u64,
         name: &str,
@@ -17,7 +17,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
             .set_return_value(SysErr::NoSys.errno() as u64);
     }
 
-    pub(super) fn syscall_log_unimplemented_command(
+    pub fn log_unimplemented_command(
         &mut self,
         name: &str,
         command_name: &str,

@@ -4,8 +4,8 @@ use aether_vfs::{FsError, NodeKind, PollEvents};
 
 use crate::arch::syscall::nr;
 use crate::errno::{SysErr, SysResult};
-use crate::process::{ProcessServices, ProcessSyscallContext};
-use crate::syscall::{KernelSyscallContext, SyscallDisposition};
+use crate::process::ProcessSyscallContext;
+use crate::syscall::SyscallDisposition;
 
 const SENDFILE_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_RW_COUNT: usize = 0x7fff_f000;
@@ -28,21 +28,8 @@ crate::declare_syscall!(
     }
 );
 
-impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
-    pub(crate) fn syscall_sendfile(
-        &mut self,
-        out_fd: u64,
-        in_fd: u64,
-        offset: u64,
-        count: usize,
-    ) -> SysResult<u64> {
-        match self.sendfile_step(out_fd, in_fd, offset, count)? {
-            SendfileStep::Complete(value) => Ok(value),
-            SendfileStep::WouldBlock(_) => Err(SysErr::Again),
-        }
-    }
-
-    pub(crate) fn syscall_sendfile_blocking(
+impl ProcessSyscallContext<'_> {
+    pub(crate) fn sendfile_blocking(
         &mut self,
         out_fd: u64,
         in_fd: u64,
@@ -129,7 +116,7 @@ impl<S: ProcessServices> ProcessSyscallContext<'_, S> {
         let mut remaining = core::cmp::min(count, MAX_RW_COUNT);
         let mut chunk = vec![0u8; core::cmp::min(remaining, SENDFILE_CHUNK_SIZE)];
         let mut explicit_offset = if offset_ptr != 0 {
-            let raw = self.syscall_read_user_exact_buffer(offset_ptr, 8)?;
+            let raw = self.read_user_exact_buffer(offset_ptr, 8)?;
             let value = i64::from_ne_bytes(raw[..8].try_into().map_err(|_| SysErr::Fault)?);
             if value < 0 {
                 return Err(SysErr::Inval);

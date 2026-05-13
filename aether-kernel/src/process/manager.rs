@@ -1252,7 +1252,11 @@ impl ProcessManager {
         let pending = process
             .pending_syscall
             .expect("dispatch_pending_syscall requires a saved syscall");
-        let mut context = super::context::ProcessSyscallContext { process, services };
+        let mut services = services;
+        let mut context = super::context::ProcessSyscallContext {
+            process,
+            services: &mut services,
+        };
         let dispatch = syscall::dispatch(pending.number, &mut context, pending.args);
         context.process.pending_syscall_name = dispatch.name;
         dispatch
